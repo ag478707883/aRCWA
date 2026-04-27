@@ -24,7 +24,7 @@ TRUNCATION = "circular"
 BACKEND = "cuda"
 FACTORIZATION = "auto"
 GRID = 190
-WORKERS = 6
+WORKERS = 1
 POINTS = 121
 SHOW = True
 
