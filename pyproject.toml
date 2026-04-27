@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rcwa3d"
+version = "0.1.0"
+description = "3D RCWA codebase split into rcwa3d_isotropic and rcwa3d_anisotropic packages."
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.23",
+  "scipy>=1.9",
+  "matplotlib>=3.5",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "torch>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

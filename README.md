@@ -166,6 +166,8 @@ results = rcwa.solveStackBatch(
 
 ## 几何构建器
 
+单层二维截面仍可直接用 `Pattern2D`：
+
 ```python
 import numpy as np
 from rcwa3d_isotropic import AIR, SI1550, Pattern2D, compileLayers, solveStack
@@ -184,7 +186,30 @@ result = solveStack(
 )
 ```
 
-可用形状包括：`circle`、`ellipse`、`rectangle`、`annulus`、`cross`、`stripes`、`polygon`。也提供快捷函数：`photonicCrystalSlab`、`circularPostLayer`、`ellipticalPostLayer`、`rectangularPostLayer`、`annularPostLayer`、`polygonPostLayer`。
+三维结构推荐用层栈方式：先铺一层或多层均匀背景，再把体结构写入这些层。`LayerStack` 会按 z 方向自动切片，用多层常截面 RCWA 层近似圆锥面、方锥面或波浪表面。
+
+```python
+from rcwa3d_isotropic import LayerStack
+
+geometry = LayerStack(period=(1.0, 1.0), shape=(96, 96))
+geometry.addLayer(1.0, AIR, name="air host")
+
+# 圆锥体：z=0 顶部半径小，z=0.8 底部半径大，自动切成 24 层。
+geometry.addCone(SI1550, z=(0.0, 0.8), topRadius=0.02, bottomRadius=0.32, slices=24)
+
+# 四面方锥体/方台：矩形截面随 z 线性缩放。
+geometry.addPyramid(SI1550, z=(0.1, 0.9), topSize=0.04, bottomSize=(0.45, 0.45), slices=24)
+
+# 波浪形体：由正弦 top surface 限定的三维体。
+geometry.addWaveBody(SI1550, baseZ=0.0, meanHeight=0.35, amplitude=0.15, axis="x", slices=24)
+
+# 多边形柱/多边形锥也可直接写入背景层。
+geometry.addPolygonPrism(SI1550, z=(0.2, 0.6), vertices=[(-0.2, -0.1), (0.2, -0.1), (0.0, 0.25)])
+
+layers = compileLayers(geometry.toLayers(), orders=3, truncation="circular")
+```
+
+各向异性模块也提供同名的 `rcwa3d_anisotropic.LayerStack`，材料可以是标量或 `(3, 3)` 张量。常用三维接口包括：`addVolume`、`addBox`、`addCylinder`、`addCone`、`addPyramid`、`addPolygonPrism`、`addPolygonPyramid`、`addWaveBody`。二维单层形状包括：`circle`、`ellipse`、`rectangle`、`annulus`、`cross`、`stripes`、`polygon`。
 
 ## 场分布
 
