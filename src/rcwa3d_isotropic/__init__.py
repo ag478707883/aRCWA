@@ -18,6 +18,7 @@ from .solver import (
     CompiledLayer,
     DiffractionOrder,
     Layer,
+    LayerEigTiming,
     LayerFieldSolution,
     RCWAResult,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "DiffractionOrder",
     "IsotropicMaterial",
     "Layer",
+    "LayerEigTiming",
     "LayerFieldSolution",
     "LayerStack",
     "LayerSpec",

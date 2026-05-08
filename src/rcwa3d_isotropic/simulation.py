@@ -15,10 +15,12 @@ from .solver import (
     PreparedTorchStack,
     _automaticOrderReductionPlan,
     _expandAdaptiveLayers,
+    _solveBatchReducedPowersTorch,
     _solveBatchReducedTorch,
     _solveStackReducedTorch,
     _validateIsotropicLayers,
     evaluatePreparedBatchTorch,
+    evaluatePreparedBatchPowersTorch,
     evaluatePreparedStackTorch,
     prepareStackTorch,
 )
@@ -154,6 +156,7 @@ class RCWASimulation:
         phi: float = 0.0,
         polarization: Polarization = "TE",
         returnFields: bool = False,
+        profile: bool = False,
     ) -> RCWAResult:
         sAmplitude, pAmplitude = _polarizationAmplitudes(polarization)
         return self.solveExcitation(
@@ -163,6 +166,7 @@ class RCWASimulation:
             sAmplitude=sAmplitude,
             pAmplitude=pAmplitude,
             returnFields=returnFields,
+            profile=profile,
         )
 
     def solveExcitation(
@@ -174,6 +178,7 @@ class RCWASimulation:
         sAmplitude: complex = 1.0,
         pAmplitude: complex = 0.0,
         returnFields: bool = False,
+        profile: bool = False,
     ) -> RCWAResult:
         """Solve one custom s/p incident excitation using the cached Torch S-matrix."""
 
@@ -184,10 +189,11 @@ class RCWASimulation:
             sAmplitude=sAmplitude,
             pAmplitude=pAmplitude,
             returnFields=returnFields,
+            profile=profile,
         )
         if reduced is not None:
             return reduced
-        prepared = self._preparedTorchStack(wavelength, theta=theta, phi=phi)
+        prepared = self._preparedTorchStack(wavelength, theta=theta, phi=phi, profile=profile)
         return evaluatePreparedStackTorch(
             prepared,
             sAmplitude=sAmplitude,
@@ -219,9 +225,9 @@ class RCWASimulation:
         if workerCount < 1:
             raise ValueError("workers must be at least 1")
 
-        def solvePoint(item: tuple[int, float]) -> tuple[int, dict[str, RCWAResult]]:
+        def solvePoint(item: tuple[int, float]) -> tuple[int, dict[str, tuple[float, float]]]:
             index, wavelength = item
-            return index, self._solveBatch(float(wavelength), theta=theta, phi=phi, excitations=excitations)
+            return index, self._solveBatchPowers(float(wavelength), theta=theta, phi=phi, excitations=excitations)
 
         items = list(enumerate(values))
         if workerCount == 1 or len(items) <= 1:
@@ -232,10 +238,10 @@ class RCWASimulation:
 
         try:
             for index, point in pointResults:
-                for label, result in point.items():
-                    reflection[label][index] = result.reflection
-                    transmission[label][index] = result.transmission
-                    conservation[label][index] = result.conservation
+                for label, (reflectionValue, transmissionValue) in point.items():
+                    reflection[label][index] = reflectionValue
+                    transmission[label][index] = transmissionValue
+                    conservation[label][index] = reflectionValue + transmissionValue
         finally:
             if "executor" in locals():
                 executor.shutdown(wait=True)
@@ -279,6 +285,20 @@ class RCWASimulation:
             solvedBy=f"{self.method}-batch-{_torchBackendLabel(self.backend)}",
         )
 
+    def _solveBatchPowers(
+        self,
+        wavelength: float,
+        *,
+        theta: float,
+        phi: float,
+        excitations: dict[str, tuple[complex, complex]],
+    ) -> dict[str, tuple[float, float]]:
+        reduced = self._reducedBatchPowersSolve(wavelength, theta=theta, phi=phi, excitations=excitations)
+        if reduced is not None:
+            return reduced
+        prepared = self._preparedTorchStack(wavelength, theta=theta, phi=phi, profile=False)
+        return evaluatePreparedBatchPowersTorch(prepared, excitations)
+
     def _reducedSolve(
         self,
         wavelength: float,
@@ -288,6 +308,7 @@ class RCWASimulation:
         sAmplitude: complex,
         pAmplitude: complex,
         returnFields: bool,
+        profile: bool,
     ) -> RCWAResult | None:
         layers, _layerKey = self._layersAtWithKey(wavelength)
         plan = _automaticOrderReductionPlan(
@@ -316,6 +337,7 @@ class RCWASimulation:
             truncation=self.truncation,
             backend=resolveBackend(self.backend),
             plan=plan,
+            profile=profile,
         )
 
     def _reducedBatchSolve(
@@ -354,7 +376,50 @@ class RCWASimulation:
             plan=plan,
         )
 
-    def _preparedTorchStack(self, wavelength: float, *, theta: float, phi: float) -> PreparedTorchStack:
+    def _reducedBatchPowersSolve(
+        self,
+        wavelength: float,
+        *,
+        theta: float,
+        phi: float,
+        excitations: dict[str, tuple[complex, complex]],
+    ) -> dict[str, tuple[float, float]] | None:
+        layers, _layerKey = self._layersAtWithKey(wavelength)
+        plan = _automaticOrderReductionPlan(
+            layers=layers,
+            wavelength=wavelength,
+            period=self.period,
+            orders=self.orders,
+            epsIncident=self.epsIncident,
+            theta=theta,
+            phi=phi,
+            truncation=self.truncation,
+            returnFields=False,
+        )
+        if plan is None:
+            return None
+        return _solveBatchReducedPowersTorch(
+            layers=layers,
+            wavelength=wavelength,
+            period=self.period,
+            excitations=excitations,
+            epsIncident=self.epsIncident,
+            epsTransmission=self.epsTransmission,
+            theta=theta,
+            phi=phi,
+            truncation=self.truncation,
+            backend=resolveBackend(self.backend),
+            plan=plan,
+        )
+
+    def _preparedTorchStack(
+        self,
+        wavelength: float,
+        *,
+        theta: float,
+        phi: float,
+        profile: bool = False,
+    ) -> PreparedTorchStack:
         layers, layerKey = self._layersAtWithKey(wavelength)
         cacheKey = (
             "torch",
@@ -367,9 +432,10 @@ class RCWASimulation:
             self.orders,
             self.truncation,
             self.backend,
+            bool(profile),
             layerKey,
         )
-        if self.cacheModes:
+        if self.cacheModes and not profile:
             with self._cacheLock:
                 cached = self._preparedCache.get(cacheKey)
                 if cached is not None:
@@ -388,8 +454,9 @@ class RCWASimulation:
             theta=theta,
             phi=phi,
             backend=self.backend,
+            profile=profile,
         )
-        if self.cacheModes:
+        if self.cacheModes and not profile:
             with self._cacheLock:
                 self._preparedCache[cacheKey] = prepared
                 while len(self._preparedCache) > self.cacheSize:

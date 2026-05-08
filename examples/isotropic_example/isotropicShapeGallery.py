@@ -147,12 +147,16 @@ for label, layer in shapeCases:
         precompile=PRECOMPILE,
         cacheModes=CACHE_MODES,
     )
-    spectrum = simulation.spectrum([WAVELENGTH], polarizations=POLARIZATIONS)
+    results = simulation.solveExcitations(
+        WAVELENGTH,
+        {polarizationName: (1.0, 0.0) if polarizationName == "TE" else (0.0, 1.0) for polarizationName in POLARIZATIONS},
+    )
     row = {"shape": label}
     for polarizationName in POLARIZATIONS:
-        row[f"{polarizationName} R"] = float(spectrum[polarizationName]["reflection"][0])
-        row[f"{polarizationName} T"] = float(spectrum[polarizationName]["transmission"][0])
-        row[f"{polarizationName} C"] = float(spectrum[polarizationName]["conservation"][0])
+        result = results[polarizationName]
+        row[f"{polarizationName} R"] = float(result.reflection)
+        row[f"{polarizationName} T"] = float(result.transmission)
+        row[f"{polarizationName} C"] = float(result.conservation)
     rows.append(row)
 
 print("Isotropic RCWA shape gallery")

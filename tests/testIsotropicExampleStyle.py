@@ -43,7 +43,7 @@ class IsotropicExampleStyleTests(unittest.TestCase):
                 self.assertIn("rcwa.RCWASimulation(", text)
                 self.assertIn("precompile=PRECOMPILE", text)
                 self.assertIn("cacheModes=CACHE_MODES", text)
-                self.assertTrue(".solve(" in text or ".spectrum(" in text)
+                self.assertTrue(".solve(" in text or ".spectrum(" in text or ".solveExcitations(" in text)
 
 
 if __name__ == "__main__":

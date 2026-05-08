@@ -68,6 +68,15 @@ class LayerFieldSolution:
 
 
 @dataclass(frozen=True)
+class LayerEigTiming:
+    layerIndex: int
+    name: str
+    kind: str
+    matrixShape: tuple[int, ...]
+    eigTimeSeconds: float
+
+
+@dataclass(frozen=True)
 class RCWAResult:
     reflection: float
     transmission: float
@@ -78,6 +87,7 @@ class RCWAResult:
     incidentFlux: float
     solvedBy: str
     layerSolutions: tuple[LayerFieldSolution, ...] = ()
+    layerEigTimings: tuple[LayerEigTiming, ...] = ()
     epsIncident: complex = 1.0
     epsTransmission: complex = 1.0
     sAmplitude: complex = 1.0

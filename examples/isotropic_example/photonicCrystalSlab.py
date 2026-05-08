@@ -77,12 +77,15 @@ startTime = time.perf_counter()
 spectrum = simulation.spectrum(wavelengths, polarizations=POLARIZATIONS)
 backend.synchronize()
 elapsed = time.perf_counter() - startTime
+profileResult = simulation.solve(wavelengths[len(wavelengths) // 2], polarization=POLARIZATIONS[0], profile=True)
 
 print("Photonic crystal slab")
 print(f"method={METHOD}, truncation={TRUNCATION}, order={ORDER}, points={POINTS}, factorization={FACTORIZATION}")
 print(f"frequency range a/lambda: {normalizedFrequency[0]:.4f} - {normalizedFrequency[-1]:.4f}")
 print(f"epsilon slab={EPS_SLAB:.6g}, hole={EPS_HOLE:.6g}")
 print(f"backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, elapsed={elapsed:.3f} s")
+for timing in profileResult.layerEigTimings:
+    print(f"  layer {timing.layerIndex} eig: {timing.kind}, shape={timing.matrixShape}, time={timing.eigTimeSeconds:.4f} s")
 for label in POLARIZATIONS:
     reflection = spectrum[label]["reflection"]
     peak = int(np.argmax(reflection))

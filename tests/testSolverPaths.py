@@ -267,6 +267,98 @@ class SolverPathTests(unittest.TestCase):
         self.assertEqual(factorized.factorization, "normal-vector-li")
         self.assertTrue(all(matrix.device.type == "cuda" for matrix in factorized.displacementMatrices))
 
+    @unittest.skipUnless(_torchCudaAvailable(), "requires torch CUDA")
+    def testIsotropicLayerEigProfileReportsMatrixShapesAndTimes(self) -> None:
+        layer = isotropic.rectangularPostLayer(
+            period=(1.0, 1.0),
+            thickness=0.05,
+            background=1.0,
+            post=2.25,
+            size=(0.30, 0.24),
+            shape=(16, 16),
+            factorization="standard",
+            name="profiled rectangle",
+        )
+        simulation = isotropic.RCWASimulation(
+            period=(1.0, 1.0),
+            layers=[layer, isotropic.Layer(thickness=0.03, epsilon=2.1, name="profiled slab")],
+            orders=(1, 1),
+            truncation="circular",
+            backend="cuda",
+        )
+
+        result = simulation.solve(1.0, polarization="TM", profile=True)
+
+        self.assertEqual(len(result.layerEigTimings), 2)
+        self.assertEqual(result.layerEigTimings[0].name, "profiled rectangle")
+        self.assertEqual(result.layerEigTimings[0].matrixShape[-2:], (10, 10))
+        self.assertEqual(result.layerEigTimings[1].kind, "homogeneous-analytic")
+        self.assertTrue(all(entry.eigTimeSeconds >= 0.0 for entry in result.layerEigTimings))
+
+    @unittest.skipUnless(_torchCudaAvailable(), "requires torch CUDA")
+    def testIsotropicPreparedTotalMatchesFullCascadeReflectionTransmission(self) -> None:
+        epsilon = np.ones((20, 22), dtype=complex)
+        epsilon[5:15, 7:16] = 2.6
+        layer = isotropic.Layer(thickness=0.07, epsilon=epsilon, factorization="standard")
+        common = dict(
+            layers=[layer],
+            wavelength=0.92,
+            period=(1.0, 1.0),
+            orders=(2, 2),
+            epsIncident=1.0,
+            epsTransmission=1.0,
+            theta=np.deg2rad(6.0),
+            phi=np.deg2rad(11.0),
+            truncation="circular",
+            backend="cuda",
+        )
+
+        prepared = isotropic_solver.prepareStackTorch(**common)
+        referenceTotal = isotropic_solver._prefixSMatricesTorch(
+            prepared.components,
+            prepared.nPorts,
+            prepared.backend.xp,
+            prepared.total.s11.device,
+        )[-1]
+        full = isotropic_solver.PreparedTorchStack(
+            layers=prepared.layers,
+            wavelength=prepared.wavelength,
+            period=prepared.period,
+            orders=prepared.orders,
+            epsIncident=prepared.epsIncident,
+            epsTransmission=prepared.epsTransmission,
+            truncation=prepared.truncation,
+            harmonics=prepared.harmonics,
+            layerModes=prepared.layerModes,
+            layerEigTimings=prepared.layerEigTimings,
+            components=prepared.components,
+            total=referenceTotal,
+            incidentForward=prepared.incidentForward,
+            incidentBackward=prepared.incidentBackward,
+            transmissionForward=prepared.transmissionForward,
+            zeroIndex=prepared.zeroIndex,
+            backend=prepared.backend,
+        )
+        excitations = ((1.0, 0.0), (0.0, 1.0), (0.6 + 0.1j, -0.2 + 0.3j))
+
+        for sAmplitude, pAmplitude in excitations:
+            with self.subTest(sAmplitude=sAmplitude, pAmplitude=pAmplitude):
+                fullResult = isotropic_solver.evaluatePreparedStackTorch(
+                    full,
+                    sAmplitude=sAmplitude,
+                    pAmplitude=pAmplitude,
+                )
+                preparedResult = isotropic_solver.evaluatePreparedStackTorch(
+                    prepared,
+                    sAmplitude=sAmplitude,
+                    pAmplitude=pAmplitude,
+                )
+
+                self.assertAlmostEqual(preparedResult.reflection, fullResult.reflection, places=10)
+                self.assertAlmostEqual(preparedResult.transmission, fullResult.transmission, places=10)
+                np.testing.assert_allclose(preparedResult.rAmplitudes, fullResult.rAmplitudes, rtol=1e-9, atol=1e-10)
+                np.testing.assert_allclose(preparedResult.tAmplitudes, fullResult.tAmplitudes, rtol=1e-9, atol=1e-10)
+
     def testAnisotropicCudaBackendEigProducesStableEigenpairs(self) -> None:
         backend = resolveAnisotropicBackend("cuda")
         matrix = np.array(

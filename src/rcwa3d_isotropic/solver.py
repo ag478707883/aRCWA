@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -14,7 +15,7 @@ from ._factorization import (
     toTorchComplex as _toTorchComplex,
 )
 from .fourier import Harmonics, flux, forwardKz, makeHarmonics, normalizeOrders, planeWaveFields, putOrderField, singleOrderVector, sqrtBranch
-from .types import ComplexArray, CompiledLayer, DiffractionOrder, Layer, LayerFieldSolution, RCWAResult
+from .types import ComplexArray, CompiledLayer, DiffractionOrder, Layer, LayerEigTiming, LayerFieldSolution, RCWAResult
 from .varrcwa import AdaptiveLayerSpec
 
 
@@ -24,6 +25,8 @@ class _TorchSMatrix:
     s12: Any
     s21: Any
     s22: Any
+    isIdentity: bool = False
+    isPropagation: bool = False
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,7 @@ class PreparedTorchStack:
     truncation: str
     harmonics: Harmonics
     layerModes: tuple[tuple[Any, Any], ...]
+    layerEigTimings: tuple[LayerEigTiming, ...]
     components: tuple[_TorchSMatrix, ...]
     total: _TorchSMatrix
     incidentForward: ComplexArray
@@ -120,6 +124,7 @@ def prepareStackTorch(
     phi: float = 0.0,
     truncation: str = "circular",
     backend: str | ArrayBackend = "cuda",
+    profile: bool = False,
 ) -> PreparedTorchStack:
     _validateGeometry(wavelength, period, orders)
     arrayBackend = resolveBackend(backend)
@@ -138,7 +143,21 @@ def prepareStackTorch(
     transmissionForward = _homogeneousBasisTorch(harmonics, epsTransmission, direction=1, torch=torch, device=device)
     transmissionBackward = _homogeneousBasisTorch(harmonics, epsTransmission, direction=-1, torch=torch, device=device)
 
-    modes = tuple(_layerModesTorch(layer, harmonics, torch, device) for layer in layers)
+    modeList: list[tuple[Any, Any]] = []
+    layerEigTimings: list[LayerEigTiming] = []
+    for layerIndex, layer in enumerate(layers):
+        modes, timing = _layerModesWithTimingTorch(
+            layer,
+            harmonics,
+            torch,
+            device,
+            layerIndex=layerIndex,
+            profile=profile,
+        )
+        modeList.append(modes)
+        if timing is not None:
+            layerEigTimings.append(timing)
+    modes = tuple(modeList)
     regionForward: list[Any] = [incidentForward]
     regionBackward: list[Any] = [incidentBackward]
     for _qValues, modeMatrix in modes:
@@ -147,17 +166,10 @@ def prepareStackTorch(
     regionForward.append(transmissionForward)
     regionBackward.append(transmissionBackward)
 
+    interfaces = _interfaceSMatricesTorch(regionForward, regionBackward, torch)
     components: list[_TorchSMatrix] = []
     for regionIndex in range(len(layers) + 1):
-        components.append(
-            _interfaceSMatrixTorch(
-                regionForward[regionIndex],
-                regionBackward[regionIndex],
-                regionForward[regionIndex + 1],
-                regionBackward[regionIndex + 1],
-                torch,
-            )
-        )
+        components.append(interfaces[regionIndex])
         if regionIndex < len(layers):
             qForward = modes[regionIndex][0][:nPorts]
             propagation = torch.diag(torch.exp(1j * qForward * k0 * layers[regionIndex].thickness))
@@ -174,8 +186,9 @@ def prepareStackTorch(
         truncation=harmonics.truncation,
         harmonics=harmonics,
         layerModes=modes,
+        layerEigTimings=tuple(layerEigTimings),
         components=componentTuple,
-        total=_cascadeManyTorch(componentTuple, nPorts, torch, device),
+        total=_reflectionTransmissionOnlySMatrixTorch(componentTuple, nPorts, torch, device),
         incidentForward=arrayBackend.asnumpy(incidentForward).copy(),
         incidentBackward=arrayBackend.asnumpy(incidentBackward).copy(),
         transmissionForward=arrayBackend.asnumpy(transmissionForward).copy(),
@@ -251,6 +264,34 @@ def evaluatePreparedBatchTorch(
     return results
 
 
+def evaluatePreparedBatchPowersTorch(
+    prepared: PreparedTorchStack,
+    excitations: Mapping[str, tuple[complex, complex]],
+) -> dict[str, tuple[float, float]]:
+    labels = tuple(excitations)
+    if not labels:
+        return {}
+
+    torch = prepared.backend.xp
+    columns = [_incidentAmplitudesTorch(prepared, *excitations[label], torch) for label in labels]
+    incidentColumns = torch.column_stack(columns)
+    reflected = prepared.backend.asnumpy(prepared.total.s11 @ incidentColumns)
+    transmitted = prepared.backend.asnumpy(prepared.total.s21 @ incidentColumns)
+
+    reflectedFluxes = _orderFluxesFromLocalBasis(prepared.incidentBackward, reflected)
+    transmittedFluxes = _orderFluxesFromLocalBasis(prepared.transmissionForward, transmitted)
+    powers: dict[str, tuple[float, float]] = {}
+    for column, label in enumerate(labels):
+        incidentFlux = _checkedIncidentFluxTorch(
+            prepared,
+            _incidentAmplitudesNumpy(prepared.nPorts, prepared.zeroIndex, *excitations[label]),
+        )
+        reflection = float(np.sum(-reflectedFluxes[:, column] / incidentFlux))
+        transmission = float(np.sum(transmittedFluxes[:, column] / incidentFlux))
+        powers[label] = (reflection, transmission)
+    return powers
+
+
 def _automaticOrderReductionPlan(
     *,
     layers: Sequence[Layer | CompiledLayer],
@@ -318,6 +359,7 @@ def _solveStackReducedTorch(
     truncation: str,
     backend: ArrayBackend,
     plan: _OrderReductionPlan,
+    profile: bool = False,
 ) -> RCWAResult:
     reducedLayers = _reducedLayers(layers, plan)
     prepared = prepareStackTorch(
@@ -331,6 +373,7 @@ def _solveStackReducedTorch(
         phi=phi,
         truncation=truncation,
         backend=backend,
+        profile=profile,
     )
     reduced = evaluatePreparedStackTorch(
         prepared,
@@ -394,6 +437,36 @@ def _solveBatchReducedTorch(
         )
         for label, result in reducedResults.items()
     }
+
+
+def _solveBatchReducedPowersTorch(
+    *,
+    layers: Sequence[Layer | CompiledLayer],
+    wavelength: float,
+    period: tuple[float, float],
+    excitations: Mapping[str, tuple[complex, complex]],
+    epsIncident: complex,
+    epsTransmission: complex,
+    theta: float,
+    phi: float,
+    truncation: str,
+    backend: ArrayBackend,
+    plan: _OrderReductionPlan,
+) -> dict[str, tuple[float, float]]:
+    reducedLayers = _reducedLayers(layers, plan)
+    prepared = prepareStackTorch(
+        layers=reducedLayers,
+        wavelength=wavelength,
+        period=period,
+        orders=plan.reducedOrders,
+        epsIncident=epsIncident,
+        epsTransmission=epsTransmission,
+        theta=theta,
+        phi=phi,
+        truncation=truncation,
+        backend=backend,
+    )
+    return evaluatePreparedBatchPowersTorch(prepared, excitations)
 
 
 def _reducedLayers(
@@ -508,6 +581,7 @@ def _embedReducedResult(
         incidentFlux=float(incidentFlux),
         solvedBy=solvedBy,
         layerSolutions=(),
+        layerEigTimings=reduced.layerEigTimings,
         epsIncident=epsIncident,
         epsTransmission=epsTransmission,
         sAmplitude=sAmplitude,
@@ -681,13 +755,11 @@ def orderResults(
 ) -> Iterable[DiffractionOrder]:
     kzReflectedForward = forwardKz(epsReflected - harmonics.kx**2 - harmonics.ky**2)
     kzTransmittedForward = forwardKz(epsTransmitted - harmonics.kx**2 - harmonics.ky**2)
+    reflectedFluxes = _orderFluxesFromLocalBasis(reflectedBasis, rAmplitudes)
+    transmittedFluxes = _orderFluxesFromLocalBasis(transmittedBasis, tAmplitudes)
     for index, (mx, my, kx, ky) in enumerate(zip(harmonics.mx, harmonics.my, harmonics.kx, harmonics.ky)):
-        reflectedOrder = np.zeros_like(rAmplitudes)
-        transmittedOrder = np.zeros_like(tAmplitudes)
-        reflectedOrder[2 * index : 2 * index + 2] = rAmplitudes[2 * index : 2 * index + 2]
-        transmittedOrder[2 * index : 2 * index + 2] = tAmplitudes[2 * index : 2 * index + 2]
-        reflectedPower = -flux(reflectedBasis @ reflectedOrder) / incidentFlux
-        transmittedPower = flux(transmittedBasis @ transmittedOrder) / incidentFlux
+        reflectedPower = -reflectedFluxes[index] / incidentFlux
+        transmittedPower = transmittedFluxes[index] / incidentFlux
         yield DiffractionOrder(
             mx=int(mx),
             my=int(my),
@@ -700,6 +772,37 @@ def orderResults(
             reflectedPropagating=isPropagating(kzReflectedForward[index]),
             transmittedPropagating=isPropagating(kzTransmittedForward[index]),
         )
+
+
+def _orderFluxesFromLocalBasis(basis: ComplexArray, amplitudes: ComplexArray) -> ComplexArray:
+    amplitudeArray = np.asarray(amplitudes)
+    nOrders = amplitudeArray.shape[0] // 2
+    singleColumn = amplitudeArray.ndim == 1
+    if singleColumn:
+        amplitudeArray = amplitudeArray[:, None]
+
+    orderIndex = np.arange(nOrders)
+    sColumns = 2 * orderIndex
+    pColumns = sColumns + 1
+
+    sAmplitudes = amplitudeArray[sColumns, :]
+    pAmplitudes = amplitudeArray[pColumns, :]
+
+    sEx = basis[orderIndex, sColumns][:, None]
+    pEx = basis[orderIndex, pColumns][:, None]
+    sEy = basis[nOrders + orderIndex, sColumns][:, None]
+    pEy = basis[nOrders + orderIndex, pColumns][:, None]
+    sHx = basis[2 * nOrders + orderIndex, sColumns][:, None]
+    pHx = basis[2 * nOrders + orderIndex, pColumns][:, None]
+    sHy = basis[3 * nOrders + orderIndex, sColumns][:, None]
+    pHy = basis[3 * nOrders + orderIndex, pColumns][:, None]
+
+    ex = sEx * sAmplitudes + pEx * pAmplitudes
+    ey = sEy * sAmplitudes + pEy * pAmplitudes
+    hx = sHx * sAmplitudes + pHx * pAmplitudes
+    hy = sHy * sAmplitudes + pHy * pAmplitudes
+    values = 0.5 * np.real(ex * np.conj(hy) - ey * np.conj(hx))
+    return values[:, 0] if singleColumn else values
 
 
 def zeroOrderIndex(harmonics: Harmonics) -> int:
@@ -721,9 +824,58 @@ def _checkedFlux(field: ComplexArray) -> float:
 
 
 def _layerModesTorch(layer: Layer | CompiledLayer, harmonics: Harmonics, torch: Any, device: Any) -> tuple[Any, Any]:
+    modes, _timing = _layerModesCoreTorch(
+        layer,
+        harmonics,
+        torch,
+        device,
+        layerIndex=-1,
+        profile=False,
+    )
+    return modes
+
+
+def _layerModesWithTimingTorch(
+    layer: Layer | CompiledLayer,
+    harmonics: Harmonics,
+    torch: Any,
+    device: Any,
+    *,
+    layerIndex: int,
+    profile: bool,
+) -> tuple[tuple[Any, Any], LayerEigTiming | None]:
+    return _layerModesCoreTorch(
+        layer,
+        harmonics,
+        torch,
+        device,
+        layerIndex=layerIndex,
+        profile=profile,
+    )
+
+
+def _layerModesCoreTorch(
+    layer: Layer | CompiledLayer,
+    harmonics: Harmonics,
+    torch: Any,
+    device: Any,
+    *,
+    layerIndex: int,
+    profile: bool,
+) -> tuple[tuple[Any, Any], LayerEigTiming | None]:
     factorized = _layerDataForTorch(layer, harmonics, torch, device)
     if factorized.homogeneousEpsilon is not None and factorized.displacementMatrices is None:
-        return _homogeneousScalarLayerModesTorch(harmonics, factorized.homogeneousEpsilon, torch, device)
+        modes = _homogeneousScalarLayerModesTorch(harmonics, factorized.homogeneousEpsilon, torch, device)
+        timing = None
+        if profile:
+            timing = LayerEigTiming(
+                layerIndex=layerIndex,
+                name=getattr(layer, "name", ""),
+                kind="homogeneous-analytic",
+                matrixShape=(4, 4),
+                eigTimeSeconds=0.0,
+            )
+        return modes, timing
 
     epsilonMatrix = _toTorchComplex(factorized.epsilonMatrix, torch, device)
     if factorized.epsilonInverse is None:
@@ -738,7 +890,16 @@ def _layerModesTorch(layer: Layer | CompiledLayer, harmonics: Harmonics, torch: 
         displacementMatrices = tuple(_toTorchComplex(matrix, torch, device) for matrix in factorized.displacementMatrices)
 
     pMatrix, qMatrix = _pqMatricesTorch(epsilonMatrix, harmonics, epsilonInverse, displacementMatrices, torch, device)
-    qSquared, electricModes = torch.linalg.eig(pMatrix @ qMatrix)
+    eigenMatrix = pMatrix @ qMatrix
+    if profile:
+        torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        qSquared, electricModes = torch.linalg.eig(eigenMatrix)
+        torch.cuda.synchronize(device)
+        eigTime = time.perf_counter() - start
+    else:
+        qSquared, electricModes = torch.linalg.eig(eigenMatrix)
+        eigTime = 0.0
     qValues = _forwardKzTorch(qSquared, torch)
     safeQ = qValues.clone()
     safeQ[torch.abs(safeQ) < 1e-13] = 1e-13 + 0j
@@ -752,7 +913,17 @@ def _layerModesTorch(layer: Layer | CompiledLayer, harmonics: Harmonics, torch: 
         dim=0,
     )
     qAll = torch.cat([qValues, -qValues], dim=0)
-    return qAll, _normalizeColumnsTorch(vectors, torch)
+    modes = qAll, _normalizeColumnsTorch(vectors, torch)
+    timing = None
+    if profile:
+        timing = LayerEigTiming(
+            layerIndex=layerIndex,
+            name=getattr(layer, "name", ""),
+            kind=factorized.factorization,
+            matrixShape=tuple(eigenMatrix.shape),
+            eigTimeSeconds=eigTime,
+        )
+    return modes, timing
 
 
 def _homogeneousBasisTorch(harmonics: Harmonics, eps: complex, direction: int, torch: Any, device: Any) -> Any:
@@ -805,37 +976,66 @@ def _homogeneousScalarLayerModesTorch(harmonics: Harmonics, epsilon: complex, to
     return torch.cat([qForward, -qForward]), torch.cat([forward, backward], dim=1)
 
 
-def _interfaceSMatrixTorch(
-    leftForward: Any,
-    leftBackward: Any,
-    rightForward: Any,
-    rightBackward: Any,
+def _interfaceSMatricesTorch(
+    regionForward: Sequence[Any],
+    regionBackward: Sequence[Any],
     torch: Any,
-) -> _TorchSMatrix:
-    size = leftForward.shape[1]
-    matrix = torch.cat([leftBackward, -rightForward], dim=1)
-    rhs = torch.cat([-leftForward, rightBackward], dim=1)
-    solved = torch.linalg.solve(matrix, rhs)
-    return _TorchSMatrix(
-        s11=solved[:size, :size],
-        s12=solved[:size, size:],
-        s21=solved[size:, :size],
-        s22=solved[size:, size:],
+) -> tuple[_TorchSMatrix, ...]:
+    size = regionForward[0].shape[1]
+    matrices = []
+    rightHandSides = []
+    for index in range(len(regionForward) - 1):
+        matrices.append(torch.cat([regionBackward[index], -regionForward[index + 1]], dim=1))
+        rightHandSides.append(torch.cat([-regionForward[index], regionBackward[index + 1]], dim=1))
+
+    if not matrices:
+        return ()
+
+    solvedBatch = torch.linalg.solve(torch.stack(matrices, dim=0), torch.stack(rightHandSides, dim=0))
+    return tuple(
+        _TorchSMatrix(
+            s11=solved[:size, :size],
+            s12=solved[:size, size:],
+            s21=solved[size:, :size],
+            s22=solved[size:, size:],
+        )
+        for solved in solvedBatch
     )
 
 
 def _propagationSMatrixTorch(propagation: Any, torch: Any) -> _TorchSMatrix:
     zero = torch.zeros_like(propagation)
-    return _TorchSMatrix(s11=zero, s12=propagation, s21=propagation, s22=zero)
+    return _TorchSMatrix(s11=zero, s12=propagation, s21=propagation, s22=zero, isPropagation=True)
 
 
 def _identitySMatrixTorch(size: int, torch: Any, device: Any) -> _TorchSMatrix:
     zero = torch.zeros((size, size), dtype=torch.complex128, device=device)
     identity = torch.eye(size, dtype=torch.complex128, device=device)
-    return _TorchSMatrix(s11=zero, s12=identity, s21=identity, s22=zero)
+    return _TorchSMatrix(s11=zero, s12=identity, s21=identity, s22=zero, isIdentity=True)
 
 
 def _redhefferStarTorch(left: _TorchSMatrix, right: _TorchSMatrix, torch: Any, device: Any) -> _TorchSMatrix:
+    if left.isIdentity:
+        return right
+    if right.isIdentity:
+        return left
+    if right.isPropagation:
+        propagation = torch.diagonal(right.s21)
+        return _TorchSMatrix(
+            s11=left.s11,
+            s12=left.s12 * propagation[None, :],
+            s21=propagation[:, None] * left.s21,
+            s22=propagation[:, None] * left.s22 * propagation[None, :],
+        )
+    if left.isPropagation:
+        propagation = torch.diagonal(left.s21)
+        return _TorchSMatrix(
+            s11=propagation[:, None] * right.s11 * propagation[None, :],
+            s12=propagation[:, None] * right.s12,
+            s21=right.s21 * propagation[None, :],
+            s22=right.s22,
+        )
+
     size = left.s11.shape[0]
     identity = torch.eye(size, dtype=torch.complex128, device=device)
     leftSolved = torch.linalg.solve(
@@ -855,13 +1055,42 @@ def _redhefferStarTorch(left: _TorchSMatrix, right: _TorchSMatrix, torch: Any, d
     return _TorchSMatrix(s11=s11, s12=s12, s21=s21, s22=s22)
 
 
-def _cascadeManyTorch(components: Sequence[_TorchSMatrix], size: int, torch: Any, device: Any) -> _TorchSMatrix:
-    if not components:
-        return _identitySMatrixTorch(size, torch, device)
-    result = components[0]
-    for component in components[1:]:
-        result = _redhefferStarTorch(result, component, torch, device)
-    return result
+def _reflectionTransmissionOnlySMatrixTorch(
+    components: Sequence[_TorchSMatrix],
+    size: int,
+    torch: Any,
+    device: Any,
+) -> _TorchSMatrix:
+    reflection, transmission = _enhancedReflectionTransmissionTorch(components, size, torch, device)
+    zero = torch.zeros_like(reflection)
+    return _TorchSMatrix(s11=reflection, s12=zero.clone(), s21=transmission, s22=zero.clone())
+
+
+def _enhancedReflectionTransmissionTorch(
+    components: Sequence[_TorchSMatrix],
+    size: int,
+    torch: Any,
+    device: Any,
+) -> tuple[Any, Any]:
+    identity = torch.eye(size, dtype=torch.complex128, device=device)
+    reflection = torch.zeros((size, size), dtype=torch.complex128, device=device)
+    transmission = identity.clone()
+    for component in reversed(components):
+        if component.isIdentity:
+            continue
+        if component.isPropagation:
+            propagation = torch.diagonal(component.s21)
+            reflection = propagation[:, None] * reflection * propagation[None, :]
+            transmission = transmission * propagation[None, :]
+            continue
+        internalReflection = torch.linalg.solve(
+            identity - reflection @ component.s22,
+            reflection @ component.s21,
+        )
+        forward = component.s21 + component.s22 @ internalReflection
+        transmission = transmission @ forward
+        reflection = component.s11 + component.s12 @ internalReflection
+    return reflection, transmission
 
 
 def _prefixSMatricesTorch(components: Sequence[_TorchSMatrix], size: int, torch: Any, device: Any) -> list[_TorchSMatrix]:
@@ -1007,6 +1236,7 @@ def _resultFromTorchAmplitudes(
         incidentFlux=float(incidentFlux),
         solvedBy=solvedBy,
         layerSolutions=layerSolutions,
+        layerEigTimings=prepared.layerEigTimings,
         epsIncident=prepared.epsIncident,
         epsTransmission=prepared.epsTransmission,
         sAmplitude=sAmplitude,
