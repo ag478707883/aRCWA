@@ -20,6 +20,8 @@ SAVE_PLOTS = True
 METHOD = "smatrix"
 TRUNCATION = "circular"
 BACKEND = "cuda"
+PRECOMPILE = True
+CACHE_MODES = True
 
 WAVELENGTH = 1.0
 PERIOD = (0.8, 0.8)
@@ -31,10 +33,6 @@ GRID = 96
 EPS_BACKGROUND = 1.0
 EPS_ROD = 3.4**2
 
-I3 = np.eye(3, dtype=complex)
-EPS_BACKGROUND_TENSOR = EPS_BACKGROUND * I3
-EPS_ROD_TENSOR = EPS_ROD * I3
-
 
 if not SHOW:
     matplotlib.use("Agg")
@@ -44,31 +42,30 @@ import matplotlib.pyplot as plt
 layer = rcwa.circularPostLayer(
     period=PERIOD,
     thickness=THICKNESS,
-    background=EPS_BACKGROUND_TENSOR[0, 0],
-    post=EPS_ROD_TENSOR[0, 0],
+    background=EPS_BACKGROUND,
+    post=EPS_ROD,
     radius=FILL * PERIOD[0] / 2,
     analytic=True,
     name="analytic square-lattice rods",
 )
-compiledLayers = rcwa.compileLayers([layer], orders=ORDER, truncation=TRUNCATION)
-
-result = rcwa.solveStack(
-    layers=compiledLayers,
-    wavelength=WAVELENGTH,
+simulation = rcwa.RCWASimulation(
     period=PERIOD,
+    layers=[layer],
     orders=ORDER,
-    epsIncident=EPS_BACKGROUND_TENSOR[0, 0],
-    epsTransmission=EPS_BACKGROUND_TENSOR[0, 0],
-    sAmplitude=1.0,
-    method=METHOD,
     truncation=TRUNCATION,
+    epsIncident=EPS_BACKGROUND,
+    epsTransmission=EPS_BACKGROUND,
+    method=METHOD,
     backend=BACKEND,
+    precompile=PRECOMPILE,
+    cacheModes=CACHE_MODES,
 )
 
+result = simulation.solve(WAVELENGTH, polarization="TE")
+
 print("Binary grating / rod lattice")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, order={ORDER}")
-print(f"epsilon background tensor:\n{EPS_BACKGROUND_TENSOR}")
-print(f"epsilon rod tensor:\n{EPS_ROD_TENSOR}")
+print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, order={ORDER}")
+print(f"epsilon background={EPS_BACKGROUND:.6g}, rod={EPS_ROD:.6g}")
 print(f"R = {result.reflection:.8f}")
 print(f"T = {result.transmission:.8f}")
 print(f"R + T = {result.conservation:.8f}")
@@ -84,8 +81,8 @@ for diffractionOrder in result.orders:
         )
 
 if SAVE_PLOTS:
-    pattern = rcwa.Pattern2D(period=PERIOD, shape=(GRID, GRID), background=EPS_BACKGROUND_TENSOR[0, 0])
-    pattern.circle(radius=FILL * PERIOD[0] / 2, material=EPS_ROD_TENSOR[0, 0])
+    pattern = rcwa.Pattern2D(period=PERIOD, shape=(GRID, GRID), background=EPS_BACKGROUND)
+    pattern.circle(radius=FILL * PERIOD[0] / 2, material=EPS_ROD)
 
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), dpi=160, constrained_layout=True)
     image = axes[0].imshow(

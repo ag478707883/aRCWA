@@ -381,6 +381,48 @@ def evaluatePreparedBatch(
     return results
 
 
+def evaluatePreparedBatchPowers(
+    prepared: PreparedStack,
+    excitations: Mapping[str, tuple[complex, complex]],
+) -> dict[str, tuple[float, float]]:
+    labels = tuple(excitations)
+    if not labels:
+        return {}
+
+    arrayBackend = _resolveBackend(prepared.backend)
+    incidentColumns = arrayBackend.asarray(
+        np.column_stack([_incidentAmplitudeVector(prepared, *excitations[label]) for label in labels])
+    )
+    reflected = prepared.total.s11 @ incidentColumns
+    transmitted = prepared.total.s21 @ incidentColumns
+
+    reflectedBasis = arrayBackend.toNumpy(prepared.incidentBackward)
+    transmittedBasis = arrayBackend.toNumpy(prepared.transmissionForward)
+    reflectedNumpy = arrayBackend.toNumpy(reflected)
+    transmittedNumpy = arrayBackend.toNumpy(transmitted)
+
+    powers: dict[str, tuple[float, float]] = {}
+    for column, label in enumerate(labels):
+        sAmplitude, pAmplitude = excitations[label]
+        incident = _incidentField(
+            harmonics=prepared.harmonics,
+            eps=prepared.epsIncident,
+            sAmplitude=sAmplitude,
+            pAmplitude=pAmplitude,
+        )
+        incidentFlux = _checkedIncidentFlux(incident)
+        reflectedFluxes = _homogeneousOrderFluxes(reflectedBasis, reflectedNumpy[:, column], prepared.harmonics.count)
+        transmittedFluxes = _homogeneousOrderFluxes(
+            transmittedBasis,
+            transmittedNumpy[:, column],
+            prepared.harmonics.count,
+        )
+        reflection = float(np.sum(-reflectedFluxes / incidentFlux))
+        transmission = float(np.sum(transmittedFluxes / incidentFlux))
+        powers[label] = (reflection, transmission)
+    return powers
+
+
 def solveStack(
     layers: Sequence[Layer | CompiledLayer],
     wavelength: float,
@@ -449,6 +491,45 @@ def solveStackBatch(
 
     _requireSMatrixMethod(method)
     return _solveStackSMatrixBatch(
+        layers=layers,
+        wavelength=wavelength,
+        period=period,
+        orders=orders,
+        excitations=excitations,
+        epsIncident=epsIncident,
+        epsTransmission=epsTransmission,
+        theta=theta,
+        phi=phi,
+        truncation=truncation,
+        backend=backend,
+        profile=profile,
+    )
+
+
+def solveStackBatchPowers(
+    layers: Sequence[Layer | CompiledLayer],
+    wavelength: float,
+    period: tuple[float, float],
+    orders: tuple[int, int],
+    excitations: Mapping[str, tuple[complex, complex]],
+    epsIncident: complex = 1.0,
+    epsTransmission: complex = 1.0,
+    theta: float = 0.0,
+    phi: float = 0.0,
+    method: str = "smatrix",
+    truncation: str = "circular",
+    backend: str | _ArrayBackend | None = "cuda",
+    profile: bool = False,
+) -> dict[str, tuple[float, float]]:
+    """Return ``(reflection, transmission)`` for several incident states.
+
+    This is the same S-matrix solve as :func:`solveStackBatch`, but it skips
+    constructing full ``RCWAResult`` objects.  It is intended for spectrum
+    sweeps where only absorptivity is needed.
+    """
+
+    _requireSMatrixMethod(method)
+    return _solveStackSMatrixBatchPowers(
         layers=layers,
         wavelength=wavelength,
         period=period,
@@ -627,6 +708,65 @@ def _solveStackSMatrixBatch(
         profile=profile,
     )
     return evaluatePreparedBatch(prepared, excitations, solvedBy=f"smatrix-batch-{prepared.backend}")
+
+
+def _solveStackSMatrixBatchPowers(
+    layers: Sequence[Layer | CompiledLayer],
+    wavelength: float,
+    period: tuple[float, float],
+    orders: tuple[int, int],
+    excitations: Mapping[str, tuple[complex, complex]],
+    epsIncident: complex = 1.0,
+    epsTransmission: complex = 1.0,
+    theta: float = 0.0,
+    phi: float = 0.0,
+    truncation: str = "circular",
+    backend: str | _ArrayBackend | None = "cuda",
+    profile: bool = False,
+) -> dict[str, tuple[float, float]]:
+    fastPlan = _automaticFastPathPlan(
+        layers=layers,
+        wavelength=wavelength,
+        period=period,
+        orders=orders,
+        epsIncident=epsIncident,
+        theta=theta,
+        phi=phi,
+        truncation=truncation,
+        returnFields=False,
+    )
+    if fastPlan is not None:
+        reducedResults = _solveStackReducedSMatrixBatch(
+            layers=layers,
+            wavelength=wavelength,
+            period=period,
+            epsIncident=epsIncident,
+            epsTransmission=epsTransmission,
+            theta=theta,
+            phi=phi,
+            excitations=excitations,
+            truncation=truncation,
+            backend=backend,
+            plan=fastPlan,
+            profile=profile,
+        )
+        return {label: (result.reflection, result.transmission) for label, result in reducedResults.items()}
+
+    prepared = prepareStackSMatrix(
+        layers=layers,
+        wavelength=wavelength,
+        period=period,
+        orders=orders,
+        epsIncident=epsIncident,
+        epsTransmission=epsTransmission,
+        theta=theta,
+        phi=phi,
+        truncation=truncation,
+        backend=backend,
+        fullTotal=False,
+        profile=profile,
+    )
+    return evaluatePreparedBatchPowers(prepared, excitations)
 
 
 def _solveStackReducedSMatrix(
@@ -1349,10 +1489,7 @@ def _homogeneousTensorLayerModesMeasured(
     collectTiming: bool,
 ) -> tuple[ComplexArray, ComplexArray, tuple[int, ...], float]:
     nOrders = harmonics.count
-    systems = np.stack(
-        [_homogeneousOrderSystemMatrix(tensor, kx, ky) for kx, ky in zip(harmonics.kx, harmonics.ky)],
-        axis=0,
-    )
+    systems = _homogeneousOrderSystemMatrices(tensor, harmonics.kx, harmonics.ky)
     start = time.perf_counter() if collectTiming else None
     orderQ, orderVectors = np.linalg.eig(systems)
     eigTime = time.perf_counter() - start if start is not None else 0.0
@@ -1369,6 +1506,44 @@ def _homogeneousTensorLayerModesMeasured(
     vectors = _normalizeModes(vectors, _CPU_BACKEND)
     qValues, vectors = _splitForwardBackward(qValues, vectors, 2 * nOrders, _CPU_BACKEND)
     return qValues, vectors, tuple(systems.shape), eigTime
+
+
+def _homogeneousOrderSystemMatrices(tensor: ComplexArray, kx: ComplexArray, ky: ComplexArray) -> ComplexArray:
+    exx, exy, exz = tensor[0]
+    eyx, eyy, eyz = tensor[1]
+    ezx, ezy, ezz = tensor[2]
+    if abs(ezz) < 1e-14:
+        raise ValueError("epsilon_zz is near zero in a homogeneous anisotropic layer")
+    eta = 1.0 / ezz
+
+    dxEx = exx - exz * eta * ezx
+    dxEy = exy - exz * eta * ezy
+    dxHx = exz * eta * ky
+    dxHy = -exz * eta * kx
+
+    dyEx = eyx - eyz * eta * ezx
+    dyEy = eyy - eyz * eta * ezy
+    dyHx = eyz * eta * ky
+    dyHy = -eyz * eta * kx
+
+    systems = np.empty((kx.size, 4, 4), dtype=complex)
+    systems[:, 0, 0] = -kx * eta * ezx
+    systems[:, 0, 1] = -kx * eta * ezy
+    systems[:, 0, 2] = kx * eta * ky
+    systems[:, 0, 3] = 1.0 - kx * eta * kx
+    systems[:, 1, 0] = -ky * eta * ezx
+    systems[:, 1, 1] = -ky * eta * ezy
+    systems[:, 1, 2] = ky * eta * ky - 1.0
+    systems[:, 1, 3] = -ky * eta * kx
+    systems[:, 2, 0] = -kx * ky - dyEx
+    systems[:, 2, 1] = kx * kx - dyEy
+    systems[:, 2, 2] = -dyHx
+    systems[:, 2, 3] = -dyHy
+    systems[:, 3, 0] = dxEx - ky * ky
+    systems[:, 3, 1] = dxEy + ky * kx
+    systems[:, 3, 2] = dxHx
+    systems[:, 3, 3] = dxHy
+    return systems
 
 
 def _homogeneousOrderSystemMatrix(tensor: ComplexArray, kx: complex, ky: complex) -> ComplexArray:
@@ -1792,7 +1967,7 @@ def _solveInterfaceBlocks(backend: _ArrayBackend, matrix: object, *rhsBlocks: ob
 
 
 def _interfaceSolveMethod() -> str:
-    return os.environ.get("RCWA3D_INTERFACE_SOLVER", "lu").strip().lower()
+    return os.environ.get("RCWA3D_INTERFACE_SOLVER", "solve").strip().lower()
 
 
 def _cascadeMany(components: Sequence[_SMatrix], size: int, backend: _ArrayBackend) -> _SMatrix:
@@ -1889,20 +2064,43 @@ def _homogeneousBasis(harmonics: _Harmonics, eps: complex, direction: int) -> Co
         raise ValueError("direction must be +1 or -1")
     nOrders = harmonics.count
     basis = np.zeros((4 * nOrders, 2 * nOrders), dtype=complex)
-    kzForward = _forwardKz(eps - harmonics.kx**2 - harmonics.ky**2)
-    for index, (kx, ky, kzPositive) in enumerate(zip(harmonics.kx, harmonics.ky, kzForward)):
-        kz = kzPositive if direction > 0 else -kzPositive
-        sField, pField = _planeWaveFields(kx, ky, kz, eps)
-        sColumn = 2 * index
-        pColumn = sColumn + 1
-        basis[index, sColumn] = sField[0]
-        basis[nOrders + index, sColumn] = sField[1]
-        basis[2 * nOrders + index, sColumn] = sField[2]
-        basis[3 * nOrders + index, sColumn] = sField[3]
-        basis[index, pColumn] = pField[0]
-        basis[nOrders + index, pColumn] = pField[1]
-        basis[2 * nOrders + index, pColumn] = pField[2]
-        basis[3 * nOrders + index, pColumn] = pField[3]
+    kx = harmonics.kx
+    ky = harmonics.ky
+    kz = _forwardKz(eps - kx**2 - ky**2)
+    if direction < 0:
+        kz = -kz
+
+    transverse = np.sqrt(kx * kx + ky * ky + 0j)
+    normal = np.abs(transverse) < 1e-14
+    safeTransverse = np.where(normal, 1.0 + 0.0j, transverse)
+    sx = np.where(normal, 0.0 + 0.0j, -ky / safeTransverse)
+    sy = np.where(normal, 1.0 + 0.0j, kx / safeTransverse)
+
+    refractiveIndex = np.sqrt(eps + 0j)
+    if np.imag(refractiveIndex) < -1e-14 or (
+        abs(np.imag(refractiveIndex)) <= 1e-14 and np.real(refractiveIndex) < 0
+    ):
+        refractiveIndex = -refractiveIndex
+
+    px = sy * kz / refractiveIndex
+    py = -sx * kz / refractiveIndex
+    pz = (sx * ky - sy * kx) / refractiveIndex
+    hsx = -kz * sy
+    hsy = kz * sx
+    hpx = ky * pz - kz * py
+    hpy = kz * px - kx * pz
+
+    orderIndices = np.arange(nOrders)
+    sColumns = 2 * orderIndices
+    pColumns = sColumns + 1
+    basis[orderIndices, sColumns] = sx
+    basis[nOrders + orderIndices, sColumns] = sy
+    basis[2 * nOrders + orderIndices, sColumns] = hsx
+    basis[3 * nOrders + orderIndices, sColumns] = hsy
+    basis[orderIndices, pColumns] = px
+    basis[nOrders + orderIndices, pColumns] = py
+    basis[2 * nOrders + orderIndices, pColumns] = hpx
+    basis[3 * nOrders + orderIndices, pColumns] = hpy
     return basis
 
 

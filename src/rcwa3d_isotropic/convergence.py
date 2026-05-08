@@ -7,7 +7,7 @@ import numpy as np
 
 from .fields import fieldSliceXy, fieldSliceXz, stackFieldSliceXz
 from .fourier import OrderSpec, normalizeOrders
-from .solver import solveStack
+from .simulation import RCWASimulation
 from .types import CompiledLayer, Layer, RCWAResult
 from .varrcwa import AdaptiveLayerSpec
 
@@ -119,6 +119,9 @@ def sweepOrders(
 ) -> OrderSweepReport:
     """Sweep Fourier orders and report adjacent R/T and optional field changes."""
 
+    if method != "smatrix":
+        raise ValueError("sweepOrders supports only method='smatrix'")
+
     sequence = _orderSequence(orderSequence, maxOrder)
     previousResult: RCWAResult | None = None
     previousField: np.ndarray | None = None
@@ -126,21 +129,23 @@ def sweepOrders(
 
     for orders in sequence:
         normalized = normalizeOrders(orders)
-        result = solveStack(
+        simulation = RCWASimulation(
             layers=layers,
-            wavelength=wavelength,
             period=period,
             orders=normalized,
             epsIncident=epsIncident,
             epsTransmission=epsTransmission,
+            truncation=truncation,
+            backend=backend,
+            method=method,
+        )
+        result = simulation.solveExcitation(
+            wavelength,
             theta=theta,
             phi=phi,
             sAmplitude=sAmplitude,
             pAmplitude=pAmplitude,
             returnFields=fieldComponent is not None,
-            method=method,
-            truncation=truncation,
-            backend=backend,
         )
         fieldMap = (
             _sampleField(

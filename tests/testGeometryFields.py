@@ -13,7 +13,6 @@ from rcwa3d_isotropic import (
     SI1550,
     Pattern2D,
     RCWASimulation,
-    compileLayers,
     fieldComponentsXy,
     fieldComponentsXz,
     stackFieldComponentsXz,
@@ -26,8 +25,8 @@ from rcwa3d_isotropic import (
     reconstructFourierGrid,
     stackFieldComponentsXy,
     stackFieldSliceXy,
-    solveStack,
 )
+from rcwa3d_isotropic.solver import _compileLayers
 
 
 class GeometryFieldTests(unittest.TestCase):
@@ -48,7 +47,7 @@ class GeometryFieldTests(unittest.TestCase):
 
         pattern = Pattern2D(period=period, shape=(160, 200), background=background)
         pattern.rectangle(size=size, center=center, material=inclusion, useNormal=False)
-        sampledLayer = compileLayers(
+        sampledLayer = _compileLayers(
             [pattern.toLayer(0.1, factorization="standard")],
             orders=(2, 2),
             truncation="rectangular",
@@ -82,7 +81,7 @@ class GeometryFieldTests(unittest.TestCase):
 
         pattern = Pattern2D(period=period, shape=(240, 240), background=background)
         pattern.circle(radius=radius, center=center, material=inclusion, useNormal=False)
-        sampledLayer = compileLayers(
+        sampledLayer = _compileLayers(
             [pattern.toLayer(0.1, factorization="standard")],
             orders=(2, 2),
             truncation="rectangular",
@@ -165,9 +164,8 @@ class GeometryFieldTests(unittest.TestCase):
         pattern = Pattern2D(period=(0.7, 0.5), shape=(32, 36), background=AIR)
         pattern.rectangle(size=(0.22, 0.16), material=SI1550)
         layer = pattern.toLayer(thickness=0.12)
-        layers = compileLayers([layer], orders=(1, 1))
-        result = solveStack(
-            layers=layers,
+        result = _solveIsotropic(
+            layers=[layer],
             wavelength=1.1,
             period=pattern.period,
             orders=(1, 1),
@@ -246,9 +244,8 @@ class GeometryFieldTests(unittest.TestCase):
 
     def testMagneticIntensityMatchesAnalyticPlaneWave(self) -> None:
         layer = Layer(thickness=0.25, epsilon=1.0, name="matched air layer")
-        layers = compileLayers([layer], orders=0, truncation="circular")
-        result = solveStack(
-            layers=layers,
+        result = _solveIsotropic(
+            layers=[layer],
             wavelength=1.0,
             period=(1.0, 1.0),
             orders=0,
@@ -305,9 +302,8 @@ class GeometryFieldTests(unittest.TestCase):
     def testIncidentNormalizedIntensityUsesActualIncidentMedium(self) -> None:
         epsilon = 2.25
         layer = Layer(thickness=0.2, epsilon=epsilon, name="matched glass layer")
-        layers = compileLayers([layer], orders=0, truncation="circular")
-        result = solveStack(
-            layers=layers,
+        result = _solveIsotropic(
+            layers=[layer],
             wavelength=1.0,
             period=(1.0, 1.0),
             orders=0,
@@ -337,9 +333,8 @@ class GeometryFieldTests(unittest.TestCase):
         pattern = Pattern2D(period=(0.7, 0.5), shape=(32, 36), background=AIR)
         pattern.rectangle(size=(0.22, 0.16), material=SI1550)
         layer = pattern.toLayer(thickness=0.12)
-        layers = compileLayers([layer], orders=(1, 1))
-        common = dict(
-            layers=layers,
+        sMatrixResult = _solveIsotropic(
+            layers=[layer],
             wavelength=1.1,
             period=pattern.period,
             orders=(1, 1),
@@ -347,8 +342,6 @@ class GeometryFieldTests(unittest.TestCase):
             epsTransmission=AIR.epsilon(),
             returnFields=True,
         )
-
-        sMatrixResult = solveStack(**common, method="smatrix")
         self.assertTrue(np.isfinite(sMatrixResult.reflection))
         self.assertTrue(np.isfinite(sMatrixResult.transmission))
 
@@ -386,9 +379,8 @@ class GeometryFieldTests(unittest.TestCase):
         distance = 0.08
         pattern = Pattern2D(period=period, shape=(32, 36), background=AIR)
         pattern.circle(radius=0.11, material=SI1550)
-        layers = compileLayers([pattern.toLayer(thickness=thickness)], orders=(1, 1))
-        result = solveStack(
-            layers=layers,
+        result = _solveIsotropic(
+            layers=[pattern.toLayer(thickness=thickness)],
             wavelength=wavelength,
             period=period,
             orders=(1, 1),
@@ -429,9 +421,8 @@ class GeometryFieldTests(unittest.TestCase):
         distance = 0.08
         pattern = Pattern2D(period=period, shape=(32, 36), background=AIR)
         pattern.circle(radius=0.11, material=SI1550)
-        layers = compileLayers([pattern.toLayer(thickness=thickness)], orders=(1, 1))
-        result = solveStack(
-            layers=layers,
+        result = _solveIsotropic(
+            layers=[pattern.toLayer(thickness=thickness)],
             wavelength=wavelength,
             period=period,
             orders=(1, 1),
@@ -463,6 +454,41 @@ class GeometryFieldTests(unittest.TestCase):
             np.abs(maps["Ex"]) ** 2 + np.abs(maps["Ey"]) ** 2 + np.abs(maps["Ez"]) ** 2
         )
         np.testing.assert_allclose(maps["EIntensity"], expectedIntensity, rtol=1e-12, atol=1e-12)
+
+
+def _solveIsotropic(
+    *,
+    layers,
+    wavelength,
+    period,
+    orders,
+    epsIncident=1.0,
+    epsTransmission=1.0,
+    theta=0.0,
+    phi=0.0,
+    sAmplitude=1.0,
+    pAmplitude=0.0,
+    returnFields=False,
+    truncation="circular",
+    backend="cuda",
+):
+    simulation = RCWASimulation(
+        period=period,
+        layers=layers,
+        orders=orders,
+        truncation=truncation,
+        epsIncident=epsIncident,
+        epsTransmission=epsTransmission,
+        backend=backend,
+    )
+    return simulation.solveExcitation(
+        wavelength,
+        theta=theta,
+        phi=phi,
+        sAmplitude=sAmplitude,
+        pAmplitude=pAmplitude,
+        returnFields=returnFields,
+    )
 
 
 if __name__ == "__main__":

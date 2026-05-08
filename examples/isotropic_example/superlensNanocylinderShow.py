@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import time
 
 import matplotlib
 import numpy as np
@@ -20,6 +21,8 @@ SAVE_PLOTS = True
 METHOD = "smatrix"
 TRUNCATION = "circular"
 BACKEND = "cuda"
+PRECOMPILE = True
+CACHE_MODES = True
 FACTORIZATION = "standard"
 QUANTITY = "realEx"
 NORMALIZE = False
@@ -39,70 +42,65 @@ EPS_SUBSTRATE = 2.12074
 EPS_INCIDENT = EPS_SUBSTRATE
 EPS_EMITTING = 1.0
 
-I3 = np.eye(3, dtype=complex)
-EPS_CYLINDER_TENSOR = EPS_CYLINDER * I3
-EPS_SUBSTRATE_TENSOR = EPS_SUBSTRATE * I3
-EPS_INCIDENT_TENSOR = EPS_INCIDENT * I3
-EPS_EMITTING_TENSOR = EPS_EMITTING * I3
-
 
 if not SHOW:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-pattern50 = rcwa.Pattern2D(period=(PERIOD, PERIOD), shape=(DISPLAY_GRID, DISPLAY_GRID), background=EPS_EMITTING_TENSOR[0, 0])
-pattern50.circle(radius=0.05, material=EPS_CYLINDER_TENSOR[0, 0])
+pattern50 = rcwa.Pattern2D(period=(PERIOD, PERIOD), shape=(DISPLAY_GRID, DISPLAY_GRID), background=EPS_EMITTING)
+pattern50.circle(radius=0.05, material=EPS_CYLINDER)
 layer50 = rcwa.circularPostLayer(
     period=(PERIOD, PERIOD),
     thickness=HEIGHT,
-    background=EPS_EMITTING_TENSOR[0, 0],
-    post=EPS_CYLINDER_TENSOR[0, 0],
+    background=EPS_EMITTING,
+    post=EPS_CYLINDER,
     radius=0.05,
     analytic=True,
     factorization=FACTORIZATION,
     name="analytic nanocylinder r=0.05",
 )
-compiledLayers50 = rcwa.compileLayers([layer50], orders=ORDER, truncation=TRUNCATION)
-result50X = rcwa.solveStack(
-    layers=compiledLayers50,
-    wavelength=WAVELENGTH,
+simulation50 = rcwa.RCWASimulation(
     period=(PERIOD, PERIOD),
+    layers=[layer50],
     orders=ORDER,
-    epsIncident=EPS_INCIDENT_TENSOR[0, 0],
-    epsTransmission=EPS_EMITTING_TENSOR[0, 0],
-    sAmplitude=0.0,
-    pAmplitude=1.0,
-    returnFields=True,
-    method=METHOD,
     truncation=TRUNCATION,
+    epsIncident=EPS_INCIDENT,
+    epsTransmission=EPS_EMITTING,
+    method=METHOD,
     backend=BACKEND,
+    precompile=PRECOMPILE,
+    cacheModes=CACHE_MODES,
 )
+backend = rcwa.resolveBackend(BACKEND)
+backend.synchronize()
+startTime = time.perf_counter()
+result50X = simulation50.solve(WAVELENGTH, polarization="TM", returnFields=True)
 layer100 = rcwa.circularPostLayer(
     period=(PERIOD, PERIOD),
     thickness=HEIGHT,
-    background=EPS_EMITTING_TENSOR[0, 0],
-    post=EPS_CYLINDER_TENSOR[0, 0],
+    background=EPS_EMITTING,
+    post=EPS_CYLINDER,
     radius=0.10,
     analytic=True,
     factorization=FACTORIZATION,
     name="analytic nanocylinder r=0.10",
 )
-compiledLayers100 = rcwa.compileLayers([layer100], orders=ORDER, truncation=TRUNCATION)
-result100X = rcwa.solveStack(
-    layers=compiledLayers100,
-    wavelength=WAVELENGTH,
+simulation100 = rcwa.RCWASimulation(
     period=(PERIOD, PERIOD),
+    layers=[layer100],
     orders=ORDER,
-    epsIncident=EPS_INCIDENT_TENSOR[0, 0],
-    epsTransmission=EPS_EMITTING_TENSOR[0, 0],
-    sAmplitude=0.0,
-    pAmplitude=1.0,
-    returnFields=True,
-    method=METHOD,
     truncation=TRUNCATION,
+    epsIncident=EPS_INCIDENT,
+    epsTransmission=EPS_EMITTING,
+    method=METHOD,
     backend=BACKEND,
+    precompile=PRECOMPILE,
+    cacheModes=CACHE_MODES,
 )
+result100X = simulation100.solve(WAVELENGTH, polarization="TM", returnFields=True)
+backend.synchronize()
+elapsed = time.perf_counter() - startTime
 
 xPlot = np.linspace(0.0, PERIOD, X_POINTS)
 zPlot = np.linspace(-0.20, HEIGHT + 0.30, Z_POINTS)
@@ -128,11 +126,10 @@ _xXy, _yXy, fieldMapsXy = rcwa.stackFieldComponentsXy(
 electricIntensityXy = fieldMapsXy["EIntensity"]
 
 print("Superlens nanocylinder RCWA check")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, order={ORDER}, factorization={FACTORIZATION}")
+print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, order={ORDER}, factorization={FACTORIZATION}")
 print("normal-incidence fields: p=x-polarized, s=y-polarized")
-print(f"epsilon cylinder tensor:\n{EPS_CYLINDER_TENSOR}")
-print(f"epsilon substrate tensor:\n{EPS_SUBSTRATE_TENSOR}")
-print(f"epsilon emitting tensor:\n{EPS_EMITTING_TENSOR}")
+print(f"epsilon cylinder={EPS_CYLINDER:.6g}, substrate={EPS_SUBSTRATE:.6g}, emitting={EPS_EMITTING:.6g}")
+print(f"elapsed={elapsed:.3f} s")
 print(f"r=50 nm x-pol: R={result50X.reflection:.6f}, T={result50X.transmission:.6f}, R+T={result50X.conservation:.6f}")
 print(f"r=100 nm x-pol: R={result100X.reflection:.6f}, T={result100X.transmission:.6f}, R+T={result100X.conservation:.6f}")
 print(f"Max |E|^2 in x-z slice, r=50 nm x-pol: {np.max(electricIntensityXz['r50']):.6f}")

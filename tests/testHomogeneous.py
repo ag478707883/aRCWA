@@ -4,7 +4,7 @@ import unittest
 import numpy as np
 
 import bootstrap  # noqa: F401
-from rcwa3d_isotropic import Layer, solveStack
+from rcwa3d_isotropic import Layer, RCWASimulation
 
 
 def slabReflectance(n0: float, n1: float, n2: float, wavelength: float, thickness: float) -> float:
@@ -18,7 +18,7 @@ def slabReflectance(n0: float, n1: float, n2: float, wavelength: float, thicknes
 
 class HomogeneousTests(unittest.TestCase):
     def testNoLayerMatchesFresnelInterface(self) -> None:
-        result = solveStack(
+        result = _solveIsotropic(
             layers=[],
             wavelength=1.0,
             period=(1.0, 1.0),
@@ -35,7 +35,7 @@ class HomogeneousTests(unittest.TestCase):
     def testUniformSlabMatchesTransferMatrix(self) -> None:
         wavelength = 1.0
         thickness = 0.30
-        result = solveStack(
+        result = _solveIsotropic(
             layers=[Layer(thickness=thickness, epsilon=2.25)],
             wavelength=wavelength,
             period=(1.0, 1.0),
@@ -61,7 +61,7 @@ class HomogeneousTests(unittest.TestCase):
 
         for polarization in ("s", "p"):
             with self.subTest(polarization=polarization):
-                result = solveStack(
+                result = _solveIsotropic(
                     layers=[],
                     wavelength=1.0,
                     period=(1.0, 1.0),
@@ -76,7 +76,7 @@ class HomogeneousTests(unittest.TestCase):
                 self.assertAlmostEqual(result.conservation, 1.0, places=12)
 
     def testSampledUniformLayerDoesNotCreateSpuriousDiffraction(self) -> None:
-        result = solveStack(
+        result = _solveIsotropic(
             layers=[Layer(thickness=0.2, epsilon=np.full((24, 20), 2.25))],
             wavelength=1.0,
             period=(0.7, 0.8),
@@ -91,6 +91,41 @@ class HomogeneousTests(unittest.TestCase):
         )
         self.assertAlmostEqual(offZeroPower, 0.0, places=10)
         self.assertAlmostEqual(result.conservation, 1.0, places=10)
+
+
+def _solveIsotropic(
+    *,
+    layers,
+    wavelength,
+    period,
+    orders,
+    epsIncident=1.0,
+    epsTransmission=1.0,
+    theta=0.0,
+    phi=0.0,
+    sAmplitude=1.0,
+    pAmplitude=0.0,
+    returnFields=False,
+    truncation="circular",
+    backend="cuda",
+):
+    simulation = RCWASimulation(
+        period=period,
+        layers=layers,
+        orders=orders,
+        truncation=truncation,
+        epsIncident=epsIncident,
+        epsTransmission=epsTransmission,
+        backend=backend,
+    )
+    return simulation.solveExcitation(
+        wavelength,
+        theta=theta,
+        phi=phi,
+        sAmplitude=sAmplitude,
+        pAmplitude=pAmplitude,
+        returnFields=returnFields,
+    )
 
 
 if __name__ == "__main__":

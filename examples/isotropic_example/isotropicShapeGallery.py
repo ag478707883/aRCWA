@@ -20,6 +20,8 @@ SAVE_PLOTS = True
 METHOD = "smatrix"
 TRUNCATION = "circular"
 BACKEND = "cuda"
+PRECOMPILE = True
+CACHE_MODES = True
 
 PERIOD = (1.0, 1.0)
 WAVELENGTH = 1.15
@@ -30,11 +32,7 @@ GRID = (96, 96)
 EPS_BACKGROUND = 1.0
 EPS_POST = 2.8**2
 
-I3 = np.eye(3, dtype=complex)
-EPS_BACKGROUND_TENSOR = EPS_BACKGROUND * I3
-EPS_POST_TENSOR = EPS_POST * I3
-
-POLARIZATION_CASES = (("TE", 1.0, 0.0), ("TM", 0.0, 1.0))
+POLARIZATIONS = ("TE", "TM")
 
 
 if not SHOW:
@@ -42,8 +40,8 @@ if not SHOW:
 import matplotlib.pyplot as plt
 
 
-stripePattern = rcwa.Pattern2D(period=PERIOD, shape=GRID, background=EPS_BACKGROUND_TENSOR[0, 0], name="sampled stripes")
-stripePattern.stripes(fillFraction=0.38, material=EPS_POST_TENSOR[0, 0], axis="x")
+stripePattern = rcwa.Pattern2D(period=PERIOD, shape=GRID, background=EPS_BACKGROUND, name="sampled stripes")
+stripePattern.stripes(fillFraction=0.38, material=EPS_POST, axis="x")
 
 shapeCases = [
     (
@@ -51,8 +49,8 @@ shapeCases = [
         rcwa.circularPostLayer(
             PERIOD,
             HEIGHT,
-            EPS_BACKGROUND_TENSOR[0, 0],
-            EPS_POST_TENSOR[0, 0],
+            EPS_BACKGROUND,
+            EPS_POST,
             radius=0.20,
             analytic=True,
             name="analytic circular post",
@@ -63,8 +61,8 @@ shapeCases = [
         rcwa.ellipticalPostLayer(
             PERIOD,
             HEIGHT,
-            EPS_BACKGROUND_TENSOR[0, 0],
-            EPS_POST_TENSOR[0, 0],
+            EPS_BACKGROUND,
+            EPS_POST,
             radii=(0.25, 0.12),
             angle=np.deg2rad(25),
             analytic=True,
@@ -75,8 +73,8 @@ shapeCases = [
         rcwa.rectangularPostLayer(
             PERIOD,
             HEIGHT,
-            EPS_BACKGROUND_TENSOR[0, 0],
-            EPS_POST_TENSOR[0, 0],
+            EPS_BACKGROUND,
+            EPS_POST,
             size=(0.34, 0.18),
             angle=np.deg2rad(20),
             analytic=True,
@@ -87,8 +85,8 @@ shapeCases = [
         rcwa.annularPostLayer(
             PERIOD,
             HEIGHT,
-            EPS_BACKGROUND_TENSOR[0, 0],
-            EPS_POST_TENSOR[0, 0],
+            EPS_BACKGROUND,
+            EPS_POST,
             innerRadius=0.10,
             outerRadius=0.24,
             analytic=True,
@@ -99,8 +97,8 @@ shapeCases = [
         rcwa.rectangularHollowPostLayer(
             PERIOD,
             HEIGHT,
-            EPS_BACKGROUND_TENSOR[0, 0],
-            EPS_POST_TENSOR[0, 0],
+            EPS_BACKGROUND,
+            EPS_POST,
             size=(0.46, 0.38),
             holeRadius=0.11,
             analytic=True,
@@ -111,8 +109,8 @@ shapeCases = [
         rcwa.crossPostLayer(
             PERIOD,
             HEIGHT,
-            EPS_BACKGROUND_TENSOR[0, 0],
-            EPS_POST_TENSOR[0, 0],
+            EPS_BACKGROUND,
+            EPS_POST,
             armLengths=(0.52, 0.44),
             armWidths=(0.14, 0.12),
             angle=np.deg2rad(12),
@@ -125,8 +123,8 @@ shapeCases = [
         rcwa.polygonPostLayer(
             period=PERIOD,
             thickness=HEIGHT,
-            background=EPS_BACKGROUND_TENSOR[0, 0],
-            post=EPS_POST_TENSOR[0, 0],
+            background=EPS_BACKGROUND,
+            post=EPS_POST,
             vertices=((-0.22, -0.14), (0.19, -0.21), (0.25, 0.12), (-0.08, 0.24), (-0.25, 0.02)),
             shape=GRID,
             factorization="standard",
@@ -137,31 +135,29 @@ shapeCases = [
 
 rows = []
 for label, layer in shapeCases:
-    compiledLayers = rcwa.compileLayers([layer], orders=ORDERS, truncation=TRUNCATION)
+    simulation = rcwa.RCWASimulation(
+        period=PERIOD,
+        layers=[layer],
+        orders=ORDERS,
+        truncation=TRUNCATION,
+        epsIncident=EPS_BACKGROUND,
+        epsTransmission=EPS_BACKGROUND,
+        method=METHOD,
+        backend=BACKEND,
+        precompile=PRECOMPILE,
+        cacheModes=CACHE_MODES,
+    )
+    spectrum = simulation.spectrum([WAVELENGTH], polarizations=POLARIZATIONS)
     row = {"shape": label}
-    for polarizationName, sAmplitude, pAmplitude in POLARIZATION_CASES:
-        result = rcwa.solveStack(
-            layers=compiledLayers,
-            wavelength=WAVELENGTH,
-            period=PERIOD,
-            orders=ORDERS,
-            epsIncident=EPS_BACKGROUND_TENSOR[0, 0],
-            epsTransmission=EPS_BACKGROUND_TENSOR[0, 0],
-            sAmplitude=sAmplitude,
-            pAmplitude=pAmplitude,
-            method=METHOD,
-            truncation=TRUNCATION,
-            backend=BACKEND,
-        )
-        row[f"{polarizationName} R"] = float(result.reflection)
-        row[f"{polarizationName} T"] = float(result.transmission)
-        row[f"{polarizationName} C"] = float(result.conservation)
+    for polarizationName in POLARIZATIONS:
+        row[f"{polarizationName} R"] = float(spectrum[polarizationName]["reflection"][0])
+        row[f"{polarizationName} T"] = float(spectrum[polarizationName]["transmission"][0])
+        row[f"{polarizationName} C"] = float(spectrum[polarizationName]["conservation"][0])
     rows.append(row)
 
 print("Isotropic RCWA shape gallery")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, wavelength={WAVELENGTH:.3f}, orders={ORDERS}")
-print(f"epsilon background tensor:\n{EPS_BACKGROUND_TENSOR}")
-print(f"epsilon post tensor:\n{EPS_POST_TENSOR}")
+print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, wavelength={WAVELENGTH:.3f}, orders={ORDERS}")
+print(f"epsilon background={EPS_BACKGROUND:.6g}, post={EPS_POST:.6g}")
 for row in rows:
     print(
         f"{row['shape']:>26s}: "

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import os
 from threading import Lock
-from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, Union
+from typing import Any, Iterable, Literal, Mapping, Sequence, Union
 
 import numpy as np
 
@@ -19,31 +19,16 @@ from .solver import (
     compileLayers,
     prepareStackSMatrix,
     solveStack,
-    solveStackBatch,
+    solveStackBatchPowers,
 )
 
 
 ComplexArray = np.ndarray
 EpsilonSource = Any
-LayerFactory = Callable[[float], Any]
 LayerInput = Any
 Polarization = Union[Literal["TE", "TM", "s", "p"], tuple[complex, complex]]
 ExcitationMap = Mapping[str, tuple[complex, complex]]
 SpectrumParallel = Literal["auto", "serial", "thread", "process"]
-
-
-@dataclass(frozen=True)
-class _SpectrumWorkerState:
-    period: tuple[float, float]
-    layers: tuple[LayerInput, ...]
-    orders: int | tuple[int, int]
-    truncation: str
-    backend: str
-    epsIncident: complex
-    epsTransmission: complex
-
-
-_PROCESS_SPECTRUM_STATE: _SpectrumWorkerState | None = None
 
 
 @dataclass(frozen=True)
@@ -177,7 +162,7 @@ class RCWASimulation:
         requestedWorkers = self.workers if workers is None else workers
         if requestedWorkers < 1:
             raise ValueError("workers must be at least 1")
-        parallelMode, workerCount = _spectrumParallelPlan(requestedWorkers, parallel, self.backend)
+        _, workerCount = _spectrumParallelPlan(requestedWorkers, parallel, self.backend)
 
         def solvePoint(item: tuple[int, float]) -> tuple[int, dict[str, tuple[float, float]]]:
             index, wavelength = item
@@ -192,28 +177,6 @@ class RCWASimulation:
         items = list(enumerate(values))
         if workerCount == 1 or len(items) <= 1:
             pointResults = map(solvePoint, items)
-        elif parallelMode == "process":
-            state = _SpectrumWorkerState(
-                period=self.period,
-                layers=tuple(self.layers),
-                orders=self.orders,
-                truncation=self.truncation,
-                backend=self.backend,
-                epsIncident=self.epsIncident,
-                epsTransmission=self.epsTransmission,
-            )
-            executor = ProcessPoolExecutor(
-                max_workers=workerCount,
-                initializer=_initializeSpectrumWorker,
-                initargs=(state,),
-            )
-            pointResults = executor.map(
-                _processSpectrumPoint,
-                (
-                    (index, float(wavelength), theta, phi, excitations, bidirectional)
-                    for index, wavelength in items
-                ),
-            )
         else:
             executor = ThreadPoolExecutor(max_workers=workerCount)
             pointResults = executor.map(solvePoint, items)
@@ -245,7 +208,7 @@ class RCWASimulation:
         bidirectional: bool,
     ) -> dict[str, tuple[float, float]]:
         layers = self._layersAt(wavelength)
-        forwardResults = self._solveBatch(
+        forwardPowers = self._solveBatchPowers(
             wavelength,
             layers=layers,
             theta=theta,
@@ -253,7 +216,7 @@ class RCWASimulation:
             excitations=excitations,
         )
         if bidirectional:
-            backwardResults = self._solveBatch(
+            backwardPowers = self._solveBatchPowers(
                 wavelength,
                 layers=layers,
                 theta=-theta,
@@ -261,16 +224,16 @@ class RCWASimulation:
                 excitations=excitations,
             )
         else:
-            backwardResults = {}
+            backwardPowers = {}
         return {
             label: (
-                _absorptionFromResult(forwardResults[label]),
-                _absorptionFromResult(backwardResults[label]) if bidirectional else np.nan,
+                _absorptionFromPowers(*forwardPowers[label]),
+                _absorptionFromPowers(*backwardPowers[label]) if bidirectional else np.nan,
             )
             for label in excitations
         }
 
-    def _solveBatch(
+    def _solveBatchPowers(
         self,
         wavelength: float,
         *,
@@ -278,8 +241,8 @@ class RCWASimulation:
         theta: float,
         phi: float,
         excitations: dict[str, tuple[complex, complex]],
-    ) -> dict[str, RCWAResult]:
-        return solveStackBatch(
+    ) -> dict[str, tuple[float, float]]:
+        return solveStackBatchPowers(
             layers=self._layersAt(wavelength) if layers is None else layers,
             wavelength=wavelength,
             period=self.period,
@@ -402,8 +365,8 @@ def _spectrumExcitations(
     return result
 
 
-def _absorptionFromResult(result: RCWAResult) -> float:
-    return float(np.real_if_close(1.0 - result.reflection - result.transmission))
+def _absorptionFromPowers(reflection: float, transmission: float) -> float:
+    return float(np.real_if_close(1.0 - reflection - transmission))
 
 
 def _spectrumParallelPlan(
@@ -451,61 +414,3 @@ def _layersAt(items: tuple[LayerInput, ...], wavelength: float) -> list[Layer | 
         else:
             raise TypeError(f"unsupported layer input {type(item)!r}")
     return layers
-
-
-def _initializeSpectrumWorker(state: _SpectrumWorkerState) -> None:
-    global _PROCESS_SPECTRUM_STATE
-    _PROCESS_SPECTRUM_STATE = state
-
-
-def _processSpectrumPoint(
-    payload: tuple[
-        int,
-        float,
-        float,
-        float,
-        dict[str, tuple[complex, complex]],
-        bool,
-    ],
-) -> tuple[int, dict[str, tuple[float, float]]]:
-    if _PROCESS_SPECTRUM_STATE is None:
-        raise RuntimeError("spectrum worker was not initialized")
-    index, wavelength, theta, phi, excitations, bidirectional = payload
-    state = _PROCESS_SPECTRUM_STATE
-    layers = _layersAt(state.layers, wavelength)
-    forwardResults = solveStackBatch(
-        layers=layers,
-        wavelength=wavelength,
-        period=state.period,
-        orders=state.orders,
-        truncation=state.truncation,
-        backend=state.backend,
-        epsIncident=state.epsIncident,
-        epsTransmission=state.epsTransmission,
-        theta=theta,
-        phi=phi,
-        excitations=excitations,
-    )
-    if bidirectional:
-        backwardResults = solveStackBatch(
-            layers=layers,
-            wavelength=wavelength,
-            period=state.period,
-            orders=state.orders,
-            truncation=state.truncation,
-            backend=state.backend,
-            epsIncident=state.epsIncident,
-            epsTransmission=state.epsTransmission,
-            theta=-theta,
-            phi=phi,
-            excitations=excitations,
-        )
-    else:
-        backwardResults = {}
-    return index, {
-        label: (
-            _absorptionFromResult(forwardResults[label]),
-            _absorptionFromResult(backwardResults[label]) if bidirectional else np.nan,
-        )
-        for label in excitations
-    }

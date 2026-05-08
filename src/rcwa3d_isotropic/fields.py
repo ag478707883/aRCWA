@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .phase import forwardKz, planeWaveFields
+from .fourier import forwardKz, planeWaveFields
 from .types import LayerFieldSolution, RCWAResult
 
 
@@ -567,7 +567,7 @@ def _selectComponent(maps: dict[str, np.ndarray], component: str) -> np.ndarray:
 
 def _resultLayer(result: RCWAResult, layerIndex: int) -> LayerFieldSolution:
     if not result.layerSolutions:
-        raise ValueError("result does not contain layer fields; call solveStack(..., returnFields=True)")
+        raise ValueError("result does not contain layer fields; call RCWASimulation.solve(..., returnFields=True)")
     return result.layerSolutions[layerIndex]
 
 

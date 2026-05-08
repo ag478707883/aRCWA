@@ -10,16 +10,19 @@ import numpy as np
 
 from .backend import resolveBackend
 from .builder import PatternLayer
+from .fourier import makeHarmonics, normalizeOrders
 from .solver import (
     PreparedTorchStack,
     _automaticOrderReductionPlan,
+    _expandAdaptiveLayers,
     _solveBatchReducedTorch,
     _solveStackReducedTorch,
-    compileLayers,
+    _validateIsotropicLayers,
     evaluatePreparedBatchTorch,
     evaluatePreparedStackTorch,
     prepareStackTorch,
 )
+from ._factorization import layerDataForTorch, solveIdentityTorch, toTorchComplex
 from .types import CompiledLayer, Layer, RCWAResult
 from .varrcwa import AdaptiveLayerSpec
 
@@ -77,7 +80,7 @@ class RCWASimulation:
     workers: int = 1
     cacheModes: bool = True
     cacheSize: int = 10
-    _compiledLayerCache: dict[tuple, CompiledLayer] = field(default_factory=dict, init=False)
+    _compiledLayerCache: dict[tuple, Any] = field(default_factory=dict, init=False)
     _torchLayerCache: dict[tuple, Any] = field(default_factory=dict, init=False)
     _preparedCache: OrderedDict[tuple, Any] = field(default_factory=OrderedDict, init=False)
     _cacheLock: Lock = field(default_factory=Lock, init=False)
@@ -153,6 +156,27 @@ class RCWASimulation:
         returnFields: bool = False,
     ) -> RCWAResult:
         sAmplitude, pAmplitude = _polarizationAmplitudes(polarization)
+        return self.solveExcitation(
+            wavelength,
+            theta=theta,
+            phi=phi,
+            sAmplitude=sAmplitude,
+            pAmplitude=pAmplitude,
+            returnFields=returnFields,
+        )
+
+    def solveExcitation(
+        self,
+        wavelength: float,
+        *,
+        theta: float = 0.0,
+        phi: float = 0.0,
+        sAmplitude: complex = 1.0,
+        pAmplitude: complex = 0.0,
+        returnFields: bool = False,
+    ) -> RCWAResult:
+        """Solve one custom s/p incident excitation using the cached Torch S-matrix."""
+
         reduced = self._reducedSolve(
             wavelength,
             theta=theta,
@@ -224,6 +248,18 @@ class RCWASimulation:
                 "conservation": conservation[label],
             }
         return spectra
+
+    def solveExcitations(
+        self,
+        wavelength: float,
+        excitations: dict[str, tuple[complex, complex]],
+        *,
+        theta: float = 0.0,
+        phi: float = 0.0,
+    ) -> dict[str, RCWAResult]:
+        """Solve several custom s/p excitations while reusing the cached Torch S-matrix."""
+
+        return self._solveBatch(float(wavelength), theta=theta, phi=phi, excitations=dict(excitations))
 
     def _solveBatch(
         self,
@@ -360,10 +396,12 @@ class RCWASimulation:
                     self._preparedCache.popitem(last=False)
         return prepared
 
-    def _torchLayers(self, layers: Sequence[Layer | CompiledLayer]) -> list[Layer | CompiledLayer | _TorchCompiledLayer]:
+    def _torchLayers(self, layers: Sequence[Layer | CompiledLayer | _TorchCompiledLayer]) -> list[Layer | CompiledLayer | _TorchCompiledLayer]:
         return [self._torchLayer(layer) for layer in layers]
 
-    def _torchLayer(self, layer: Layer | CompiledLayer) -> Layer | CompiledLayer | _TorchCompiledLayer:
+    def _torchLayer(self, layer: Layer | CompiledLayer | _TorchCompiledLayer) -> Layer | CompiledLayer | _TorchCompiledLayer:
+        if isinstance(layer, _TorchCompiledLayer):
+            return layer
         if not hasattr(layer, "epsilonMatrix"):
             return layer
         if getattr(layer, "homogeneousEpsilon", None) is not None and getattr(layer, "displacementMatrices", None) is None:
@@ -399,11 +437,12 @@ class RCWASimulation:
             self._torchLayerCache[cacheKey] = torchLayer
         return torchLayer
 
-    def _layersAt(self, wavelength: float) -> list[Layer | CompiledLayer]:
+    def _layersAt(self, wavelength: float) -> list[Layer | CompiledLayer | _TorchCompiledLayer]:
         return self._layersAtWithKey(wavelength)[0]
 
-    def _layersAtWithKey(self, wavelength: float) -> tuple[list[Layer | CompiledLayer], tuple]:
-        layers: list[Layer | CompiledLayer] = []
+    def _layersAtWithKey(self, wavelength: float) -> tuple[list[Layer | CompiledLayer | _TorchCompiledLayer], tuple]:
+        _validateIsotropicLayers(_expandAdaptiveLayers(self.layers), kind="solve")
+        layers: list[Layer | CompiledLayer | _TorchCompiledLayer] = []
         keys = []
         for item in self.layers:
             materialized, key = self._materializeLayer(item, wavelength)
@@ -412,9 +451,10 @@ class RCWASimulation:
             else:
                 layers.append(materialized)
             keys.append(key)
+        _validateIsotropicLayers(_expandAdaptiveLayers(layers), kind="solve")
         return layers, tuple(keys)
 
-    def _materializeLayer(self, item: LayerInput, wavelength: float) -> tuple[Layer | CompiledLayer | list, tuple]:
+    def _materializeLayer(self, item: LayerInput, wavelength: float) -> tuple[Layer | CompiledLayer | _TorchCompiledLayer | list, tuple]:
         if isinstance(item, CompiledLayer):
             return item, ("compiled", id(item), item.thickness, item.orders, item.truncation)
         if isinstance(item, Layer):
@@ -447,7 +487,7 @@ class RCWASimulation:
             return layers, ("factory", id(item), float(wavelength), tuple(keys))
         raise TypeError(f"unsupported layer input {type(item)!r}")
 
-    def _compileIfRequested(self, layer: Layer, key: tuple) -> tuple[Layer | CompiledLayer, tuple]:
+    def _compileIfRequested(self, layer: Layer, key: tuple) -> tuple[Layer | _TorchCompiledLayer, tuple]:
         if not self.precompile:
             return layer, key
         compileKey = (key, self.orders, self.truncation)
@@ -456,13 +496,45 @@ class RCWASimulation:
             if cached is not None:
                 return cached, ("compiled-cache", compileKey)
 
-        compiled = compileLayers([layer], orders=self.orders, truncation=self.truncation)[0]
+        compiled = self._compileLayerTorch(layer)
         with self._cacheLock:
             cached = self._compiledLayerCache.get(compileKey)
             if cached is not None:
                 return cached, ("compiled-cache", compileKey)
             self._compiledLayerCache[compileKey] = compiled
         return compiled, ("compiled-cache", compileKey)
+
+    def _compileLayerTorch(self, layer: Layer) -> _TorchCompiledLayer:
+        backend = resolveBackend(self.backend)
+        torch = backend.xp
+        device = backend.device if backend.device is not None else torch.device("cuda")
+        orders = normalizeOrders(self.orders)
+        harmonics = makeHarmonics(
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            orders=orders,
+            epsIncident=1.0,
+            theta=0.0,
+            phi=0.0,
+            truncation=self.truncation,
+        )
+        factorized = layerDataForTorch(layer, harmonics, torch, device)
+        epsilonInverse = factorized.epsilonInverse
+        if epsilonInverse is None:
+            epsilonInverse = solveIdentityTorch(factorized.epsilonMatrix, torch, device)
+        return _TorchCompiledLayer(
+            thickness=float(layer.thickness),
+            epsilonMatrix=toTorchComplex(factorized.epsilonMatrix, torch, device),
+            epsilonInverse=toTorchComplex(epsilonInverse, torch, device),
+            orders=orders,
+            truncation=harmonics.truncation,
+            name=getattr(layer, "name", ""),
+            displacementMatrices=None
+            if factorized.displacementMatrices is None
+            else tuple(toTorchComplex(matrix, torch, device) for matrix in factorized.displacementMatrices),
+            factorization=factorized.factorization,
+            homogeneousEpsilon=factorized.homogeneousEpsilon,
+        )
 
 
 def _polarizationAmplitudes(polarization: Polarization) -> tuple[complex, complex]:

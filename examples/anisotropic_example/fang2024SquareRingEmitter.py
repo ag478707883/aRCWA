@@ -25,7 +25,7 @@ BACKEND = "cuda"
 FACTORIZATION = "auto"
 GRID = 128
 WORKERS = 1
-POINTS = 101
+POINTS = 501
 SHOW = True
 
 # Fang et al. 2024, Near-infrared multi-band small-angle TE-polarization
@@ -42,7 +42,7 @@ OUTER_WIDTH = OUTER_WIDTH_RATIO * PERIOD
 # Illumination and sweep for Fig. 2(c,d).
 THETA = math.radians(4.0)
 PHI = 0.0
-WAVELENGTHS = np.linspace(1.65, 1.682, POINTS)
+WAVELENGTHS = np.linspace(1.65, 1.8, POINTS)
 POLARIZATIONS = ("TE",)
 
 # Reference peak positions reported in the paper, used only as plot guides.
@@ -70,7 +70,9 @@ def ceyig_tensor() -> np.ndarray:
 
     rcwa.gyrotropicXzTensor returns [[eps, 0, g], [0, eps_y, 0],
     [-g, 0, eps]].  With g=-1j*b this matches the paper convention
-    [[eps, 0, -b*i], [0, eps, 0], [b*i, 0, eps]].
+    [[eps, 0, -b*i], 
+    [0,   eps, 0], 
+    [b*i, 0, eps]].
     """
 
     return rcwa.gyrotropicXzTensor(

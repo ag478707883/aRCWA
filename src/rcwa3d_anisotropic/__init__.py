@@ -1,12 +1,20 @@
 """Tensor-material RCWA solver for z-stacked, x/y-periodic structures."""
 
-from .analytic import AnalyticDisk, analyticDiskConvolution, diskIndicatorConvolution
+from .analytic import (
+    AnalyticDisk,
+    AnalyticRectangle,
+    analyticDiskConvolution,
+    analyticRectangleConvolution,
+    diskIndicatorConvolution,
+    rectangleIndicatorConvolution,
+)
 from .backend import ArrayBackend, resolveBackend
 from .builder import LayerStack, PatternLayer
 from .factorization import TensorConvolutionData, liFactorizedSystemMatrix, tensorConvolutionData
 from .geometry import (
     SampledPattern,
     analyticCircularPostLayer,
+    analyticRectangularPostLayer,
     circularPostLayer,
     ellipticalPostLayer,
     polygonPostLayer,
@@ -35,11 +43,13 @@ from .solver import (
     compileLayers,
     solveStack,
     solveStackBatch,
+    solveStackBatchPowers,
 )
 
 __all__ = [
     "CompiledLayer",
     "AnalyticDisk",
+    "AnalyticRectangle",
     "AnisotropicRCWA",
     "ArrayBackend",
     "DiffractionOrder",
@@ -56,6 +66,8 @@ __all__ = [
     "TensorConvolutionData",
     "analyticCircularPostLayer",
     "analyticDiskConvolution",
+    "analyticRectangularPostLayer",
+    "analyticRectangleConvolution",
     "circularPostLayer",
     "compileLayers",
     "diskIndicatorConvolution",
@@ -65,6 +77,7 @@ __all__ = [
     "liFactorizedSystemMatrix",
     "polygonPostLayer",
     "reciprocalXzTensor",
+    "rectangleIndicatorConvolution",
     "rectangularHollowPostLayer",
     "rectangularPostLayer",
     "resolveBackend",
@@ -72,6 +85,7 @@ __all__ = [
     "rotationMatrix",
     "solveStack",
     "solveStackBatch",
+    "solveStackBatchPowers",
     "slicedTaperStack",
     "stack",
     "tensorConvolutionData",

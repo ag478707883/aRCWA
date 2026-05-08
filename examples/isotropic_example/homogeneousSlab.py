@@ -4,7 +4,6 @@ from pathlib import Path
 import sys
 
 import matplotlib
-import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +19,8 @@ SAVE_PLOTS = True
 METHOD = "smatrix"
 TRUNCATION = "circular"
 BACKEND = "cuda"
+PRECOMPILE = True
+CACHE_MODES = True
 
 WAVELENGTH = 1.0
 PERIOD = (1.0, 1.0)
@@ -30,36 +31,31 @@ EPS_INCIDENT = 1.0
 EPS_TRANSMISSION = 1.0
 EPS_SLAB = 2.25
 
-I3 = np.eye(3, dtype=complex)
-EPS_INCIDENT_TENSOR = EPS_INCIDENT * I3
-EPS_TRANSMISSION_TENSOR = EPS_TRANSMISSION * I3
-EPS_SLAB_TENSOR = EPS_SLAB * I3
-
 
 if not SHOW:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-layer = rcwa.Layer(thickness=SLAB_THICKNESS, epsilon=EPS_SLAB_TENSOR[0, 0], name="glass slab")
-compiledLayers = rcwa.compileLayers([layer], orders=ORDER, truncation=TRUNCATION)
-
-result = rcwa.solveStack(
-    layers=compiledLayers,
-    wavelength=WAVELENGTH,
+layer = rcwa.Layer(thickness=SLAB_THICKNESS, epsilon=EPS_SLAB, name="glass slab")
+simulation = rcwa.RCWASimulation(
     period=PERIOD,
+    layers=[layer],
     orders=ORDER,
-    epsIncident=EPS_INCIDENT_TENSOR[0, 0],
-    epsTransmission=EPS_TRANSMISSION_TENSOR[0, 0],
-    sAmplitude=1.0,
-    method=METHOD,
     truncation=TRUNCATION,
+    epsIncident=EPS_INCIDENT,
+    epsTransmission=EPS_TRANSMISSION,
+    method=METHOD,
     backend=BACKEND,
+    precompile=PRECOMPILE,
+    cacheModes=CACHE_MODES,
 )
 
+result = simulation.solve(WAVELENGTH, polarization="TE")
+
 print("Homogeneous slab")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, order={ORDER}")
-print(f"epsilon slab tensor:\n{EPS_SLAB_TENSOR}")
+print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, order={ORDER}")
+print(f"epsilon slab={EPS_SLAB:.6g}")
 print(f"R = {result.reflection:.8f}")
 print(f"T = {result.transmission:.8f}")
 print(f"R + T = {result.conservation:.8f}")

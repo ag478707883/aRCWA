@@ -4,54 +4,18 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
-from scipy.linalg import eig
 
 from .backend import ArrayBackend, resolveBackend
-from .fourier import Harmonics, epsilonConvolutionMatrix, makeHarmonics, normalizeOrders
-from .phase import flux, forwardKz, planeWaveFields, putOrderField, singleOrderVector
-from .smatrix import (
-    SMatrix,
-    cascadeMany,
-    interfaceSMatrix,
-    prefixSMatrices,
-    propagationSMatrix,
-    suffixSMatrices,
+from ._factorization import (
+    homogeneousEpsilon as _homogeneousEpsilon,
+    layerDataForTorch as _layerDataForTorch,
+    pqMatricesTorch as _pqMatricesTorch,
+    solveIdentityTorch as _solveIdentityTorch,
+    toTorchComplex as _toTorchComplex,
 )
+from .fourier import Harmonics, flux, forwardKz, makeHarmonics, normalizeOrders, planeWaveFields, putOrderField, singleOrderVector, sqrtBranch
 from .types import ComplexArray, CompiledLayer, DiffractionOrder, Layer, LayerFieldSolution, RCWAResult
 from .varrcwa import AdaptiveLayerSpec
-
-
-@dataclass(frozen=True)
-class FactorizationData:
-    epsilonMatrix: ComplexArray
-    epsilonInverse: ComplexArray
-    displacementMatrices: tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray] | None = None
-    factorization: str = "standard"
-    homogeneousEpsilon: complex | None = None
-
-
-@dataclass(frozen=True)
-class PreparedStack:
-    layers: tuple[Layer | CompiledLayer, ...]
-    wavelength: float
-    period: tuple[float, float]
-    orders: tuple[int, int]
-    epsIncident: complex
-    epsTransmission: complex
-    theta: float
-    phi: float
-    truncation: str
-    harmonics: Harmonics
-    components: tuple[SMatrix, ...]
-    total: SMatrix
-    layerModes: tuple[tuple[ComplexArray, ComplexArray], ...]
-    incidentBackward: ComplexArray
-    transmissionForward: ComplexArray
-    zeroIndex: int
-
-    @property
-    def nPorts(self) -> int:
-        return 2 * self.harmonics.count
 
 
 @dataclass(frozen=True)
@@ -60,14 +24,6 @@ class _TorchSMatrix:
     s12: Any
     s21: Any
     s22: Any
-
-
-@dataclass(frozen=True)
-class _TorchLayerData:
-    epsilonMatrix: ComplexArray
-    epsilonInverse: ComplexArray | None
-    displacementMatrices: tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray] | None
-    homogeneousEpsilon: complex | None
 
 
 @dataclass(frozen=True)
@@ -102,152 +58,19 @@ class _OrderReductionPlan:
     keptIndices: ComplexArray
 
 
-def solveStack(
-    layers: Sequence[Layer | CompiledLayer | AdaptiveLayerSpec],
-    wavelength: float,
-    period: tuple[float, float],
-    orders: int | tuple[int, int],
-    epsIncident: complex = 1.0,
-    epsTransmission: complex = 1.0,
-    theta: float = 0.0,
-    phi: float = 0.0,
-    sAmplitude: complex = 1.0,
-    pAmplitude: complex = 0.0,
-    returnFields: bool = False,
-    method: str = "smatrix",
-    truncation: str = "circular",
-    backend: str | ArrayBackend | None = "cuda",
-) -> RCWAResult:
-    """Solve a 2D-periodic isotropic stack with the S-matrix RCWA path."""
-
-    _requireSMatrixMethod(method)
-    expandedLayers = _expandAdaptiveLayers(layers)
-    _validateIsotropicLayers(expandedLayers, kind="solve")
-    arrayBackend = resolveBackend(backend)
-    reductionPlan = _automaticOrderReductionPlan(
-        layers=expandedLayers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        returnFields=returnFields,
-    )
-    if reductionPlan is not None:
-        return _solveStackReducedTorch(
-            layers=expandedLayers,
-            wavelength=wavelength,
-            period=period,
-            epsIncident=epsIncident,
-            epsTransmission=epsTransmission,
-            theta=theta,
-            phi=phi,
-            sAmplitude=sAmplitude,
-            pAmplitude=pAmplitude,
-            truncation=truncation,
-            backend=arrayBackend,
-            plan=reductionPlan,
-        )
-
-    preparedTorch = prepareStackTorch(
-        layers=expandedLayers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        backend=arrayBackend,
-    )
-    return evaluatePreparedStackTorch(
-        preparedTorch,
-        sAmplitude=sAmplitude,
-        pAmplitude=pAmplitude,
-        solvedBy=f"smatrix-{_backendSuffix(arrayBackend)}",
-        returnFields=returnFields,
-    )
-
-
-def solveStackBatch(
-    layers: Sequence[Layer | CompiledLayer | AdaptiveLayerSpec],
-    wavelength: float,
-    period: tuple[float, float],
-    orders: int | tuple[int, int],
-    excitations: Mapping[str, tuple[complex, complex]],
-    epsIncident: complex = 1.0,
-    epsTransmission: complex = 1.0,
-    theta: float = 0.0,
-    phi: float = 0.0,
-    method: str = "smatrix",
-    truncation: str = "circular",
-    backend: str | ArrayBackend | None = "cuda",
-) -> dict[str, RCWAResult]:
-    """Solve several incident polarizations while reusing the same S-matrix."""
-
-    _requireSMatrixMethod(method)
-    if not excitations:
-        return {}
-    expandedLayers = _expandAdaptiveLayers(layers)
-    _validateIsotropicLayers(expandedLayers, kind="solve")
-    arrayBackend = resolveBackend(backend)
-    reductionPlan = _automaticOrderReductionPlan(
-        layers=expandedLayers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        returnFields=False,
-    )
-    if reductionPlan is not None:
-        return _solveBatchReducedTorch(
-            layers=expandedLayers,
-            wavelength=wavelength,
-            period=period,
-            excitations=excitations,
-            epsIncident=epsIncident,
-            epsTransmission=epsTransmission,
-            theta=theta,
-            phi=phi,
-            truncation=truncation,
-            backend=arrayBackend,
-            plan=reductionPlan,
-        )
-
-    preparedTorch = prepareStackTorch(
-        layers=expandedLayers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        backend=arrayBackend,
-    )
-    return evaluatePreparedBatchTorch(
-        preparedTorch,
-        excitations,
-        solvedBy=f"smatrix-batch-{_backendSuffix(arrayBackend)}",
-    )
-
-
-def compileLayers(
+def _compileLayers(
     layers: Sequence[Layer | AdaptiveLayerSpec],
     orders: int | tuple[int, int],
     truncation: str = "circular",
+    backend: str | ArrayBackend | None = "cuda",
 ) -> tuple[CompiledLayer, ...]:
-    """Precompute Fourier convolution data for fixed orders/truncation."""
+    """Precompute Fourier convolution data for fixed orders/truncation using CUDA PyTorch."""
 
     expandedLayers = _expandAdaptiveLayers(layers)
     _validateIsotropicLayers(expandedLayers, kind="compile")
+    arrayBackend = resolveBackend(backend)
+    torch = arrayBackend.xp
+    device = arrayBackend.device if arrayBackend.device is not None else torch.device("cuda")
 
     normalizedOrders = normalizeOrders(orders)
     if normalizedOrders[0] < 0 or normalizedOrders[1] < 0:
@@ -263,144 +86,27 @@ def compileLayers(
     )
     compiledLayers: list[CompiledLayer] = []
     for layer in expandedLayers:
-        factorized = layerEpsilonData(layer, harmonics)
+        factorized = _layerDataForTorch(layer, harmonics, torch, device)
+        epsilonInverse = factorized.epsilonInverse
+        if epsilonInverse is None:
+            epsilonInverse = _solveIdentityTorch(factorized.epsilonMatrix, torch, device)
+        displacement = None
+        if factorized.displacementMatrices is not None:
+            displacement = tuple(arrayBackend.asnumpy(matrix).copy() for matrix in factorized.displacementMatrices)
         compiledLayers.append(
             CompiledLayer(
                 thickness=layer.thickness,
-                epsilonMatrix=factorized.epsilonMatrix,
-                epsilonInverse=factorized.epsilonInverse,
+                epsilonMatrix=arrayBackend.asnumpy(factorized.epsilonMatrix).copy(),
+                epsilonInverse=arrayBackend.asnumpy(epsilonInverse).copy(),
                 orders=normalizedOrders,
                 truncation=harmonics.truncation,
                 name=layer.name,
-                displacementMatrices=factorized.displacementMatrices,
+                displacementMatrices=displacement,
                 factorization=factorized.factorization,
                 homogeneousEpsilon=factorized.homogeneousEpsilon,
             )
         )
     return tuple(compiledLayers)
-
-
-def prepareStack(
-    layers: Sequence[Layer | CompiledLayer],
-    wavelength: float,
-    period: tuple[float, float],
-    orders: int | tuple[int, int],
-    epsIncident: complex = 1.0,
-    epsTransmission: complex = 1.0,
-    theta: float = 0.0,
-    phi: float = 0.0,
-    truncation: str = "circular",
-) -> PreparedStack:
-    _validateGeometry(wavelength, period, orders)
-    normalizedOrders = normalizeOrders(orders)
-    harmonics = makeHarmonics(wavelength, period, normalizedOrders, epsIncident, theta, phi, truncation=truncation)
-    nPorts = 2 * harmonics.count
-    k0 = 2 * np.pi / wavelength
-
-    incidentForward = homogeneousBasis(harmonics, epsIncident, direction=1)
-    incidentBackward = homogeneousBasis(harmonics, epsIncident, direction=-1)
-    transmissionForward = homogeneousBasis(harmonics, epsTransmission, direction=1)
-    transmissionBackward = homogeneousBasis(harmonics, epsTransmission, direction=-1)
-
-    modes = tuple(layerModes(layer, harmonics) for layer in layers)
-    regionForward: list[ComplexArray] = [incidentForward]
-    regionBackward: list[ComplexArray] = [incidentBackward]
-    for _qValues, modeMatrix in modes:
-        regionForward.append(modeMatrix[:, :nPorts])
-        regionBackward.append(modeMatrix[:, nPorts:])
-    regionForward.append(transmissionForward)
-    regionBackward.append(transmissionBackward)
-
-    components: list[SMatrix] = []
-    for regionIndex in range(len(layers) + 1):
-        components.append(
-            interfaceSMatrix(
-                regionForward[regionIndex],
-                regionBackward[regionIndex],
-                regionForward[regionIndex + 1],
-                regionBackward[regionIndex + 1],
-            )
-        )
-        if regionIndex < len(layers):
-            qForward = modes[regionIndex][0][:nPorts]
-            propagation = np.diag(np.exp(1j * qForward * k0 * layers[regionIndex].thickness))
-            components.append(propagationSMatrix(propagation))
-
-    componentTuple = tuple(components)
-    return PreparedStack(
-        layers=tuple(layers),
-        wavelength=float(wavelength),
-        period=period,
-        orders=normalizedOrders,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=float(theta),
-        phi=float(phi),
-        truncation=harmonics.truncation,
-        harmonics=harmonics,
-        components=componentTuple,
-        total=cascadeMany(componentTuple, nPorts),
-        layerModes=modes,
-        incidentBackward=incidentBackward,
-        transmissionForward=transmissionForward,
-        zeroIndex=zeroOrderIndex(harmonics),
-    )
-
-
-def evaluatePreparedStack(
-    prepared: PreparedStack,
-    sAmplitude: complex = 1.0,
-    pAmplitude: complex = 0.0,
-    *,
-    solvedBy: str = "smatrix",
-    returnFields: bool = False,
-) -> RCWAResult:
-    incident = incidentField(prepared.harmonics, prepared.epsIncident, sAmplitude, pAmplitude)
-    incidentFlux = _checkedFlux(incident)
-    incidentAmplitudes = _incidentAmplitudes(prepared, sAmplitude, pAmplitude)
-    rAmplitudes = prepared.total.s11 @ incidentAmplitudes
-    tAmplitudes = prepared.total.s21 @ incidentAmplitudes
-    return _result(
-        prepared,
-        rAmplitudes,
-        tAmplitudes,
-        incidentFlux,
-        solvedBy,
-        _layerSolutions(prepared, incidentAmplitudes) if returnFields and prepared.layers else (),
-        sAmplitude,
-        pAmplitude,
-    )
-
-
-def evaluatePreparedBatch(
-    prepared: PreparedStack,
-    excitations: Mapping[str, tuple[complex, complex]],
-    *,
-    solvedBy: str = "smatrix-batch",
-) -> dict[str, RCWAResult]:
-    labels = tuple(excitations)
-    if not labels:
-        return {}
-
-    incidentColumns = np.column_stack([_incidentAmplitudes(prepared, *excitations[label]) for label in labels])
-    reflected = prepared.total.s11 @ incidentColumns
-    transmitted = prepared.total.s21 @ incidentColumns
-
-    results: dict[str, RCWAResult] = {}
-    for column, label in enumerate(labels):
-        sAmplitude, pAmplitude = excitations[label]
-        incident = incidentField(prepared.harmonics, prepared.epsIncident, sAmplitude, pAmplitude)
-        results[label] = _result(
-            prepared,
-            reflected[:, column],
-            transmitted[:, column],
-            _checkedFlux(incident),
-            solvedBy,
-            (),
-            sAmplitude,
-            pAmplitude,
-        )
-    return results
 
 
 def prepareStackTorch(
@@ -427,15 +133,10 @@ def prepareStackTorch(
     nPorts = 2 * harmonics.count
     k0 = 2 * np.pi / wavelength
 
-    incidentForwardNp = homogeneousBasis(harmonics, epsIncident, direction=1)
-    incidentBackwardNp = homogeneousBasis(harmonics, epsIncident, direction=-1)
-    transmissionForwardNp = homogeneousBasis(harmonics, epsTransmission, direction=1)
-    transmissionBackwardNp = homogeneousBasis(harmonics, epsTransmission, direction=-1)
-
-    incidentForward = _toTorchComplex(incidentForwardNp, torch, device)
-    incidentBackward = _toTorchComplex(incidentBackwardNp, torch, device)
-    transmissionForward = _toTorchComplex(transmissionForwardNp, torch, device)
-    transmissionBackward = _toTorchComplex(transmissionBackwardNp, torch, device)
+    incidentForward = _homogeneousBasisTorch(harmonics, epsIncident, direction=1, torch=torch, device=device)
+    incidentBackward = _homogeneousBasisTorch(harmonics, epsIncident, direction=-1, torch=torch, device=device)
+    transmissionForward = _homogeneousBasisTorch(harmonics, epsTransmission, direction=1, torch=torch, device=device)
+    transmissionBackward = _homogeneousBasisTorch(harmonics, epsTransmission, direction=-1, torch=torch, device=device)
 
     modes = tuple(_layerModesTorch(layer, harmonics, torch, device) for layer in layers)
     regionForward: list[Any] = [incidentForward]
@@ -475,9 +176,9 @@ def prepareStackTorch(
         layerModes=modes,
         components=componentTuple,
         total=_cascadeManyTorch(componentTuple, nPorts, torch, device),
-        incidentForward=incidentForwardNp,
-        incidentBackward=incidentBackwardNp,
-        transmissionForward=transmissionForwardNp,
+        incidentForward=arrayBackend.asnumpy(incidentForward).copy(),
+        incidentBackward=arrayBackend.asnumpy(incidentBackward).copy(),
+        transmissionForward=arrayBackend.asnumpy(transmissionForward).copy(),
         zeroIndex=zeroOrderIndex(harmonics),
         backend=arrayBackend,
     )
@@ -703,7 +404,7 @@ def _reducedLayers(
     for layer in layers:
         if _isHomogeneousLayer(layer):
             reduced.append(_homogeneousEquivalentLayer(layer))
-        elif isinstance(layer, CompiledLayer):
+        elif _isCompiledLayer(layer):
             reduced.append(_sliceCompiledLayer(layer, plan))
         else:
             reduced.append(layer)
@@ -711,10 +412,10 @@ def _reducedLayers(
 
 
 def _homogeneousEquivalentLayer(layer: Layer | CompiledLayer) -> Layer:
-    if isinstance(layer, CompiledLayer):
-        if layer.homogeneousEpsilon is None:
+    if _isCompiledLayer(layer):
+        if getattr(layer, "homogeneousEpsilon", None) is None:
             raise RuntimeError("compiled layer is not homogeneous")
-        return Layer(thickness=layer.thickness, epsilon=layer.homogeneousEpsilon, name=layer.name)
+        return Layer(thickness=layer.thickness, epsilon=getattr(layer, "homogeneousEpsilon"), name=getattr(layer, "name", ""))
     epsilon = _homogeneousEpsilon(getattr(layer, "epsilon"))
     if epsilon is None:
         raise RuntimeError("layer is not homogeneous")
@@ -722,20 +423,36 @@ def _homogeneousEquivalentLayer(layer: Layer | CompiledLayer) -> Layer:
 
 
 def _sliceCompiledLayer(layer: CompiledLayer, plan: _OrderReductionPlan) -> CompiledLayer:
+    displacement = getattr(layer, "displacementMatrices", None)
+    if _isTorchTensor(getattr(layer, "epsilonMatrix")):
+        index = _torchIndex(plan.keptIndices, getattr(layer, "epsilonMatrix"))
+        return type(layer)(
+            thickness=getattr(layer, "thickness"),
+            epsilonMatrix=_torchSliceSquare(getattr(layer, "epsilonMatrix"), index),
+            epsilonInverse=_torchSliceSquare(getattr(layer, "epsilonInverse"), index),
+            orders=plan.reducedOrders,
+            truncation=plan.fullHarmonics.truncation,
+            name=getattr(layer, "name", ""),
+            displacementMatrices=None
+            if displacement is None
+            else tuple(_torchSliceSquare(matrix, index) for matrix in displacement),
+            factorization=getattr(layer, "factorization", "standard"),
+            homogeneousEpsilon=getattr(layer, "homogeneousEpsilon", None),
+        )
+
     indexer = np.ix_(plan.keptIndices, plan.keptIndices)
-    displacement = layer.displacementMatrices
     return CompiledLayer(
-        thickness=layer.thickness,
-        epsilonMatrix=np.asarray(layer.epsilonMatrix)[indexer].copy(),
-        epsilonInverse=np.asarray(layer.epsilonInverse)[indexer].copy(),
+        thickness=getattr(layer, "thickness"),
+        epsilonMatrix=np.asarray(getattr(layer, "epsilonMatrix"))[indexer].copy(),
+        epsilonInverse=np.asarray(getattr(layer, "epsilonInverse"))[indexer].copy(),
         orders=plan.reducedOrders,
         truncation=plan.fullHarmonics.truncation,
-        name=layer.name,
+        name=getattr(layer, "name", ""),
         displacementMatrices=None
         if displacement is None
         else tuple(np.asarray(matrix)[indexer].copy() for matrix in displacement),
-        factorization=layer.factorization,
-        homogeneousEpsilon=layer.homogeneousEpsilon,
+        factorization=getattr(layer, "factorization", "standard"),
+        homogeneousEpsilon=getattr(layer, "homogeneousEpsilon", None),
     )
 
 
@@ -765,9 +482,9 @@ def _embedReducedResult(
             2 * reducedIndex : 2 * reducedIndex + 2
         ]
 
-    incidentBackward = homogeneousBasis(fullHarmonics, epsIncident, direction=-1)
-    transmissionForward = homogeneousBasis(fullHarmonics, epsTransmission, direction=1)
-    incident = incidentField(fullHarmonics, epsIncident, sAmplitude, pAmplitude)
+    incidentBackward = _homogeneousBasis(fullHarmonics, epsIncident, direction=-1)
+    transmissionForward = _homogeneousBasis(fullHarmonics, epsTransmission, direction=1)
+    incident = _incidentField(fullHarmonics, epsIncident, sAmplitude, pAmplitude)
     incidentFlux = _checkedFlux(incident)
     reflection = float(-flux(incidentBackward @ rAmplitudes) / incidentFlux)
     transmission = float(flux(transmissionForward @ tAmplitudes) / incidentFlux)
@@ -806,8 +523,8 @@ def _reducedHarmonicIndices(harmonics: Harmonics, reducedOrders: tuple[int, int]
 
 def _hasMismatchedCompiledLayer(layers: Sequence[Layer | CompiledLayer], harmonics: Harmonics) -> bool:
     return any(
-        isinstance(layer, CompiledLayer)
-        and (layer.orders != harmonics.orders or layer.truncation != harmonics.truncation)
+        _isCompiledLayer(layer)
+        and (getattr(layer, "orders") != harmonics.orders or getattr(layer, "truncation") != harmonics.truncation)
         for layer in layers
     )
 
@@ -819,7 +536,7 @@ def _stackInvariantAlong(axis: str, layers: Sequence[Layer | CompiledLayer], har
 def _layerInvariantAlong(axis: str, layer: Layer | CompiledLayer, harmonics: Harmonics) -> bool:
     if _isHomogeneousLayer(layer):
         return True
-    if isinstance(layer, CompiledLayer):
+    if _isCompiledLayer(layer):
         return _compiledLayerInvariantAlong(axis, layer, harmonics)
     return _rawLayerInvariantAlong(axis, layer)
 
@@ -852,114 +569,76 @@ def _arrayInvariantAlong(axis: str, array: ComplexArray) -> bool:
 
 
 def _compiledLayerInvariantAlong(axis: str, layer: CompiledLayer, harmonics: Harmonics) -> bool:
-    if layer.orders != harmonics.orders or layer.truncation != harmonics.truncation:
+    if getattr(layer, "orders") != harmonics.orders or getattr(layer, "truncation") != harmonics.truncation:
         return False
-    if layer.homogeneousEpsilon is not None and layer.displacementMatrices is None:
+    if getattr(layer, "homogeneousEpsilon", None) is not None and getattr(layer, "displacementMatrices", None) is None:
         return True
     if axis == "y":
-        uncoupled = harmonics.my[:, None] != harmonics.my[None, :]
+        uncoupled = harmonics.deltaMy != 0
     elif axis == "x":
-        uncoupled = harmonics.mx[:, None] != harmonics.mx[None, :]
+        uncoupled = harmonics.deltaMx != 0
     else:
         raise ValueError("axis must be 'x' or 'y'")
 
-    matrices = [layer.epsilonMatrix, layer.epsilonInverse]
-    if layer.displacementMatrices is not None:
-        matrices.extend(layer.displacementMatrices)
-    scale = max(1.0, max(float(np.max(np.abs(matrix))) for matrix in matrices if matrix.size))
+    matrices = [getattr(layer, "epsilonMatrix"), getattr(layer, "epsilonInverse")]
+    displacement = getattr(layer, "displacementMatrices", None)
+    if displacement is not None:
+        matrices.extend(displacement)
+    scale = max(1.0, max(_matrixMaxAbs(matrix) for matrix in matrices if _matrixSize(matrix)))
     tolerance = 1e-10 * scale
-    return all(float(np.max(np.abs(np.asarray(matrix)[uncoupled]))) <= tolerance for matrix in matrices)
+    return all(_matrixMaskedMaxAbs(matrix, uncoupled) <= tolerance for matrix in matrices)
 
 
 def _isHomogeneousLayer(layer: Layer | CompiledLayer) -> bool:
-    if isinstance(layer, CompiledLayer):
-        return layer.homogeneousEpsilon is not None
+    if _isCompiledLayer(layer):
+        return getattr(layer, "homogeneousEpsilon", None) is not None
     return _homogeneousEpsilon(getattr(layer, "epsilon")) is not None
 
 
-def layerEpsilonData(layer: Layer | CompiledLayer, harmonics: Harmonics) -> FactorizationData:
-    if hasattr(layer, "epsilonMatrix") and hasattr(layer, "epsilonInverse"):
-        expectedOrders = harmonics.orders
-        if getattr(layer, "orders") != expectedOrders:
-            raise ValueError(
-                f"compiled layer orders {getattr(layer, 'orders')} do not match requested orders {expectedOrders}"
-            )
-        layerTruncation = getattr(layer, "truncation", "rectangular")
-        if layerTruncation != harmonics.truncation:
-            raise ValueError(
-                f"compiled layer truncation {layerTruncation!r} does not match requested truncation "
-                f"{harmonics.truncation!r}"
-            )
-        return FactorizationData(
-            getattr(layer, "epsilonMatrix"),
-            getattr(layer, "epsilonInverse"),
-            getattr(layer, "displacementMatrices", None),
-            getattr(layer, "factorization", "standard"),
-            getattr(layer, "homogeneousEpsilon", None),
-        )
-
-    epsilon = getattr(layer, "epsilon")
-    epsilonMatrix = epsilonConvolutionMatrix(epsilon, harmonics)
-    epsilonInverse = np.linalg.inv(epsilonMatrix)
-    factorizationMode = _normalizeFactorization(getattr(layer, "factorization", "auto"))
-    normalField = getattr(layer, "normalField", None)
-    displacementMatrices: tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray] | None = None
-    factorization = _analyticFactorizationName(epsilon)
-
-    if normalField is None and _shouldAutoGenerateNormalField(epsilon, factorizationMode):
-        normalField = _estimateNormalField(epsilon, harmonics.orders, harmonics.truncation)
-
-    if _useAnalyticNormalVector(epsilon, factorizationMode):
-        displacementMatrices = _analyticNormalVectorDisplacementMatrices(epsilon, harmonics)
-        factorization = "analytic-normal-vector-li"
-    elif normalField is not None and factorizationMode in ("auto", "normal-vector", "jones"):
-        displacementMatrices = _normalVectorDisplacementMatrices(epsilon, normalField, harmonics)
-        factorization = "normal-vector-li"
-    elif factorizationMode in ("normal-vector", "jones"):
-        raise ValueError("normal-vector factorization requires a normalField or an analytic shape with normal vectors")
-
-    return FactorizationData(
-        epsilonMatrix,
-        epsilonInverse,
-        displacementMatrices,
-        factorization,
-        _homogeneousEpsilon(epsilon),
-    )
+def _isCompiledLayer(layer: object) -> bool:
+    return hasattr(layer, "epsilonMatrix") and hasattr(layer, "epsilonInverse")
 
 
-def pqMatrices(
-    epsilonMatrix: ComplexArray,
-    harmonics: Harmonics,
-    epsilonInverse: ComplexArray,
-    displacementMatrices: tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray] | None = None,
-) -> tuple[ComplexArray, ComplexArray]:
-    n = harmonics.count
-    identity = np.eye(n, dtype=complex)
-    kx = harmonics.kx
-    ky = harmonics.ky
-
-    p11 = kx[:, None] * epsilonInverse * ky[None, :]
-    p12 = identity - kx[:, None] * epsilonInverse * kx[None, :]
-    p21 = ky[:, None] * epsilonInverse * ky[None, :] - identity
-    p22 = -ky[:, None] * epsilonInverse * kx[None, :]
-
-    if displacementMatrices is None:
-        cxx = epsilonMatrix
-        cxy = np.zeros_like(epsilonMatrix)
-        cyx = np.zeros_like(epsilonMatrix)
-        cyy = epsilonMatrix
-    else:
-        cxx, cxy, cyx, cyy = displacementMatrices
-
-    q11 = -np.diag(kx * ky) - cyx
-    q12 = np.diag(kx * kx) - cyy
-    q21 = cxx - np.diag(ky * ky)
-    q22 = cxy + np.diag(ky * kx)
-
-    return np.block([[p11, p12], [p21, p22]]), np.block([[q11, q12], [q21, q22]])
+def _isTorchTensor(value: object) -> bool:
+    return hasattr(value, "detach") and hasattr(value, "device")
 
 
-def incidentField(
+def _torchIndex(indices: ComplexArray, reference: Any) -> Any:
+    import torch as torch_module
+
+    return torch_module.as_tensor(indices, dtype=torch_module.long, device=reference.device)
+
+
+def _torchSliceSquare(matrix: Any, index: Any) -> Any:
+    return matrix.index_select(0, index).index_select(1, index).clone()
+
+
+def _matrixSize(matrix: object) -> int:
+    return int(matrix.numel()) if _isTorchTensor(matrix) else int(np.asarray(matrix).size)
+
+
+def _matrixMaxAbs(matrix: object) -> float:
+    if _isTorchTensor(matrix):
+        if matrix.numel() == 0:
+            return 0.0
+        return float(matrix.abs().amax().detach().cpu().item())
+    array = np.asarray(matrix)
+    return 0.0 if array.size == 0 else float(np.max(np.abs(array)))
+
+
+def _matrixMaskedMaxAbs(matrix: object, mask: ComplexArray) -> float:
+    if _isTorchTensor(matrix):
+        import torch
+
+        torchMask = torch.as_tensor(mask, dtype=torch.bool, device=matrix.device)
+        if not bool(torch.any(torchMask).item()):
+            return 0.0
+        return float(matrix[torchMask].abs().amax().detach().cpu().item())
+    values = np.asarray(matrix)[mask]
+    return 0.0 if values.size == 0 else float(np.max(np.abs(values)))
+
+
+def _incidentField(
     harmonics: Harmonics,
     eps: complex,
     sAmplitude: complex,
@@ -977,7 +656,7 @@ def incidentField(
     return field
 
 
-def homogeneousBasis(harmonics: Harmonics, eps: complex, direction: int) -> ComplexArray:
+def _homogeneousBasis(harmonics: Harmonics, eps: complex, direction: int) -> ComplexArray:
     if direction not in (-1, 1):
         raise ValueError("direction must be +1 or -1")
     basis = np.zeros((4 * harmonics.count, 2 * harmonics.count), dtype=complex)
@@ -988,44 +667,6 @@ def homogeneousBasis(harmonics: Harmonics, eps: complex, direction: int) -> Comp
         basis[:, 2 * index] = singleOrderVector(harmonics.count, index, sField)
         basis[:, 2 * index + 1] = singleOrderVector(harmonics.count, index, pField)
     return basis
-
-
-def layerModes(layer: Layer | CompiledLayer, harmonics: Harmonics) -> tuple[ComplexArray, ComplexArray]:
-    factorized = layerEpsilonData(layer, harmonics)
-    if factorized.homogeneousEpsilon is not None and factorized.displacementMatrices is None:
-        return homogeneousScalarLayerModes(harmonics, factorized.homogeneousEpsilon)
-
-    pMatrix, qMatrix = pqMatrices(
-        factorized.epsilonMatrix,
-        harmonics,
-        factorized.epsilonInverse,
-        factorized.displacementMatrices,
-    )
-    qSquared, electricModes = eig(pMatrix @ qMatrix)
-    qValues = forwardKz(qSquared)
-    safeQ = qValues.copy()
-    safeQ[np.abs(safeQ) < 1e-13] = 1e-13
-
-    magneticModes = qMatrix @ electricModes @ np.diag(1 / safeQ)
-    vectors = np.block([[electricModes, electricModes], [magneticModes, -magneticModes]])
-    qAll = np.concatenate([qValues, -qValues])
-    return qAll, normalizeColumns(vectors)
-
-
-def homogeneousScalarLayerModes(harmonics: Harmonics, epsilon: complex) -> tuple[ComplexArray, ComplexArray]:
-    forward = homogeneousBasis(harmonics, epsilon, direction=1)
-    backward = homogeneousBasis(harmonics, epsilon, direction=-1)
-    kzForward = forwardKz(epsilon - harmonics.kx**2 - harmonics.ky**2)
-    qForward = np.empty(2 * harmonics.count, dtype=complex)
-    qForward[0::2] = kzForward
-    qForward[1::2] = kzForward
-    return np.concatenate([qForward, -qForward]), np.concatenate([forward, backward], axis=1)
-
-
-def normalizeColumns(vectors: ComplexArray) -> ComplexArray:
-    scales = np.max(np.abs(vectors), axis=0)
-    scales[scales == 0] = 1.0
-    return vectors / scales
 
 
 def orderResults(
@@ -1072,13 +713,6 @@ def isPropagating(kz: complex) -> bool:
     return bool(abs(np.imag(kz)) < 1e-10 and np.real(kz) > 1e-12)
 
 
-def _incidentAmplitudes(prepared: PreparedStack, sAmplitude: complex, pAmplitude: complex) -> ComplexArray:
-    amplitudes = np.zeros(prepared.nPorts, dtype=complex)
-    amplitudes[2 * prepared.zeroIndex] = sAmplitude
-    amplitudes[2 * prepared.zeroIndex + 1] = pAmplitude
-    return amplitudes
-
-
 def _checkedFlux(field: ComplexArray) -> float:
     incidentFlux = flux(field)
     if not np.isfinite(incidentFlux) or abs(incidentFlux) < 1e-14:
@@ -1086,95 +720,17 @@ def _checkedFlux(field: ComplexArray) -> float:
     return incidentFlux
 
 
-def _result(
-    prepared: PreparedStack,
-    rAmplitudes: ComplexArray,
-    tAmplitudes: ComplexArray,
-    incidentFlux: float,
-    solvedBy: str,
-    layerSolutions: tuple[LayerFieldSolution, ...],
-    sAmplitude: complex,
-    pAmplitude: complex,
-) -> RCWAResult:
-    reflectedField = prepared.incidentBackward @ rAmplitudes
-    transmittedField = prepared.transmissionForward @ tAmplitudes
-    reflection = float(-flux(reflectedField) / incidentFlux)
-    transmission = float(flux(transmittedField) / incidentFlux)
-    orders = orderResults(
-        harmonics=prepared.harmonics,
-        epsReflected=prepared.epsIncident,
-        epsTransmitted=prepared.epsTransmission,
-        reflectedBasis=prepared.incidentBackward,
-        transmittedBasis=prepared.transmissionForward,
-        rAmplitudes=rAmplitudes,
-        tAmplitudes=tAmplitudes,
-        incidentFlux=incidentFlux,
-    )
-    return RCWAResult(
-        reflection=reflection,
-        transmission=transmission,
-        conservation=reflection + transmission,
-        rAmplitudes=rAmplitudes,
-        tAmplitudes=tAmplitudes,
-        orders=tuple(orders),
-        incidentFlux=float(incidentFlux),
-        solvedBy=solvedBy,
-        layerSolutions=layerSolutions,
-        epsIncident=prepared.epsIncident,
-        epsTransmission=prepared.epsTransmission,
-        sAmplitude=sAmplitude,
-        pAmplitude=pAmplitude,
-    )
-
-
-def _layerSolutions(prepared: PreparedStack, incidentAmplitudes: ComplexArray) -> tuple[LayerFieldSolution, ...]:
-    prefixes = prefixSMatrices(prepared.components, prepared.nPorts)
-    suffixes = suffixSMatrices(prepared.components, prepared.nPorts)
-    identity = np.eye(prepared.nPorts, dtype=complex)
-    solutions = []
-    for layerIndex, (layer, (qValues, modeMatrix)) in enumerate(zip(prepared.layers, prepared.layerModes)):
-        boundaryIndex = 2 * layerIndex + 1
-        leftNetwork = prefixes[boundaryIndex]
-        rightNetwork = suffixes[boundaryIndex]
-        rhs = rightNetwork.s11 @ (leftNetwork.s21 @ incidentAmplitudes)
-        backwardAtLeft = np.linalg.solve(identity - rightNetwork.s11 @ leftNetwork.s22, rhs)
-        forwardAtLeft = leftNetwork.s21 @ incidentAmplitudes + leftNetwork.s22 @ backwardAtLeft
-        rightBoundaryIndex = boundaryIndex + 1
-        leftAtRight = prefixes[rightBoundaryIndex]
-        rightAtRight = suffixes[rightBoundaryIndex]
-        rhsAtRight = rightAtRight.s11 @ (leftAtRight.s21 @ incidentAmplitudes)
-        backwardAtRight = np.linalg.solve(identity - rightAtRight.s11 @ leftAtRight.s22, rhsAtRight)
-        coefficients = np.concatenate([forwardAtLeft, backwardAtLeft])
-        solutions.append(
-            LayerFieldSolution(
-                name=getattr(layer, "name", ""),
-                thickness=float(layer.thickness),
-                wavelength=prepared.wavelength,
-                period=prepared.period,
-                orders=prepared.orders,
-                mx=prepared.harmonics.mx.copy(),
-                my=prepared.harmonics.my.copy(),
-                kx=prepared.harmonics.kx.copy(),
-                ky=prepared.harmonics.ky.copy(),
-                qValues=qValues.copy(),
-                modeMatrix=modeMatrix.copy(),
-                coefficients=coefficients,
-                epsilonInverse=layerEpsilonData(layer, prepared.harmonics).epsilonInverse.copy(),
-                backwardCoefficientsRight=backwardAtRight.copy(),
-            )
-        )
-    return tuple(solutions)
-
-
 def _layerModesTorch(layer: Layer | CompiledLayer, harmonics: Harmonics, torch: Any, device: Any) -> tuple[Any, Any]:
-    factorized = _layerDataForTorch(layer, harmonics)
+    factorized = _layerDataForTorch(layer, harmonics, torch, device)
     if factorized.homogeneousEpsilon is not None and factorized.displacementMatrices is None:
-        qValuesNp, modeMatrixNp = homogeneousScalarLayerModes(harmonics, factorized.homogeneousEpsilon)
-        return _toTorchComplex(qValuesNp, torch, device), _toTorchComplex(modeMatrixNp, torch, device)
+        return _homogeneousScalarLayerModesTorch(harmonics, factorized.homogeneousEpsilon, torch, device)
 
     epsilonMatrix = _toTorchComplex(factorized.epsilonMatrix, torch, device)
     if factorized.epsilonInverse is None:
-        epsilonInverse = torch.linalg.inv(epsilonMatrix)
+        epsilonInverse = torch.linalg.solve(
+            epsilonMatrix,
+            torch.eye(epsilonMatrix.shape[0], dtype=torch.complex128, device=device),
+        )
     else:
         epsilonInverse = _toTorchComplex(factorized.epsilonInverse, torch, device)
     displacementMatrices = None
@@ -1199,76 +755,54 @@ def _layerModesTorch(layer: Layer | CompiledLayer, harmonics: Harmonics, torch: 
     return qAll, _normalizeColumnsTorch(vectors, torch)
 
 
-def _layerDataForTorch(layer: Layer | CompiledLayer, harmonics: Harmonics) -> _TorchLayerData:
-    if hasattr(layer, "epsilonMatrix") and hasattr(layer, "epsilonInverse"):
-        factorized = layerEpsilonData(layer, harmonics)
-        return _TorchLayerData(
-            factorized.epsilonMatrix,
-            factorized.epsilonInverse,
-            factorized.displacementMatrices,
-            factorized.homogeneousEpsilon,
-        )
-
-    epsilon = getattr(layer, "epsilon")
-    factorizationMode = _normalizeFactorization(getattr(layer, "factorization", "auto"))
-    normalField = getattr(layer, "normalField", None)
-    needsFullFactorization = (
-        _useAnalyticNormalVector(epsilon, factorizationMode)
-        or factorizationMode in ("normal-vector", "jones")
-        or (factorizationMode == "auto" and normalField is not None)
-        or _shouldAutoGenerateNormalField(epsilon, factorizationMode)
-    )
-    if needsFullFactorization:
-        factorized = layerEpsilonData(layer, harmonics)
-        return _TorchLayerData(
-            factorized.epsilonMatrix,
-            factorized.epsilonInverse,
-            factorized.displacementMatrices,
-            factorized.homogeneousEpsilon,
-        )
-
-    epsilonMatrix = epsilonConvolutionMatrix(epsilon, harmonics)
-    return _TorchLayerData(
-        epsilonMatrix=epsilonMatrix,
-        epsilonInverse=None,
-        displacementMatrices=None,
-        homogeneousEpsilon=_homogeneousEpsilon(epsilon),
-    )
-
-
-def _pqMatricesTorch(
-    epsilonMatrix: Any,
-    harmonics: Harmonics,
-    epsilonInverse: Any,
-    displacementMatrices: tuple[Any, Any, Any, Any] | None,
-    torch: Any,
-    device: Any,
-) -> tuple[Any, Any]:
+def _homogeneousBasisTorch(harmonics: Harmonics, eps: complex, direction: int, torch: Any, device: Any) -> Any:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be +1 or -1")
     n = harmonics.count
-    identity = torch.eye(n, dtype=torch.complex128, device=device)
+    basis = torch.zeros((4 * n, 2 * n), dtype=torch.complex128, device=device)
+    kxValues = _toTorchComplex(harmonics.kx, torch, device)
+    kyValues = _toTorchComplex(harmonics.ky, torch, device)
+    kzForward = _forwardKzTorch(complex(eps) - kxValues * kxValues - kyValues * kyValues, torch)
+    kz = kzForward if direction > 0 else -kzForward
+    refractiveIndex = complex(sqrtBranch(eps))
+
+    kp = torch.sqrt(kxValues * kxValues + kyValues * kyValues + 0j)
+    normalIncidence = torch.abs(kp) < 1e-14
+    safeKp = torch.where(normalIncidence, torch.ones_like(kp), kp)
+    sx = torch.where(normalIncidence, torch.zeros_like(kp), -kyValues / safeKp)
+    sy = torch.where(normalIncidence, torch.ones_like(kp), kxValues / safeKp)
+    px = sy * kz / refractiveIndex
+    py = -sx * kz / refractiveIndex
+    hxS = -kz * sy
+    hyS = kz * sx
+    pz = (sx * kyValues - sy * kxValues) / refractiveIndex
+    hxP = kyValues * pz - kz * py
+    hyP = kz * px - kxValues * pz
+
+    row = torch.arange(n, device=device)
+    sColumn = 2 * row
+    pColumn = sColumn + 1
+    basis[row, sColumn] = sx
+    basis[n + row, sColumn] = sy
+    basis[2 * n + row, sColumn] = hxS
+    basis[3 * n + row, sColumn] = hyS
+    basis[row, pColumn] = px
+    basis[n + row, pColumn] = py
+    basis[2 * n + row, pColumn] = hxP
+    basis[3 * n + row, pColumn] = hyP
+    return basis
+
+
+def _homogeneousScalarLayerModesTorch(harmonics: Harmonics, epsilon: complex, torch: Any, device: Any) -> tuple[Any, Any]:
+    forward = _homogeneousBasisTorch(harmonics, epsilon, direction=1, torch=torch, device=device)
+    backward = _homogeneousBasisTorch(harmonics, epsilon, direction=-1, torch=torch, device=device)
     kx = _toTorchComplex(harmonics.kx, torch, device)
     ky = _toTorchComplex(harmonics.ky, torch, device)
-
-    p11 = kx[:, None] * epsilonInverse * ky[None, :]
-    p12 = identity - kx[:, None] * epsilonInverse * kx[None, :]
-    p21 = ky[:, None] * epsilonInverse * ky[None, :] - identity
-    p22 = -ky[:, None] * epsilonInverse * kx[None, :]
-
-    if displacementMatrices is None:
-        cxx = epsilonMatrix
-        cxy = torch.zeros_like(epsilonMatrix)
-        cyx = torch.zeros_like(epsilonMatrix)
-        cyy = epsilonMatrix
-    else:
-        cxx, cxy, cyx, cyy = displacementMatrices
-
-    q11 = -torch.diag(kx * ky) - cyx
-    q12 = torch.diag(kx * kx) - cyy
-    q21 = cxx - torch.diag(ky * ky)
-    q22 = cxy + torch.diag(ky * kx)
-    pMatrix = torch.cat([torch.cat([p11, p12], dim=1), torch.cat([p21, p22], dim=1)], dim=0)
-    qMatrix = torch.cat([torch.cat([q11, q12], dim=1), torch.cat([q21, q22], dim=1)], dim=0)
-    return pMatrix, qMatrix
+    kzForward = _forwardKzTorch(complex(epsilon) - kx * kx - ky * ky, torch)
+    qForward = torch.empty(2 * harmonics.count, dtype=torch.complex128, device=device)
+    qForward[0::2] = kzForward
+    qForward[1::2] = kzForward
+    return torch.cat([qForward, -qForward]), torch.cat([forward, backward], dim=1)
 
 
 def _interfaceSMatrixTorch(
@@ -1431,9 +965,11 @@ def _layerSolutionsTorch(prepared: PreparedTorchStack, incidentAmplitudes: Any) 
 
 
 def _layerEpsilonInverseNumpy(prepared: PreparedTorchStack, layer: Layer | CompiledLayer) -> ComplexArray | None:
-    epsilonInverse = layerEpsilonData(layer, prepared.harmonics).epsilonInverse
+    device = prepared.total.s11.device
+    factorized = _layerDataForTorch(layer, prepared.harmonics, prepared.backend.xp, device)
+    epsilonInverse = factorized.epsilonInverse
     if epsilonInverse is None:
-        return None
+        epsilonInverse = _solveIdentityTorch(factorized.epsilonMatrix, prepared.backend.xp, device)
     return prepared.backend.asnumpy(epsilonInverse).copy()
 
 
@@ -1476,166 +1012,6 @@ def _resultFromTorchAmplitudes(
         sAmplitude=sAmplitude,
         pAmplitude=pAmplitude,
     )
-
-
-def _toTorchComplex(value: object, torch: Any, device: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.to(device=device, dtype=torch.complex128)
-    return torch.as_tensor(np.asarray(value), dtype=torch.complex128, device=device)
-
-
-def _normalizeFactorization(value: str) -> str:
-    normalized = str(value).lower().replace("_", "-")
-    aliases = {
-        "auto": "auto",
-        "standard": "standard",
-        "none": "standard",
-        "direct": "standard",
-        "normal-vector": "normal-vector",
-        "normal-vector-li": "normal-vector",
-        "nv": "normal-vector",
-        "jones": "jones",
-        "jones-li": "jones",
-    }
-    if normalized not in aliases:
-        raise ValueError("factorization must be 'auto', 'standard', 'normal-vector', or 'jones'")
-    return aliases[normalized]
-
-
-def _analyticFactorizationName(epsilon: object) -> str:
-    if hasattr(epsilon, "convolutionMatrix"):
-        return "analytic-li"
-    return "standard"
-
-
-def _useAnalyticNormalVector(epsilon: object, factorizationMode: str) -> bool:
-    return bool(
-        hasattr(epsilon, "normalVectorMatrices")
-        and hasattr(epsilon, "reciprocalConvolutionMatrix")
-        and (
-            factorizationMode == "jones"
-            or (factorizationMode == "auto" and getattr(epsilon, "factorization", "analytic") == "jones")
-        )
-    )
-
-
-def _shouldAutoGenerateNormalField(epsilon: object, factorizationMode: str) -> bool:
-    if factorizationMode not in ("auto", "normal-vector", "jones"):
-        return False
-    if hasattr(epsilon, "convolutionMatrix") or np.isscalar(epsilon):
-        return False
-    array = np.asarray(epsilon)
-    if array.ndim != 2 or array.shape == (3, 3):
-        return False
-    if factorizationMode == "auto":
-        return _looksPiecewiseConstant(array)
-    return True
-
-
-def _looksPiecewiseConstant(values: object) -> bool:
-    grid = np.asarray(values)
-    if grid.ndim != 2 or grid.size == 0:
-        return False
-    if not np.all(np.isfinite(grid)):
-        return False
-
-    scale = max(1.0, float(np.max(np.abs(grid))))
-    tolerance = 1e-10 * scale
-    rounded = np.round(grid.real / tolerance) + 1j * np.round(grid.imag / tolerance)
-    uniqueCount = np.unique(rounded).size
-    return 1 < uniqueCount <= max(16, grid.size // 4)
-
-
-def _estimateNormalField(
-    values: object,
-    orders: int | tuple[int, int] | None = None,
-    truncation: str | None = None,
-) -> ComplexArray:
-    del orders, truncation
-    grid = np.asarray(values, dtype=complex)
-    if grid.ndim != 2:
-        raise ValueError("normal-field estimation requires a 2D scalar grid")
-    if grid.shape[0] < 1 or grid.shape[1] < 1:
-        raise ValueError("sampled epsilon grid must be non-empty")
-
-    contrast = np.abs(grid - np.mean(grid))
-    dx = 0.5 * (np.roll(contrast, -1, axis=1) - np.roll(contrast, 1, axis=1))
-    dy = 0.5 * (np.roll(contrast, -1, axis=0) - np.roll(contrast, 1, axis=0))
-    length = np.sqrt(dx**2 + dy**2)
-
-    normals = np.zeros(grid.shape + (2,), dtype=float)
-    active = length > 1e-12 * max(1.0, float(np.max(length)) if length.size else 1.0)
-    normals[..., 0] = np.where(active, dx / np.where(active, length, 1.0), 1.0)
-    normals[..., 1] = np.where(active, dy / np.where(active, length, 1.0), 0.0)
-    return normals
-
-
-def _analyticNormalVectorDisplacementMatrices(
-    epsilon: object,
-    harmonics: Harmonics,
-) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
-    direct = epsilonConvolutionMatrix(epsilon, harmonics)
-    inverseRule = np.linalg.inv(epsilon.reciprocalConvolutionMatrix(harmonics))
-    nx, ny, tx, ty = epsilon.normalVectorMatrices(harmonics)
-    return _normalVectorBlocks(direct, inverseRule, nx, ny, tx, ty)
-
-
-def _normalVectorDisplacementMatrices(
-    epsilon: object,
-    normalField: object,
-    harmonics: Harmonics,
-) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
-    grid = np.asarray(epsilon, dtype=complex)
-    normals = np.asarray(normalField, dtype=float)
-    if grid.ndim != 2:
-        raise ValueError("normal-vector factorization requires a 2D scalar epsilon grid")
-    if normals.shape != grid.shape + (2,):
-        raise ValueError("normalField must have shape (ny, nx, 2) matching epsilon")
-
-    normalX = normals[..., 0]
-    normalY = normals[..., 1]
-    length = np.sqrt(normalX * normalX + normalY * normalY)
-    safe = length > 1e-12
-    normalX = np.where(safe, normalX / np.where(safe, length, 1.0), 1.0)
-    normalY = np.where(safe, normalY / np.where(safe, length, 1.0), 0.0)
-    tangentX = -normalY
-    tangentY = normalX
-
-    direct = epsilonConvolutionMatrix(grid, harmonics)
-    inverseRule = np.linalg.inv(epsilonConvolutionMatrix(1.0 / grid, harmonics))
-    nx = epsilonConvolutionMatrix(normalX, harmonics)
-    ny = epsilonConvolutionMatrix(normalY, harmonics)
-    tx = epsilonConvolutionMatrix(tangentX, harmonics)
-    ty = epsilonConvolutionMatrix(tangentY, harmonics)
-    return _normalVectorBlocks(direct, inverseRule, nx, ny, tx, ty)
-
-
-def _normalVectorBlocks(
-    direct: ComplexArray,
-    inverseRule: ComplexArray,
-    nx: ComplexArray,
-    ny: ComplexArray,
-    tx: ComplexArray,
-    ty: ComplexArray,
-) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
-    cxx = nx @ inverseRule @ nx + tx @ direct @ tx
-    cxy = nx @ inverseRule @ ny + tx @ direct @ ty
-    cyx = ny @ inverseRule @ nx + ty @ direct @ tx
-    cyy = ny @ inverseRule @ ny + ty @ direct @ ty
-    return cxx, cxy, cyx, cyy
-
-
-def _homogeneousEpsilon(epsilon: object) -> complex | None:
-    if hasattr(epsilon, "convolutionMatrix"):
-        return None
-    if np.isscalar(epsilon):
-        return complex(epsilon)
-    array = np.asarray(epsilon, dtype=complex)
-    if array.ndim == 0:
-        return complex(array.item())
-    if array.ndim == 2 and array.size > 0 and np.allclose(array, array.flat[0], rtol=0.0, atol=1e-14):
-        return complex(array.flat[0])
-    return None
 
 
 def _validateGeometry(wavelength: float, period: tuple[float, float], orders: int | tuple[int, int]) -> None:
@@ -1683,15 +1059,7 @@ def _expandAdaptiveLayers(
     return expanded
 
 
-def _requireSMatrixMethod(method: str) -> None:
-    if str(method).lower() != "smatrix":
-        raise ValueError("the isotropic solver now supports only method='smatrix'")
-
-
 def _backendSuffix(backend: ArrayBackend) -> str:
     if not backend.isCuda:
         raise ValueError("the isotropic solver is CUDA-only")
     return "cuda"
-
-
-prepareStackSMatrix = prepareStack

@@ -21,6 +21,8 @@ SAVE_PLOTS = True
 METHOD = "smatrix"
 TRUNCATION = "circular"
 BACKEND = "cuda"
+PRECOMPILE = True
+CACHE_MODES = True
 
 PERIOD = (0.72, 0.48)
 THICKNESS = 0.28
@@ -32,68 +34,41 @@ FIELD_WAVELENGTH = 0.75
 EPS_AIR = rcwa.AIR.epsilon()
 EPS_SI = rcwa.SI1550.epsilon()
 
-I3 = np.eye(3, dtype=complex)
-EPS_AIR_TENSOR = EPS_AIR * I3
-EPS_SI_TENSOR = EPS_SI * I3
-
 
 if not SHOW:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-pattern = rcwa.Pattern2D(period=PERIOD, shape=(72, 108), background=EPS_AIR_TENSOR[0, 0], name="rectangular metasurface")
-pattern.rectangle(size=(0.34, 0.18), angle=np.deg2rad(25), material=EPS_SI_TENSOR[0, 0])
+pattern = rcwa.Pattern2D(period=PERIOD, shape=(72, 108), background=EPS_AIR, name="rectangular metasurface")
+pattern.rectangle(size=(0.34, 0.18), angle=np.deg2rad(25), material=EPS_SI)
 layer = pattern.toLayer(THICKNESS)
-compiledLayers = rcwa.compileLayers([layer], orders=ORDER, truncation=TRUNCATION)
+simulation = rcwa.RCWASimulation(
+    period=PERIOD,
+    layers=[layer],
+    orders=ORDER,
+    truncation=TRUNCATION,
+    epsIncident=EPS_AIR,
+    epsTransmission=EPS_AIR,
+    method=METHOD,
+    backend=BACKEND,
+    precompile=PRECOMPILE,
+    cacheModes=CACHE_MODES,
+)
 
 if FIELD_WAVELENGTH < WAVELENGTHS[0] or FIELD_WAVELENGTH > WAVELENGTHS[-1]:
     raise ValueError("FIELD_WAVELENGTH must lie inside the plotted wavelength range")
 
-reflection = []
-transmission = []
-conservation = []
-for index, wavelength in enumerate(WAVELENGTHS):
-    result = rcwa.solveStack(
-        layers=compiledLayers,
-        wavelength=float(wavelength),
-        period=PERIOD,
-        orders=ORDER,
-        epsIncident=EPS_AIR_TENSOR[0, 0],
-        epsTransmission=EPS_AIR_TENSOR[0, 0],
-        sAmplitude=1.0,
-        pAmplitude=0.0,
-        method=METHOD,
-        truncation=TRUNCATION,
-        backend=BACKEND,
-    )
-    reflection.append(result.reflection)
-    transmission.append(result.transmission)
-    conservation.append(result.conservation)
-
-reflection = np.array(reflection)
-transmission = np.array(transmission)
-conservation = np.array(conservation)
-fieldResult = rcwa.solveStack(
-    layers=compiledLayers,
-    wavelength=FIELD_WAVELENGTH,
-    period=PERIOD,
-    orders=ORDER,
-    epsIncident=EPS_AIR_TENSOR[0, 0],
-    epsTransmission=EPS_AIR_TENSOR[0, 0],
-    sAmplitude=1.0,
-    pAmplitude=0.0,
-    returnFields=True,
-    method=METHOD,
-    truncation=TRUNCATION,
-    backend=BACKEND,
-)
+spectrum = simulation.spectrum(WAVELENGTHS, polarizations=("TE",))
+reflection = spectrum["TE"]["reflection"]
+transmission = spectrum["TE"]["transmission"]
+conservation = spectrum["TE"]["conservation"]
+fieldResult = simulation.solve(FIELD_WAVELENGTH, polarization="TE", returnFields=True)
 
 print("Rectangular metasurface")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, order={ORDER}, points={POINTS}")
+print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, order={ORDER}, points={POINTS}")
 print(f"field wavelength={FIELD_WAVELENGTH:.4f}")
-print(f"epsilon air tensor:\n{EPS_AIR_TENSOR}")
-print(f"epsilon silicon tensor:\n{EPS_SI_TENSOR}")
+print(f"epsilon air={EPS_AIR:.6g}, silicon={EPS_SI:.6g}")
 print(f"Max |R + T - 1|: {np.max(np.abs(conservation - 1)):.3e}")
 
 if SAVE_PLOTS:

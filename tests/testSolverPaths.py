@@ -9,9 +9,11 @@ import rcwa3d_anisotropic as anisotropic
 import rcwa3d_anisotropic.simulation as anisotropic_simulation
 import rcwa3d_anisotropic.solver as anisotropic_solver
 import rcwa3d_isotropic as isotropic
+import rcwa3d_isotropic.solver as isotropic_solver
 from rcwa3d_anisotropic.backend import resolveBackend as resolveAnisotropicBackend
 from rcwa3d_isotropic.fourier import makeHarmonics
-from rcwa3d_isotropic import Layer, compileLayers, solveStack
+from rcwa3d_isotropic import Layer
+from rcwa3d_isotropic.solver import _compileLayers as _compileIsotropic
 
 
 def _torchCudaAvailable() -> bool:
@@ -20,6 +22,73 @@ def _torchCudaAvailable() -> bool:
     except Exception:
         return False
     return bool(torch.cuda.is_available())
+
+
+def _solveIsotropic(
+    *,
+    layers,
+    wavelength,
+    period,
+    orders,
+    epsIncident=1.0,
+    epsTransmission=1.0,
+    theta=0.0,
+    phi=0.0,
+    sAmplitude=1.0,
+    pAmplitude=0.0,
+    returnFields=False,
+    method="smatrix",
+    truncation="circular",
+    backend="cuda",
+):
+    if method != "smatrix":
+        raise ValueError("RCWASimulation now supports only method='smatrix'")
+    simulation = isotropic.RCWASimulation(
+        period=period,
+        layers=layers,
+        orders=orders,
+        truncation=truncation,
+        epsIncident=epsIncident,
+        epsTransmission=epsTransmission,
+        backend=backend,
+    )
+    return simulation.solveExcitation(
+        wavelength,
+        theta=theta,
+        phi=phi,
+        sAmplitude=sAmplitude,
+        pAmplitude=pAmplitude,
+        returnFields=returnFields,
+    )
+
+
+def _solveIsotropicBatch(
+    *,
+    layers,
+    wavelength,
+    period,
+    orders,
+    excitations,
+    epsIncident=1.0,
+    epsTransmission=1.0,
+    theta=0.0,
+    phi=0.0,
+    method="smatrix",
+    truncation="circular",
+    backend="cuda",
+):
+    if method != "smatrix":
+        raise ValueError("RCWASimulation now supports only method='smatrix'")
+    simulation = isotropic.RCWASimulation(
+        period=period,
+        layers=layers,
+        orders=orders,
+        truncation=truncation,
+        epsIncident=epsIncident,
+        epsTransmission=epsTransmission,
+        backend=backend,
+    )
+    return simulation.solveExcitations(wavelength, excitations, theta=theta, phi=phi)
 
 
 class SolverPathTests(unittest.TestCase):
@@ -58,15 +127,15 @@ class SolverPathTests(unittest.TestCase):
             epsTransmission=1.0,
         )
 
-        scalarOrder = isotropic.solveStack(**common, orders=1)
-        tupleOrder = isotropic.solveStack(**common, orders=(1, 1))
+        scalarOrder = _solveIsotropic(**common, orders=1)
+        tupleOrder = _solveIsotropic(**common, orders=(1, 1))
 
         self.assertEqual(scalarOrder.orders[0].mx, tupleOrder.orders[0].mx)
         self.assertAlmostEqual(scalarOrder.reflection, tupleOrder.reflection, places=12)
         self.assertAlmostEqual(scalarOrder.transmission, tupleOrder.transmission, places=12)
 
     def testIsotropicDefaultTruncationIsCircular(self) -> None:
-        result = isotropic.solveStack(
+        result = _solveIsotropic(
             layers=[isotropic.Layer(thickness=0.1, epsilon=2.25)],
             wavelength=0.8,
             period=(1.0, 1.0),
@@ -115,10 +184,10 @@ class SolverPathTests(unittest.TestCase):
             truncation="circular",
         )
 
-        cuda = isotropic.solveStack(**common, sAmplitude=0.6 + 0.2j, pAmplitude=0.15 - 0.3j, backend="cuda")
+        cuda = _solveIsotropic(**common, sAmplitude=0.6 + 0.2j, pAmplitude=0.15 - 0.3j, backend="cuda")
 
         for alias in ("gpu", "torch", "auto"):
-            aliasResult = isotropic.solveStack(
+            aliasResult = _solveIsotropic(
                 **common,
                 sAmplitude=0.6 + 0.2j,
                 pAmplitude=0.15 - 0.3j,
@@ -131,8 +200,8 @@ class SolverPathTests(unittest.TestCase):
             np.testing.assert_allclose(aliasResult.tAmplitudes, cuda.tAmplitudes, rtol=1e-8, atol=1e-9)
 
         excitations = {"TE": (1.0, 0.0), "TM": (0.0, 1.0), "Mixed": (0.7 + 0.1j, -0.2 + 0.15j)}
-        cudaBatch = isotropic.solveStackBatch(**common, excitations=excitations, method="smatrix", backend="cuda")
-        aliasBatch = isotropic.solveStackBatch(**common, excitations=excitations, method="smatrix", backend="gpu")
+        cudaBatch = _solveIsotropicBatch(**common, excitations=excitations, method="smatrix", backend="cuda")
+        aliasBatch = _solveIsotropicBatch(**common, excitations=excitations, method="smatrix", backend="gpu")
 
         for label in excitations:
             self.assertAlmostEqual(aliasBatch[label].reflection, cudaBatch[label].reflection, places=9)
@@ -163,10 +232,40 @@ class SolverPathTests(unittest.TestCase):
         self.assertEqual(prepared.components[0].s11.device.type, "cuda")
         self.assertEqual(prepared.components[-1].s21.device.type, "cuda")
 
-        self.assertEqual(len(simulation._torchLayerCache), 1)
-        torchLayer = next(iter(simulation._torchLayerCache.values()))
+        self.assertEqual(len(simulation._torchLayerCache), 0)
+        self.assertEqual(len(simulation._compiledLayerCache), 1)
+        torchLayer = next(iter(simulation._compiledLayerCache.values()))
         self.assertEqual(torchLayer.epsilonMatrix.device.type, "cuda")
         self.assertEqual(torchLayer.epsilonInverse.device.type, "cuda")
+
+    @unittest.skipUnless(_torchCudaAvailable(), "requires torch CUDA")
+    def testIsotropicTorchPrepareBuildsRawLayerDataOnGpu(self) -> None:
+        epsilon = np.ones((18, 20), dtype=complex)
+        epsilon[4:14, 6:13] = 2.4
+        layer = isotropic.Layer(thickness=0.06, epsilon=epsilon, factorization="auto")
+        prepared = isotropic_solver.prepareStackTorch(
+            layers=[layer],
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            orders=(1, 1),
+            truncation="circular",
+            backend="cuda",
+        )
+
+        self.assertEqual(prepared.total.s11.device.type, "cuda")
+        qValues, modeMatrix = prepared.layerModes[0]
+        self.assertEqual(qValues.device.type, "cuda")
+        self.assertEqual(modeMatrix.device.type, "cuda")
+        factorized = isotropic_solver._layerDataForTorch(
+            layer,
+            prepared.harmonics,
+            prepared.backend.xp,
+            prepared.total.s11.device,
+        )
+        self.assertEqual(factorized.epsilonMatrix.device.type, "cuda")
+        self.assertEqual(factorized.epsilonInverse.device.type, "cuda")
+        self.assertEqual(factorized.factorization, "normal-vector-li")
+        self.assertTrue(all(matrix.device.type == "cuda" for matrix in factorized.displacementMatrices))
 
     def testAnisotropicCudaBackendEigProducesStableEigenpairs(self) -> None:
         backend = resolveAnisotropicBackend("cuda")
@@ -239,24 +338,10 @@ class SolverPathTests(unittest.TestCase):
         np.testing.assert_allclose(block.s21, dense.s21, atol=1e-11)
         np.testing.assert_allclose(block.s22, dense.s22, atol=1e-11)
 
-    def testExplicitIsotropicModuleMatchesTopLevelCompatibilityAPI(self) -> None:
-        common = dict(
-            layers=[Layer(thickness=0.30, epsilon=2.25, name="glass slab")],
-            wavelength=1.0,
-            period=(1.0, 1.0),
-            orders=(0, 0),
-            epsIncident=1.0,
-            epsTransmission=1.0,
-            sAmplitude=1.0,
-        )
-
-        compatibilityResult = solveStack(**common)
-        explicitResult = isotropic.solveStack(**common)
-
-        self.assertAlmostEqual(compatibilityResult.reflection, explicitResult.reflection, places=12)
-        self.assertAlmostEqual(compatibilityResult.transmission, explicitResult.transmission, places=12)
-        self.assertAlmostEqual(compatibilityResult.conservation, explicitResult.conservation, places=12)
-        self.assertEqual(compatibilityResult.solvedBy, explicitResult.solvedBy)
+    def testIsotropicLegacySolveFunctionsAreNotPublic(self) -> None:
+        self.assertFalse(hasattr(isotropic, "solveStack"))
+        self.assertFalse(hasattr(isotropic, "solveStackBatch"))
+        self.assertFalse(hasattr(isotropic, "compileLayers"))
 
     def testIsotropicPathRejectsTensorLikeLayerInputs(self) -> None:
         tensor = np.zeros((6, 6, 3, 3), dtype=complex)
@@ -265,7 +350,7 @@ class SolverPathTests(unittest.TestCase):
         layer = anisotropic.Layer(thickness=0.2, epsilon=tensor, name="tensor layer")
 
         with self.assertRaisesRegex(TypeError, "rcwa3d_anisotropic.solveStack"):
-            solveStack(
+            _solveIsotropic(
                 layers=[layer],
                 wavelength=1.0,
                 period=(0.8, 0.8),
@@ -275,7 +360,7 @@ class SolverPathTests(unittest.TestCase):
             )
 
         with self.assertRaisesRegex(TypeError, "rcwa3d_anisotropic.compileLayers"):
-            compileLayers([layer], orders=(1, 1))
+            _compileIsotropic([layer], orders=(1, 1))
 
     def testAnisotropicScalarLayerMatchesIsotropicSolver(self) -> None:
         common = dict(
@@ -288,7 +373,7 @@ class SolverPathTests(unittest.TestCase):
             sAmplitude=0.0,
         )
 
-        isotropicResult = isotropic.solveStack(layers=[isotropic.Layer(thickness=0.30, epsilon=2.25)], **common)
+        isotropicResult = _solveIsotropic(layers=[isotropic.Layer(thickness=0.30, epsilon=2.25)], **common)
         anisotropicResult = anisotropic.solveStack(layers=[anisotropic.Layer(thickness=0.30, epsilon=2.25)], **common)
 
         self.assertAlmostEqual(anisotropicResult.reflection, isotropicResult.reflection, places=12)
@@ -445,7 +530,7 @@ class SolverPathTests(unittest.TestCase):
             layers=[anisotropic.Layer(thickness=0.30, epsilon=tensor)],
             **common,
         )
-        effectiveScalarResult = isotropic.solveStack(
+        effectiveScalarResult = _solveIsotropic(
             layers=[isotropic.Layer(thickness=0.30, epsilon=effectiveP)],
             **common,
         )
@@ -620,7 +705,7 @@ class SolverPathTests(unittest.TestCase):
             shape=(18, 18),
             factorization="auto",
         )
-        compiled = isotropic.compileLayers([layer], orders=(1, 1), truncation="circular")
+        compiled = _compileIsotropic([layer], orders=(1, 1), truncation="circular")
         self.assertEqual(compiled[0].factorization, "normal-vector-li")
 
         common = dict(
@@ -631,37 +716,45 @@ class SolverPathTests(unittest.TestCase):
             truncation="circular",
             theta=np.deg2rad(5),
         )
-        smatrix = isotropic.solveStack(**common, method="smatrix", sAmplitude=1.0, pAmplitude=0.0)
+        smatrix = _solveIsotropic(**common, method="smatrix", sAmplitude=1.0, pAmplitude=0.0)
         with self.assertRaisesRegex(ValueError, "only method='smatrix'"):
-            isotropic.solveStack(**common, method="etm", sAmplitude=1.0, pAmplitude=0.0)
+            isotropic.RCWASimulation(
+                period=(1.0, 1.0),
+                layers=compiled,
+                orders=(1, 1),
+                truncation="circular",
+                method="etm",
+            )
 
-        batch = isotropic.solveStackBatch(
+        batch = _solveIsotropicBatch(
             **common,
             excitations={"TE": (1.0, 0.0), "TM": (0.0, 1.0)},
         )
-        sequentialTm = isotropic.solveStack(**common, sAmplitude=0.0, pAmplitude=1.0)
+        sequentialTm = _solveIsotropic(**common, sAmplitude=0.0, pAmplitude=1.0)
         self.assertAlmostEqual(batch["TE"].reflection, smatrix.reflection, places=12)
         self.assertAlmostEqual(batch["TM"].transmission, sequentialTm.transmission, places=12)
         self.assertEqual(batch["TE"].solvedBy, "smatrix-batch-cuda")
 
         with self.assertRaisesRegex(ValueError, "only method='smatrix'"):
-            isotropic.solveStackBatch(
-                **common,
-                excitations={"TE": (1.0, 0.0), "TM": (0.0, 1.0)},
+            isotropic.RCWASimulation(
+                period=(1.0, 1.0),
+                layers=compiled,
+                orders=(1, 1),
+                truncation="circular",
                 method="etm",
             )
 
     def testIsotropicAutoFactorizationGeneratesVectorFieldForPiecewiseConstantGrid(self) -> None:
         epsilon = np.ones((18, 18), dtype=complex)
         epsilon[4:14, 6:12] = 2.25
-        compiled = isotropic.compileLayers(
+        compiled = _compileIsotropic(
             [isotropic.Layer(thickness=0.08, epsilon=epsilon, factorization="auto")],
             orders=(1, 1),
             truncation="circular",
         )
         self.assertEqual(compiled[0].factorization, "normal-vector-li")
 
-        result = isotropic.solveStack(
+        result = _solveIsotropic(
             layers=compiled,
             wavelength=1.0,
             period=(1.0, 1.0),
@@ -674,7 +767,7 @@ class SolverPathTests(unittest.TestCase):
     def testIsotropicStandardFactorizationSkipsGeneratedVectorField(self) -> None:
         epsilon = np.ones((18, 18), dtype=complex)
         epsilon[4:14, 6:12] = 2.25
-        compiled = isotropic.compileLayers(
+        compiled = _compileIsotropic(
             [isotropic.Layer(thickness=0.08, epsilon=epsilon, factorization="standard")],
             orders=(1, 1),
             truncation="circular",
@@ -690,7 +783,7 @@ class SolverPathTests(unittest.TestCase):
             radius=0.2,
             analytic=True,
         )
-        compiledDisk = isotropic.compileLayers([disk], orders=(2, 2), truncation="circular")
+        compiledDisk = _compileIsotropic([disk], orders=(2, 2), truncation="circular")
         self.assertEqual(compiledDisk[0].factorization, "analytic-normal-vector-li")
         expectedAverage = 1.0 + (2.25 - 1.0) * np.pi * 0.2**2
         self.assertAlmostEqual(compiledDisk[0].epsilonMatrix[0, 0], expectedAverage, places=12)
@@ -720,7 +813,7 @@ class SolverPathTests(unittest.TestCase):
             outerRadius=0.18,
             analytic=True,
         )
-        compiledShapes = isotropic.compileLayers([rectangle, ellipse, annulus], orders=(1, 1), truncation="circular")
+        compiledShapes = _compileIsotropic([rectangle, ellipse, annulus], orders=(1, 1), truncation="circular")
         self.assertTrue(all(layer.factorization == "analytic-normal-vector-li" for layer in compiledShapes))
         self.assertTrue(all(layer.displacementMatrices is not None for layer in compiledShapes))
 
@@ -733,11 +826,11 @@ class SolverPathTests(unittest.TestCase):
             analytic=True,
             factorization="standard",
         )
-        compiledStandard = isotropic.compileLayers([standardRectangle], orders=(1, 1), truncation="circular")
+        compiledStandard = _compileIsotropic([standardRectangle], orders=(1, 1), truncation="circular")
         self.assertEqual(compiledStandard[0].factorization, "analytic-li")
         self.assertIsNone(compiledStandard[0].displacementMatrices)
 
-        uniform = isotropic.compileLayers([isotropic.Layer(thickness=0.1, epsilon=np.full((8, 8), 2.25))], orders=1)
+        uniform = _compileIsotropic([isotropic.Layer(thickness=0.1, epsilon=np.full((8, 8), 2.25))], orders=1)
         self.assertAlmostEqual(uniform[0].homogeneousEpsilon, 2.25)
 
     def testIsotropicOneDimensionalGratingUsesReducedCudaPath(self) -> None:
@@ -755,8 +848,8 @@ class SolverPathTests(unittest.TestCase):
             truncation="rectangular",
         )
 
-        reduced = isotropic.solveStack(**common)
-        full = isotropic.solveStack(**common, returnFields=True)
+        reduced = _solveIsotropic(**common)
+        full = _solveIsotropic(**common, returnFields=True)
 
         self.assertEqual(reduced.solvedBy, "smatrix-1d-x-cuda")
         self.assertEqual(reduced.rAmplitudes.shape, full.rAmplitudes.shape)
@@ -788,8 +881,8 @@ class SolverPathTests(unittest.TestCase):
             analytic=True,
             jonesResolution=32,
         )
-        compiledStripe = isotropic.compileLayers([analyticStripe], orders=(2, 2), truncation="rectangular")
-        stripeResult = isotropic.solveStack(
+        compiledStripe = _compileIsotropic([analyticStripe], orders=(2, 2), truncation="rectangular")
+        stripeResult = _solveIsotropic(
             layers=compiledStripe,
             wavelength=1.1,
             period=(1.0, 1.0),
@@ -828,7 +921,7 @@ class SolverPathTests(unittest.TestCase):
             holeRadius=0.1,
             analytic=True,
         )
-        compiled = isotropic.compileLayers([layer], orders=(1, 1), truncation="circular")
+        compiled = _compileIsotropic([layer], orders=(1, 1), truncation="circular")
         expected = 1.0 + (3.0 - 1.0) * 0.5 * 0.4 + (1.0 - 3.0) * np.pi * 0.1**2
         self.assertEqual(compiled[0].factorization, "analytic-li")
         self.assertAlmostEqual(compiled[0].epsilonMatrix[0, 0], expected, places=12)
@@ -842,7 +935,7 @@ class SolverPathTests(unittest.TestCase):
             armWidths=(0.2, 0.3),
             analytic=True,
         )
-        compiledCross = isotropic.compileLayers([cross], orders=(1, 1), truncation="circular")
+        compiledCross = _compileIsotropic([cross], orders=(1, 1), truncation="circular")
         expectedCross = 1.0 + (2.0 - 1.0) * (0.7 * 0.2 + 0.3 * 0.5 - 0.3 * 0.2)
         self.assertAlmostEqual(compiledCross[0].epsilonMatrix[0, 0], expectedCross, places=12)
 
@@ -858,7 +951,7 @@ class SolverPathTests(unittest.TestCase):
         layers = adaptive.toLayers()
         self.assertGreaterEqual(len(layers), 1)
         self.assertAlmostEqual(sum(layer.thickness for layer in layers), 0.2)
-        result = isotropic.solveStack(
+        result = _solveIsotropic(
             layers=[adaptive],
             wavelength=0.9,
             period=(1.0, 1.0),
@@ -987,6 +1080,60 @@ class SolverPathTests(unittest.TestCase):
         compiled = anisotropic.compileLayers([layer], orders=(1, 1), truncation="circular")
 
         self.assertEqual(compiled[0].tensorData.factorization, "jones-li")
+
+    def testCommercialStyleAnalyticRectangleNeedsOnlyOrders(self) -> None:
+        layer = anisotropic.rectangularPostLayer(
+            period=(1.0, 1.0),
+            thickness=0.08,
+            background=1.0,
+            post=2.25,
+            size=(0.35, 0.25),
+            factorization="auto",
+            jonesResolution=48,
+        )
+        self.assertIsInstance(layer.epsilon, anisotropic.AnalyticRectangle)
+
+        compiled = anisotropic.compileLayers([layer], orders=(2, 2), truncation="rectangular")
+        self.assertEqual(compiled[0].tensorData.factorization, "jones-li")
+
+        harmonics = makeHarmonics(
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            orders=(2, 2),
+            epsIncident=1.0,
+            theta=0.0,
+            phi=0.0,
+            truncation="rectangular",
+        )
+        matrix = anisotropic.analyticRectangleConvolution(layer.epsilon, harmonics)
+        expectedAverage = 1.0 + (2.25 - 1.0) * 0.35 * 0.25
+        self.assertAlmostEqual(matrix[0, 0], expectedAverage, places=12)
+
+    def testAnalyticRectangleSolvesWithCircularAndRectangularTruncation(self) -> None:
+        layer = anisotropic.rectangularPostLayer(
+            period=(1.0, 1.0),
+            thickness=0.06,
+            background=1.0,
+            post=2.25,
+            size=(0.30, 0.20),
+            angle=np.deg2rad(15),
+            jonesResolution=40,
+        )
+
+        for truncation in ("circular", "rectangular"):
+            with self.subTest(truncation=truncation):
+                result = anisotropic.solveStack(
+                    layers=[layer],
+                    wavelength=1.1,
+                    period=(1.0, 1.0),
+                    orders=(1, 1),
+                    truncation=truncation,
+                    theta=np.deg2rad(5.0),
+                    pAmplitude=1.0,
+                    sAmplitude=0.0,
+                )
+                self.assertTrue(np.isfinite(result.reflection))
+                self.assertTrue(np.isfinite(result.transmission))
 
     def testAutoFactorizationUsesNormalVectorForSampledScalarBoundaries(self) -> None:
         layer = anisotropic.rectangularHollowPostLayer(

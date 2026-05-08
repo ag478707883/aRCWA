@@ -3,7 +3,7 @@ import unittest
 
 
 class IsotropicExampleStyleTests(unittest.TestCase):
-    def testExamplesUseOneReusableCudaSolverInterface(self) -> None:
+    def testExamplesUseSimulationCudaInterface(self) -> None:
         root = Path(__file__).resolve().parents[1]
         exampleDir = root / "examples" / "isotropic_example"
         disallowed = (
@@ -11,10 +11,15 @@ class IsotropicExampleStyleTests(unittest.TestCase):
             "add_argument",
             "parser",
             "args",
-            "RCWASimulation",
             "solveStackBatch",
-            "def ",
             "if __name__",
+            "EPS_AIR_TENSOR",
+            "EPS_SI_TENSOR",
+            "EPS_AU_TENSOR",
+            "EPS_COVER_TENSOR",
+            "EPS_SUBSTRATE_TENSOR",
+            "EPS_GRATING_TENSOR",
+            "EPS_GROOVE_TENSOR",
             'backend="cpu"',
             "backend='cpu'",
             'backend = "cpu"',
@@ -33,8 +38,12 @@ class IsotropicExampleStyleTests(unittest.TestCase):
                 for token in disallowed:
                     self.assertNotIn(token, text)
                 self.assertIn('BACKEND = "cuda"', text)
-                self.assertIn("rcwa.compileLayers(", text)
-                self.assertIn("rcwa.solveStack(", text)
+                self.assertIn("PRECOMPILE = ", text)
+                self.assertIn("CACHE_MODES = ", text)
+                self.assertIn("rcwa.RCWASimulation(", text)
+                self.assertIn("precompile=PRECOMPILE", text)
+                self.assertIn("cacheModes=CACHE_MODES", text)
+                self.assertTrue(".solve(" in text or ".spectrum(" in text)
 
 
 if __name__ == "__main__":

@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Union
 
 import numpy as np
 from numpy.typing import ArrayLike
 
-from .analytic import AnalyticDisk, analyticDiskConvolution, analyticDiskJonesMatrices
+from .analytic import (
+    AnalyticDisk,
+    AnalyticRectangle,
+    analyticDiskConvolution,
+    analyticDiskJonesMatrices,
+    analyticRectangleConvolution,
+    analyticRectangleJonesMatrices,
+)
 from .fourier import Harmonics, epsilonConvolutionMatrix
 
 
 ComplexArray = np.ndarray
 TensorLike = object
+AnalyticShape = Union[AnalyticDisk, AnalyticRectangle]
+_ANALYTIC_SHAPES = (AnalyticDisk, AnalyticRectangle)
 
 _AXIS = {"x": 0, "y": 1, "z": 2}
 _COMPONENT_NAMES = {
@@ -89,8 +98,8 @@ def tensorConvolutionData(
 
     factorizationMode = _normalizeFactorization(factorization)
     constantTensor = _constantTensor(epsilon)
-    if isinstance(epsilon, AnalyticDisk):
-        components, factorization = _analyticDiskTensorMatrices(epsilon, harmonics)
+    if isinstance(epsilon, _ANALYTIC_SHAPES):
+        components, factorization = _analyticShapeTensorMatrices(epsilon, harmonics)
     elif _isScalarGrid(epsilon):
         if normalField is None and _shouldAutoGenerateNormalField(epsilon, factorizationMode):
             normalField = _estimateNormalField(epsilon, harmonics.orders, harmonics.truncation)
@@ -243,25 +252,40 @@ def _tensorComponentMatrices(
 
     raise ValueError(
         "anisotropic epsilon must be a scalar, a 2D scalar grid, a (3, 3) tensor, "
-        "a (ny, nx, 3, 3) tensor grid, an AnalyticDisk, or a component mapping"
+        "a (ny, nx, 3, 3) tensor grid, an analytic shape, or a component mapping"
     )
 
 
-def _analyticDiskTensorMatrices(
-    disk: AnalyticDisk,
+def _analyticShapeTensorMatrices(
+    shape: AnalyticShape,
     harmonics: Harmonics,
 ) -> tuple[tuple[tuple[ComplexArray, ComplexArray, ComplexArray], ...], str]:
     zero = _zero(harmonics.count)
-    if disk.factorization == "jones":
-        cxx, cxy, cyx, cyy, czz = analyticDiskJonesMatrices(disk, harmonics)
+    if shape.factorization == "jones":
+        cxx, cxy, cyx, cyy, czz = _analyticJonesMatrices(shape, harmonics)
         return ((cxx, cxy, zero.copy()), (cyx, cyy, zero.copy()), (zero.copy(), zero.copy(), czz)), "jones-li"
 
-    direct = analyticDiskConvolution(disk, harmonics)
+    direct = _analyticConvolution(shape, harmonics)
     return (
         (direct, zero.copy(), zero.copy()),
         (zero.copy(), direct.copy(), zero.copy()),
         (zero.copy(), zero.copy(), direct.copy()),
     ), "analytic-li"
+
+
+def _analyticConvolution(shape: AnalyticShape, harmonics: Harmonics) -> ComplexArray:
+    if isinstance(shape, AnalyticRectangle):
+        return analyticRectangleConvolution(shape, harmonics)
+    return analyticDiskConvolution(shape, harmonics)
+
+
+def _analyticJonesMatrices(
+    shape: AnalyticShape,
+    harmonics: Harmonics,
+) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
+    if isinstance(shape, AnalyticRectangle):
+        return analyticRectangleJonesMatrices(shape, harmonics)
+    return analyticDiskJonesMatrices(shape, harmonics)
 
 
 def _normalVectorScalarTensorMatrices(
@@ -343,7 +367,7 @@ def _componentIndex(key: object) -> tuple[int, int]:
 
 
 def _constantTensor(epsilon: TensorLike) -> ComplexArray | None:
-    if isinstance(epsilon, AnalyticDisk):
+    if isinstance(epsilon, _ANALYTIC_SHAPES):
         return None
     if isinstance(epsilon, Mapping):
         tensor = np.zeros((3, 3), dtype=complex)
@@ -371,7 +395,7 @@ def _constantTensor(epsilon: TensorLike) -> ComplexArray | None:
 
 
 def _isScalarGrid(epsilon: TensorLike) -> bool:
-    if isinstance(epsilon, AnalyticDisk) or isinstance(epsilon, Mapping) or np.isscalar(epsilon):
+    if isinstance(epsilon, _ANALYTIC_SHAPES) or isinstance(epsilon, Mapping) or np.isscalar(epsilon):
         return False
     array = np.asarray(epsilon)
     return bool(array.ndim == 2 and array.shape != (3, 3))
@@ -452,8 +476,8 @@ def _constantTensorMatrices(
 
 
 def _convolution(value: ArrayLike | complex, harmonics: Harmonics) -> ComplexArray:
-    if isinstance(value, AnalyticDisk):
-        return analyticDiskConvolution(value, harmonics)
+    if isinstance(value, _ANALYTIC_SHAPES):
+        return _analyticConvolution(value, harmonics)
     return epsilonConvolutionMatrix(value, harmonics)
 
 

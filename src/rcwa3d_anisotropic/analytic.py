@@ -27,6 +27,16 @@ def _solveIdentity(matrix: ComplexArray) -> ComplexArray:
     return np.linalg.solve(matrix, np.eye(matrix.shape[0], dtype=complex))
 
 
+def _validateFactorization(value: str) -> None:
+    if value not in ("analytic", "jones"):
+        raise ValueError("factorization must be 'analytic' or 'jones'")
+
+
+def _validateJonesResolution(value: int) -> None:
+    if value < 8:
+        raise ValueError("jonesResolution must be at least 8")
+
+
 def _phase(
     harmonics: Harmonics,
     period: tuple[float, float],
@@ -57,6 +67,50 @@ def _twoMaterialConvolution(
     return complex(background) * np.eye(size, dtype=complex) + (complex(inclusion) - complex(background)) * indicator
 
 
+def _sampleCoordinates(
+    period: tuple[float, float],
+    center: tuple[float, float],
+    samples: int,
+) -> tuple[ComplexArray, ComplexArray]:
+    periodX, periodY = period
+    yIndex, xIndex = np.mgrid[0:samples, 0:samples]
+    xx = (xIndex + 0.5) / samples * periodX - periodX / 2 - center[0]
+    yy = (yIndex + 0.5) / samples * periodY - periodY / 2 - center[1]
+    xx = (xx + periodX / 2) % periodX - periodX / 2
+    yy = (yy + periodY / 2) % periodY - periodY / 2
+    return xx, yy
+
+
+def _localCoordinates(
+    period: tuple[float, float],
+    center: tuple[float, float],
+    angle: float,
+    samples: int,
+) -> tuple[ComplexArray, ComplexArray, float, float]:
+    xx, yy = _sampleCoordinates(period, center, samples)
+    cosine = float(np.cos(angle))
+    sine = float(np.sin(angle))
+    return cosine * xx + sine * yy, -sine * xx + cosine * yy, cosine, sine
+
+
+def _normalizeVectorField(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
+    length = np.sqrt(np.real(x) ** 2 + np.real(y) ** 2)
+    safe = length > 1e-12
+    return (
+        np.where(safe, np.real(x) / np.where(safe, length, 1.0), 1.0).astype(complex),
+        np.where(safe, np.real(y) / np.where(safe, length, 1.0), 0.0).astype(complex),
+    )
+
+
+def _rotateLocalVector(
+    xLocal: ComplexArray,
+    yLocal: ComplexArray,
+    cosine: float,
+    sine: float,
+) -> tuple[ComplexArray, ComplexArray]:
+    return cosine * xLocal - sine * yLocal, sine * xLocal + cosine * yLocal
+
+
 @dataclass(frozen=True)
 class AnalyticDisk:
     """Analytic circular inclusion in one rectangular periodic unit cell.
@@ -80,10 +134,8 @@ class AnalyticDisk:
         _validatePeriod(self.period)
         if self.radius <= 0:
             raise ValueError("radius must be positive")
-        if self.jonesResolution < 8:
-            raise ValueError("jonesResolution must be at least 8")
-        if self.factorization not in ("analytic", "jones"):
-            raise ValueError("factorization must be 'analytic' or 'jones'")
+        _validateFactorization(self.factorization)
+        _validateJonesResolution(self.jonesResolution)
 
     def indicatorMatrix(self, harmonics: Harmonics) -> ComplexArray:
         return diskIndicatorConvolution(self, harmonics)
@@ -178,11 +230,15 @@ class AnalyticRectangle:
     inclusion: complex
     center: tuple[float, float] = (0.0, 0.0)
     angle: float = 0.0
+    factorization: str = "jones"
+    jonesResolution: int = 512
 
     def __post_init__(self) -> None:
         _validatePeriod(self.period)
         if self.size[0] <= 0 or self.size[1] <= 0:
             raise ValueError("rectangle size values must be positive")
+        _validateFactorization(self.factorization)
+        _validateJonesResolution(self.jonesResolution)
 
     def indicatorMatrix(self, harmonics: Harmonics) -> ComplexArray:
         gx, gy, phase = _phase(harmonics, self.period, self.center)
@@ -193,13 +249,33 @@ class AnalyticRectangle:
         fill = self.size[0] * self.size[1] / (self.period[0] * self.period[1])
         return fill * _sinc(gxLocal * self.size[0] / 2) * _sinc(gyLocal * self.size[1] / 2) * phase
 
-    def convolutionMatrix(self, harmonics: Harmonics) -> ComplexArray:
+    def convolutionMatrix(
+        self,
+        harmonics: Harmonics,
+        background: complex | None = None,
+        inclusion: complex | None = None,
+    ) -> ComplexArray:
         return _twoMaterialConvolution(
             self.indicatorMatrix(harmonics),
             harmonics.count,
-            self.background,
-            self.inclusion,
+            self.background if background is None else background,
+            self.inclusion if inclusion is None else inclusion,
         )
+
+
+def analyticRectangleConvolution(
+    rectangle: AnalyticRectangle,
+    harmonics: Harmonics,
+    background: complex | None = None,
+    inclusion: complex | None = None,
+) -> ComplexArray:
+    """Convolution matrix for a two-material analytic rectangle pattern."""
+
+    return rectangle.convolutionMatrix(harmonics, background=background, inclusion=inclusion)
+
+
+def rectangleIndicatorConvolution(rectangle: AnalyticRectangle, harmonics: Harmonics) -> ComplexArray:
+    return rectangle.indicatorMatrix(harmonics)
 
 
 def analyticDiskJonesMatrices(
@@ -208,16 +284,31 @@ def analyticDiskJonesMatrices(
 ) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
     """Return Li/Jones-factorized in-plane epsilon blocks and epsilon_zz."""
 
-    direct = analyticDiskConvolution(disk, harmonics)
+    return _jonesFactorizedMatrices(disk, harmonics)
+
+
+def analyticRectangleJonesMatrices(
+    rectangle: AnalyticRectangle,
+    harmonics: Harmonics,
+) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
+    """Return Li/Jones-factorized in-plane epsilon blocks and epsilon_zz."""
+
+    return _jonesFactorizedMatrices(rectangle, harmonics)
+
+
+def _jonesFactorizedMatrices(
+    shape: AnalyticDisk | AnalyticRectangle,
+    harmonics: Harmonics,
+) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
+    direct = shape.convolutionMatrix(harmonics)
     inverseRule = _solveIdentity(
-        analyticDiskConvolution(
-            disk,
+        shape.convolutionMatrix(
             harmonics,
-            background=1.0 / complex(disk.background),
-            inclusion=1.0 / complex(disk.inclusion),
+            background=1.0 / complex(shape.background),
+            inclusion=1.0 / complex(shape.inclusion),
         )
     )
-    nx, ny, tx, ty = _jonesVectorMatrices(disk, harmonics)
+    nx, ny, tx, ty = _jonesVectorMatrices(shape, harmonics)
 
     cxx = nx @ inverseRule @ nx + tx @ direct @ tx
     cxy = nx @ inverseRule @ ny + tx @ direct @ ty
@@ -227,10 +318,10 @@ def analyticDiskJonesMatrices(
 
 
 def _jonesVectorMatrices(
-    disk: AnalyticDisk,
+    shape: AnalyticDisk | AnalyticRectangle,
     harmonics: Harmonics,
 ) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
-    normalX, normalY = _jonesVectorField(disk)
+    normalX, normalY = _jonesVectorField(shape)
     tangentX = -normalY
     tangentY = normalX
     return (
@@ -241,19 +332,56 @@ def _jonesVectorMatrices(
     )
 
 
-def _jonesVectorField(disk: AnalyticDisk) -> tuple[ComplexArray, ComplexArray]:
-    periodX, periodY = disk.period
-    samples = disk.jonesResolution
-    yIndex, xIndex = np.mgrid[0:samples, 0:samples]
-    xx = (xIndex + 0.5) / samples * periodX - periodX / 2 - disk.center[0]
-    yy = (yIndex + 0.5) / samples * periodY - periodY / 2 - disk.center[1]
+def _jonesVectorField(shape: AnalyticDisk | AnalyticRectangle) -> tuple[ComplexArray, ComplexArray]:
+    if isinstance(shape, AnalyticRectangle):
+        return _rectangleJonesVectorField(shape)
+    return _diskJonesVectorField(shape)
 
-    # Periodic shortest-image radial direction.  This gives a continuous Jones
-    # field around a centered disk and keeps the correct normal on the cylinder.
-    xx = (xx + periodX / 2) % periodX - periodX / 2
-    yy = (yy + periodY / 2) % periodY - periodY / 2
+
+def _diskJonesVectorField(disk: AnalyticDisk) -> tuple[ComplexArray, ComplexArray]:
+    xx, yy = _sampleCoordinates(disk.period, disk.center, disk.jonesResolution)
     radius = np.sqrt(xx * xx + yy * yy)
     safeRadius = np.where(radius > 1e-12, radius, 1.0)
     normalX = np.where(radius > 1e-12, xx / safeRadius, 1.0)
     normalY = np.where(radius > 1e-12, yy / safeRadius, 0.0)
-    return normalX.astype(complex), normalY.astype(complex)
+    return _normalizeVectorField(normalX, normalY)
+
+
+def _rectangleJonesVectorField(rectangle: AnalyticRectangle) -> tuple[ComplexArray, ComplexArray]:
+    xLocal, yLocal, cosine, sine = _localCoordinates(
+        rectangle.period,
+        rectangle.center,
+        rectangle.angle,
+        rectangle.jonesResolution,
+    )
+    sx = max(float(rectangle.size[0]), 1e-30)
+    sy = max(float(rectangle.size[1]), 1e-30)
+    signX = np.where(xLocal >= 0.0, 1.0, -1.0)
+    signY = np.where(yLocal >= 0.0, 1.0, -1.0)
+
+    angleMod = float(rectangle.angle) % np.pi
+    tolerance = 1e-12 * max(1.0, rectangle.period[0], rectangle.period[1], sx, sy)
+    if min(abs(angleMod), abs(angleMod - np.pi)) <= tolerance:
+        localPeriod = rectangle.period
+    elif abs(angleMod - np.pi / 2) <= tolerance:
+        localPeriod = (rectangle.period[1], rectangle.period[0])
+    else:
+        localPeriod = (np.inf, np.inf)
+
+    spansLocalX = sx >= localPeriod[0] - tolerance
+    spansLocalY = sy >= localPeriod[1] - tolerance
+    if spansLocalY and not spansLocalX:
+        localX = signX
+        localY = np.zeros_like(signY)
+    elif spansLocalX and not spansLocalY:
+        localX = np.zeros_like(signX)
+        localY = signY
+    else:
+        distanceX = np.abs(np.abs(xLocal) - sx / 2)
+        distanceY = np.abs(np.abs(yLocal) - sy / 2)
+        useX = distanceX <= distanceY
+        localX = np.where(useX, signX, 0.0)
+        localY = np.where(useX, 0.0, signY)
+
+    normalX, normalY = _rotateLocalVector(localX, localY, cosine, sine)
+    return _normalizeVectorField(normalX, normalY)

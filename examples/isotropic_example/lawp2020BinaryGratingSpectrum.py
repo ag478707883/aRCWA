@@ -22,6 +22,8 @@ SAVE_PLOTS = True
 METHOD = "smatrix"
 TRUNCATION = "circular"
 BACKEND = "cuda"
+PRECOMPILE = True
+CACHE_MODES = True
 
 PERIOD_X = 0.5
 PERIOD_Y = PERIOD_X
@@ -34,18 +36,12 @@ NY = 8
 
 FREQUENCY_THZ = np.linspace(150.0, 300.0, 581)
 THETA_CASES = [(0.0, 0.0), (30.0, np.deg2rad(30.0))]
-POLARIZATION_CASES = [("TE", 1.0, 0.0), ("TM", 0.0, 1.0)]
+POLARIZATIONS = ("TE", "TM")
 
 EPS_COVER = 1.0
 EPS_SUBSTRATE = 2.25
 EPS_GRATING = 3.0**2
 EPS_GROOVE = EPS_COVER
-
-I3 = np.eye(3, dtype=complex)
-EPS_COVER_TENSOR = EPS_COVER * I3
-EPS_SUBSTRATE_TENSOR = EPS_SUBSTRATE * I3
-EPS_GRATING_TENSOR = EPS_GRATING * I3
-EPS_GROOVE_TENSOR = EPS_GROOVE * I3
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -56,16 +52,14 @@ xCell = (xIndex + 0.5) / NX * PERIOD_X - PERIOD_X / 2
 ridgeWidth = DUTY_CYCLE * PERIOD_X
 ridgeMask = np.abs(xCell) <= ridgeWidth / 2
 
-epsilonTensorCell = np.empty((NY, NX, 3, 3), dtype=complex)
-epsilonTensorCell[:] = EPS_GROOVE_TENSOR
-epsilonTensorCell[ridgeMask] = EPS_GRATING_TENSOR
-epsilonCell = epsilonTensorCell[..., 0, 0]
+epsilonCell = np.full((NY, NX), EPS_GROOVE, dtype=complex)
+epsilonCell[ridgeMask] = EPS_GRATING
 
 gratingEpsilon = AnalyticRectangle(
     period=(PERIOD_X, PERIOD_Y),
     size=(ridgeWidth, PERIOD_Y),
-    background=EPS_GROOVE_TENSOR[0, 0],
-    inclusion=EPS_GRATING_TENSOR[0, 0],
+    background=EPS_GROOVE,
+    inclusion=EPS_GRATING,
 )
 layers = [
     rcwa.Layer(
@@ -75,43 +69,40 @@ layers = [
         factorization="standard",
     )
 ]
-compiledLayers = rcwa.compileLayers(layers, orders=ORDERS, truncation=TRUNCATION)
+simulation = rcwa.RCWASimulation(
+    period=(PERIOD_X, PERIOD_Y),
+    layers=layers,
+    orders=ORDERS,
+    truncation=TRUNCATION,
+    epsIncident=EPS_COVER,
+    epsTransmission=EPS_SUBSTRATE,
+    method=METHOD,
+    backend=BACKEND,
+    precompile=PRECOMPILE,
+    cacheModes=CACHE_MODES,
+)
 
-reflection = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol, *_ in POLARIZATION_CASES for thetaDeg, _ in THETA_CASES}
-transmission = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol, *_ in POLARIZATION_CASES for thetaDeg, _ in THETA_CASES}
-conservation = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol, *_ in POLARIZATION_CASES for thetaDeg, _ in THETA_CASES}
+reflection = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, _ in THETA_CASES}
+transmission = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, _ in THETA_CASES}
+conservation = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, _ in THETA_CASES}
 
 print("LAWP 2020 binary grating reproduction")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, order=({ORDER}, 0), points={FREQUENCY_THZ.size}")
-print(f"epsilon cover tensor:\n{EPS_COVER_TENSOR}")
-print(f"epsilon substrate tensor:\n{EPS_SUBSTRATE_TENSOR}")
-print(f"epsilon grating tensor:\n{EPS_GRATING_TENSOR}")
+print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, order=({ORDER}, 0), points={FREQUENCY_THZ.size}")
+print(f"epsilon cover={EPS_COVER:.6g}, substrate={EPS_SUBSTRATE:.6g}, grating={EPS_GRATING:.6g}")
 
+backend = rcwa.resolveBackend(BACKEND)
+backend.synchronize()
 startTime = time.perf_counter()
-for polarizationName, sAmplitude, pAmplitude in POLARIZATION_CASES:
-    for thetaDeg, theta in THETA_CASES:
+for thetaDeg, theta in THETA_CASES:
+    print(f"Solving theta={thetaDeg:.0f} deg")
+    wavelengths = 299.792458 / FREQUENCY_THZ
+    thetaSpectrum = simulation.spectrum(wavelengths, theta=theta, phi=0.0, polarizations=POLARIZATIONS)
+    for polarizationName in POLARIZATIONS:
         key = (polarizationName, thetaDeg)
-        print(f"Solving {polarizationName}, theta={thetaDeg:.0f} deg")
-        for index, frequency in enumerate(FREQUENCY_THZ):
-            wavelength = 299.792458 / float(frequency)
-            result = rcwa.solveStack(
-                layers=compiledLayers,
-                wavelength=wavelength,
-                period=(PERIOD_X, PERIOD_Y),
-                orders=ORDERS,
-                epsIncident=EPS_COVER_TENSOR[0, 0],
-                epsTransmission=EPS_SUBSTRATE_TENSOR[0, 0],
-                theta=theta,
-                phi=0.0,
-                sAmplitude=sAmplitude,
-                pAmplitude=pAmplitude,
-                method=METHOD,
-                truncation=TRUNCATION,
-                backend=BACKEND,
-            )
-            reflection[key][index] = result.reflection
-            transmission[key][index] = result.transmission
-            conservation[key][index] = result.conservation
+        reflection[key] = thetaSpectrum[polarizationName]["reflection"]
+        transmission[key] = thetaSpectrum[polarizationName]["transmission"]
+        conservation[key] = thetaSpectrum[polarizationName]["conservation"]
+backend.synchronize()
 elapsed = time.perf_counter() - startTime
 
 for key in [("TE", 0.0), ("TE", 30.0), ("TM", 0.0), ("TM", 30.0)]:

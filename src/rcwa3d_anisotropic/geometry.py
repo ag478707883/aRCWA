@@ -5,7 +5,7 @@ from typing import Iterable, Literal
 
 import numpy as np
 
-from .analytic import AnalyticDisk
+from .analytic import AnalyticDisk, AnalyticRectangle
 from .solver import Layer
 
 
@@ -26,6 +26,18 @@ def _asTensor(value: complex | float | ComplexArray) -> ComplexArray:
 def _isTensorMaterial(value: complex | float | ComplexArray) -> bool:
     array = np.asarray(value)
     return bool(array.shape == (3, 3))
+
+
+def _isScalarMaterial(value: complex | float | ComplexArray) -> bool:
+    return not _isTensorMaterial(value)
+
+
+def _analyticShapeFactorization(factorization: FactorizationMode) -> str:
+    if factorization in ("auto", "jones", "normal-vector"):
+        return "jones"
+    if factorization == "standard":
+        return "analytic"
+    raise ValueError("factorization must be 'auto', 'standard', 'normal-vector', or 'jones'")
 
 
 def _normalizeVectors(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
@@ -320,12 +332,6 @@ def analyticCircularPostLayer(
     jonesResolution: int = 512,
     name: str = "analytic circular post",
 ) -> Layer:
-    if factorization in ("auto", "jones", "normal-vector"):
-        diskFactorization = "jones"
-    elif factorization == "standard":
-        diskFactorization = "analytic"
-    else:
-        raise ValueError("factorization must be 'auto', 'standard', 'normal-vector', or 'jones'")
     return Layer(
         thickness=thickness,
         epsilon=AnalyticDisk(
@@ -334,7 +340,7 @@ def analyticCircularPostLayer(
             background=background,
             inclusion=post,
             center=center,
-            factorization=diskFactorization,
+            factorization=_analyticShapeFactorization(factorization),
             jonesResolution=jonesResolution,
         ),
         factorization=factorization,
@@ -349,14 +355,15 @@ def circularPostLayer(
     post: complex | float | ComplexArray,
     radius: float,
     *,
-    shape: tuple[int, int] = (128, 128),
+    shape: tuple[int, int] | None = None,
     center: tuple[float, float] = (0.0, 0.0),
     factorization: FactorizationMode = "auto",
-    analytic: bool = False,
+    analytic: bool | None = None,
     jonesResolution: int = 512,
     name: str = "circular post",
 ) -> Layer:
-    if analytic and not (_isTensorMaterial(background) or _isTensorMaterial(post)):
+    useAnalytic = (shape is None) if analytic is None else analytic
+    if useAnalytic and _isScalarMaterial(background) and _isScalarMaterial(post):
         return analyticCircularPostLayer(
             period,
             thickness,
@@ -368,7 +375,7 @@ def circularPostLayer(
             jonesResolution=jonesResolution,
             name=name,
         )
-    pattern = SampledPattern(period=period, shape=shape, background=background, name=name)
+    pattern = SampledPattern(period=period, shape=(128, 128) if shape is None else shape, background=background, name=name)
     return pattern.circle(radius, post, center=center).toLayer(thickness, factorization=factorization)
 
 
@@ -389,6 +396,36 @@ def ellipticalPostLayer(
     return pattern.ellipse(radii, post, center=center, angle=angle).toLayer(thickness, factorization=factorization)
 
 
+def analyticRectangularPostLayer(
+    period: tuple[float, float],
+    thickness: float,
+    background: complex | float,
+    post: complex | float,
+    size: tuple[float, float],
+    *,
+    angle: float = 0.0,
+    center: tuple[float, float] = (0.0, 0.0),
+    factorization: FactorizationMode = "auto",
+    jonesResolution: int = 512,
+    name: str = "analytic rectangular post",
+) -> Layer:
+    return Layer(
+        thickness=thickness,
+        epsilon=AnalyticRectangle(
+            period=period,
+            size=size,
+            background=background,
+            inclusion=post,
+            center=center,
+            angle=angle,
+            factorization=_analyticShapeFactorization(factorization),
+            jonesResolution=jonesResolution,
+        ),
+        factorization=factorization,
+        name=name,
+    )
+
+
 def rectangularPostLayer(
     period: tuple[float, float],
     thickness: float,
@@ -397,12 +434,28 @@ def rectangularPostLayer(
     size: tuple[float, float],
     *,
     angle: float = 0.0,
-    shape: tuple[int, int] = (128, 128),
+    shape: tuple[int, int] | None = None,
     center: tuple[float, float] = (0.0, 0.0),
     factorization: FactorizationMode = "auto",
+    analytic: bool | None = None,
+    jonesResolution: int = 512,
     name: str = "rectangular post",
 ) -> Layer:
-    pattern = SampledPattern(period=period, shape=shape, background=background, name=name)
+    useAnalytic = (shape is None) if analytic is None else analytic
+    if useAnalytic and _isScalarMaterial(background) and _isScalarMaterial(post):
+        return analyticRectangularPostLayer(
+            period,
+            thickness,
+            complex(background),
+            complex(post),
+            size,
+            angle=angle,
+            center=center,
+            factorization=factorization,
+            jonesResolution=jonesResolution,
+            name=name,
+        )
+    pattern = SampledPattern(period=period, shape=(128, 128) if shape is None else shape, background=background, name=name)
     return pattern.rectangle(size, post, center=center, angle=angle).toLayer(thickness, factorization=factorization)
 
 
@@ -504,7 +557,7 @@ def slicedTaperStack(
     kind: ShapeKind = "rectangle",
     slices: int = 20,
     angle: float = 0.0,
-    shape: tuple[int, int] = (128, 128),
+    shape: tuple[int, int] | None = None,
     factorization: FactorizationMode = "auto",
     name: str = "taper",
 ) -> list[Layer]:

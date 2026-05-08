@@ -20,9 +20,6 @@ from .solver import (
     Layer,
     LayerFieldSolution,
     RCWAResult,
-    compileLayers,
-    solveStack,
-    solveStackBatch,
 )
 from .analytic import AnalyticAnnulus, AnalyticDisk, AnalyticEllipse, AnalyticRectangle
 from .backend import ArrayBackend, resolveBackend
@@ -72,7 +69,6 @@ __all__ = [
     "analyticCircularPostLayer",
     "annularPostLayer",
     "circularPostLayer",
-    "compileLayers",
     "constantEpsilon",
     "constantIndex",
     "crossPostLayer",
@@ -92,8 +88,6 @@ __all__ = [
     "resolveBackend",
     "reconstructFourierGrid",
     "reconstructFourierXy",
-    "solveStack",
-    "solveStackBatch",
     "stackFieldComponentsXy",
     "stackFieldComponentsXz",
     "stackFieldSliceXy",

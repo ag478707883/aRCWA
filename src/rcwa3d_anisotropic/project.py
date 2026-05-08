@@ -164,7 +164,9 @@ class AnisotropicRCWA:
         center: tuple[float, float] = (0.0, 0.0),
         angle_deg: float = 0.0,
         samples: int | tuple[int, int] | None = None,
+        analytic: bool = True,
         factorization: Literal["auto", "standard", "normal-vector", "jones"] = "auto",
+        jonesResolution: int = 512,
         name: str = "rectangular grating",
     ) -> "AnisotropicRCWA":
         """Append a rectangular post layer."""
@@ -179,7 +181,9 @@ class AnisotropicRCWA:
                 center=center,
                 angle=np.deg2rad(angle_deg),
                 shape=_samples(samples, self.samples),
+                analytic=analytic,
                 factorization=factorization,
+                jonesResolution=jonesResolution,
                 name=name,
             )
         )

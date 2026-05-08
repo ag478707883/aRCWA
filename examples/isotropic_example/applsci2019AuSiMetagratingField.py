@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import time
 
 import matplotlib
 import numpy as np
@@ -13,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import rcwa3d_isotropic as rcwa
+from rcwa3d_isotropic.analytic import AnalyticComposite, AnalyticRectangle, AnalyticTerm
 
 
 SHOW = True
@@ -20,6 +22,8 @@ SAVE_PLOTS = True
 METHOD = "smatrix"
 TRUNCATION = "circular"
 BACKEND = "cuda"
+PRECOMPILE = False
+CACHE_MODES = False
 
 SPECTRUM_ORDER = 8
 FIELD_ORDER = 8
@@ -27,7 +31,6 @@ WAVELENGTH = 4.132
 SPECTRUM_MIN = 3.0
 SPECTRUM_MAX = 5
 SPECTRUM_POINTS = 501
-GEOMETRY_GRID = (8, 1024)
 FIELD_X = 421
 FIELD_Z = 301
 
@@ -39,10 +42,6 @@ SILICON_HEIGHT = 0.7
 
 EPS_AIR = 1.0
 EPS_QUARTZ = 1.45**2
-
-I3 = np.eye(3, dtype=complex)
-EPS_AIR_TENSOR = EPS_AIR * I3
-EPS_QUARTZ_TENSOR = EPS_QUARTZ * I3
 
 
 if not SHOW:
@@ -79,106 +78,100 @@ if SPECTRUM_MIN >= SPECTRUM_MAX:
 if SPECTRUM_POINTS < 2:
     raise ValueError("SPECTRUM_POINTS must be at least 2")
 
-epsSi = complex(float(np.interp(WAVELENGTH, siWavelengths, siN)), float(np.interp(WAVELENGTH, siWavelengths, siK))) ** 2
-epsAu = complex(float(np.interp(WAVELENGTH, auWavelengths, auN)), float(np.interp(WAVELENGTH, auWavelengths, auK))) ** 2
-EPS_SI_TENSOR = epsSi * I3
-EPS_AU_TENSOR = epsAu * I3
-
 period = (PERIOD_1, 1.0)
 stripWidth = FILL_2 * PERIOD_2
 stripCenters = (-PERIOD_2 / 2, PERIOD_2 / 2)
+
+
+def interpolatedEpsilon(wavelength, wavelengthsTable, nTable, kTable, source):
+    if wavelength < wavelengthsTable[0] or wavelength > wavelengthsTable[-1]:
+        raise ValueError(f"wavelength {wavelength} um is outside {source} data range")
+    nValue = float(np.interp(wavelength, wavelengthsTable, nTable))
+    kValue = float(np.interp(wavelength, wavelengthsTable, kTable))
+    return complex(nValue, kValue) ** 2
+
+
+def siliconGoldLayers(wavelength):
+    epsSiSample = interpolatedEpsilon(wavelength, siWavelengths, siN, siK, SI_DATA)
+    epsAuSample = interpolatedEpsilon(wavelength, auWavelengths, auN, auK, AU_DATA)
+    terms = tuple(
+        AnalyticTerm(
+            AnalyticRectangle(
+                period=period,
+                size=(stripWidth, period[1]),
+                background=0.0,
+                inclusion=1.0,
+                center=(center, 0.0),
+            ),
+            epsSiSample - EPS_AIR,
+        )
+        for center in stripCenters
+    )
+    return [
+        rcwa.Layer(
+            thickness=SILICON_HEIGHT,
+            epsilon=AnalyticComposite(period=period, background=EPS_AIR, terms=terms),
+            name="analytic silicon strip pair in air",
+            factorization="standard",
+        ),
+        rcwa.Layer(thickness=GOLD_THICKNESS, epsilon=epsAuSample, name="gold film", factorization="standard"),
+    ]
+
+
+epsSi = interpolatedEpsilon(WAVELENGTH, siWavelengths, siN, siK, SI_DATA)
+epsAu = interpolatedEpsilon(WAVELENGTH, auWavelengths, auN, auK, AU_DATA)
 
 wavelengths = np.linspace(SPECTRUM_MIN, SPECTRUM_MAX, SPECTRUM_POINTS)
 reflection = np.empty_like(wavelengths)
 transmission = np.empty_like(wavelengths)
 absorptionSpectrum = np.empty_like(wavelengths)
 
-for index, sampleWavelength in enumerate(wavelengths):
-    if sampleWavelength < siWavelengths[0] or sampleWavelength > siWavelengths[-1]:
-        raise ValueError(f"wavelength {sampleWavelength} um is outside {SI_DATA} data range")
-    if sampleWavelength < auWavelengths[0] or sampleWavelength > auWavelengths[-1]:
-        raise ValueError(f"wavelength {sampleWavelength} um is outside {AU_DATA} data range")
-
-    epsSiSample = complex(float(np.interp(sampleWavelength, siWavelengths, siN)), float(np.interp(sampleWavelength, siWavelengths, siK))) ** 2
-    epsAuSample = complex(float(np.interp(sampleWavelength, auWavelengths, auN)), float(np.interp(sampleWavelength, auWavelengths, auK))) ** 2
-    epsSiTensorSample = epsSiSample * I3
-    epsAuTensorSample = epsAuSample * I3
-
-    spectrumGeometry = rcwa.LayerStack(period=period, shape=GEOMETRY_GRID)
-    spectrumGeometry.addLayer(SILICON_HEIGHT, EPS_AIR_TENSOR, name="air layer patterned with silicon strips", factorization="standard")
-    spectrumGeometry.addLayer(GOLD_THICKNESS, epsAuTensorSample, name="gold film", factorization="standard")
-    for center in stripCenters:
-        spectrumGeometry.setMaterial(
-            epsSiTensorSample,
-            x=(center - stripWidth / 2, center + stripWidth / 2),
-            y=(-period[1] / 2, period[1] / 2),
-            z=(0.0, SILICON_HEIGHT),
-        )
-
-    spectrumLayers = spectrumGeometry.toLayers()
-    compiledSpectrumLayers = rcwa.compileLayers(spectrumLayers, orders=(SPECTRUM_ORDER, 0), truncation=TRUNCATION)
-    spectrumResult = rcwa.solveStack(
-        layers=compiledSpectrumLayers,
-        wavelength=float(sampleWavelength),
-        period=period,
-        orders=(SPECTRUM_ORDER, 0),
-        epsIncident=EPS_AIR_TENSOR[0, 0],
-        epsTransmission=EPS_QUARTZ_TENSOR[0, 0],
-        theta=0.0,
-        phi=0.0,
-        sAmplitude=0.0,
-        pAmplitude=1.0,
-        returnFields=False,
-        method=METHOD,
-        truncation=TRUNCATION,
-        backend=BACKEND,
-    )
-    reflection[index] = spectrumResult.reflection
-    transmission[index] = spectrumResult.transmission
-    absorptionSpectrum[index] = 1.0 - spectrumResult.reflection - spectrumResult.transmission
-
-geometry = rcwa.LayerStack(period=period, shape=GEOMETRY_GRID)
-geometry.addLayer(SILICON_HEIGHT, EPS_AIR_TENSOR, name="air layer patterned with silicon strips", factorization="standard")
-geometry.addLayer(GOLD_THICKNESS, EPS_AU_TENSOR, name="gold film", factorization="standard")
-for center in stripCenters:
-    geometry.setMaterial(
-        EPS_SI_TENSOR,
-        x=(center - stripWidth / 2, center + stripWidth / 2),
-        y=(-period[1] / 2, period[1] / 2),
-        z=(0.0, SILICON_HEIGHT),
-    )
-
-layers = geometry.toLayers()
-compiledLayers = rcwa.compileLayers(layers, orders=(FIELD_ORDER, 0), truncation=TRUNCATION)
-result = rcwa.solveStack(
-    layers=compiledLayers,
-    wavelength=WAVELENGTH,
+spectrumSimulation = rcwa.RCWASimulation(
     period=period,
-    orders=(FIELD_ORDER, 0),
-    epsIncident=EPS_AIR_TENSOR[0, 0],
-    epsTransmission=EPS_QUARTZ_TENSOR[0, 0],
-    theta=0.0,
-    phi=0.0,
-    sAmplitude=0.0,
-    pAmplitude=1.0,
-    returnFields=True,
+    orders=(SPECTRUM_ORDER, 0),
+    layers=[siliconGoldLayers],
+    epsIncident=EPS_AIR,
+    epsTransmission=EPS_QUARTZ,
     method=METHOD,
     truncation=TRUNCATION,
     backend=BACKEND,
+    precompile=PRECOMPILE,
+    cacheModes=CACHE_MODES,
 )
+fieldSimulation = rcwa.RCWASimulation(
+    period=period,
+    orders=(FIELD_ORDER, 0),
+    layers=[siliconGoldLayers],
+    epsIncident=EPS_AIR,
+    epsTransmission=EPS_QUARTZ,
+    method=METHOD,
+    truncation=TRUNCATION,
+    backend=BACKEND,
+    precompile=PRECOMPILE,
+    cacheModes=CACHE_MODES,
+)
+backend = rcwa.resolveBackend(BACKEND)
+backend.synchronize()
+startTime = time.perf_counter()
+spectrum = spectrumSimulation.spectrum(wavelengths, polarizations=("TM",))
+reflection = spectrum["TM"]["reflection"]
+transmission = spectrum["TM"]["transmission"]
+absorptionSpectrum = 1.0 - reflection - transmission
+result = fieldSimulation.solve(WAVELENGTH, polarization="TM", returnFields=True)
+backend.synchronize()
+elapsed = time.perf_counter() - startTime
 
 absorption = 1.0 - result.reflection - result.transmission
 bestAbsorptionIndex = int(np.argmax(absorptionSpectrum))
 
 print("Appl. Sci. 2019 absorber: spectrum + Fig. 3(c) self-normalized magnetic field |H|")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}")
+print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}")
 print(f"spectrum orders=({SPECTRUM_ORDER}, 0), field orders=({FIELD_ORDER}, 0)")
-print("geometry: full air-pattern layer + full gold layer, then Si set by x/y/z region selection")
+print("geometry: analytic silicon strip pair in air + homogeneous gold film")
 print(f"lambda={WAVELENGTH:.4f} um, period1={PERIOD_1:.3f} um, period2={PERIOD_2:.3f} um")
-print(f"epsilon air tensor:\n{EPS_AIR_TENSOR}")
-print(f"epsilon quartz tensor:\n{EPS_QUARTZ_TENSOR}")
-print(f"epsilon silicon tensor:\n{EPS_SI_TENSOR}")
-print(f"epsilon gold tensor:\n{EPS_AU_TENSOR}")
+print(f"epsilon air={EPS_AIR:.6g}, quartz={EPS_QUARTZ:.6g}")
+print(f"epsilon silicon={epsSi:.6g}, gold={epsAu:.6g}")
+print(f"elapsed={elapsed:.3f} s")
 print(f"R={result.reflection:.6f}, T={result.transmission:.6f}, A={absorption:.6f}, R+T={result.conservation:.6f}")
 print(f"spectrum peak A={absorptionSpectrum[bestAbsorptionIndex]:.6f} at lambda={wavelengths[bestAbsorptionIndex]:.4f} um")
 
