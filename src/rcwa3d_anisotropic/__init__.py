@@ -1,20 +1,9 @@
-"""Tensor-material RCWA solver for z-stacked, x/y-periodic structures."""
+"""Tensor-material RCWA solver for sampled z-stacked, x/y-periodic structures."""
 
-from .analytic import (
-    AnalyticDisk,
-    AnalyticRectangle,
-    analyticDiskConvolution,
-    analyticRectangleConvolution,
-    diskIndicatorConvolution,
-    rectangleIndicatorConvolution,
-)
 from .backend import ArrayBackend, resolveBackend
 from .builder import LayerStack, PatternLayer
-from .factorization import TensorConvolutionData, liFactorizedSystemMatrix, tensorConvolutionData
 from .geometry import (
     SampledPattern,
-    analyticCircularPostLayer,
-    analyticRectangularPostLayer,
     circularPostLayer,
     ellipticalPostLayer,
     polygonPostLayer,
@@ -32,24 +21,17 @@ from .materials import (
     xzTensor,
 )
 from .project import AnisotropicRCWA, Project
-from .simulation import LayerSpec, RCWASimulation, homogeneousLayer
+from .simulation import LayerSpec, RCWASimulation, SimulationConfig, buildSimulation, homogeneousLayer, solveSpectrum
 from .solver import (
-    CompiledLayer,
     DiffractionOrder,
     Layer,
     LayerEigTiming,
     LayerFieldSolution,
     RCWAResult,
-    compileLayers,
-    solveStack,
-    solveStackBatch,
-    solveStackBatchPowers,
+    StackTiming,
 )
 
 __all__ = [
-    "CompiledLayer",
-    "AnalyticDisk",
-    "AnalyticRectangle",
     "AnisotropicRCWA",
     "ArrayBackend",
     "DiffractionOrder",
@@ -60,35 +42,26 @@ __all__ = [
     "RCWAResult",
     "RCWASimulation",
     "LayerSpec",
+    "SimulationConfig",
+    "StackTiming",
     "PatternLayer",
     "Project",
     "SampledPattern",
-    "TensorConvolutionData",
-    "analyticCircularPostLayer",
-    "analyticDiskConvolution",
-    "analyticRectangularPostLayer",
-    "analyticRectangleConvolution",
+    "buildSimulation",
     "circularPostLayer",
-    "compileLayers",
-    "diskIndicatorConvolution",
     "ellipticalPostLayer",
     "gyrotropicXzTensor",
     "homogeneousLayer",
-    "liFactorizedSystemMatrix",
     "polygonPostLayer",
     "reciprocalXzTensor",
-    "rectangleIndicatorConvolution",
     "rectangularHollowPostLayer",
     "rectangularPostLayer",
     "resolveBackend",
     "rotateTensor",
     "rotationMatrix",
-    "solveStack",
-    "solveStackBatch",
-    "solveStackBatchPowers",
     "slicedTaperStack",
+    "solveSpectrum",
     "stack",
-    "tensorConvolutionData",
     "twistXzCoupling",
     "xzTensor",
 ]

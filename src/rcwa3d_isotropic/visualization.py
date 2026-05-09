@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def _save_if_requested(fig: Figure, path: str | Path | None) -> None:
+def save_if_requested(fig: Figure, path: str | Path | None) -> None:
     if path is None:
         return
     outputPath = Path(path)
@@ -35,7 +35,7 @@ def plotEpsilon(
     ax.set_ylabel("y")
     ax.set_title(title)
     fig.tight_layout()
-    _save_if_requested(fig, path)
+    save_if_requested(fig, path)
     return fig
 
 
@@ -60,7 +60,7 @@ def plotSpectrum(
     ax.grid(True, alpha=0.28)
     ax.legend()
     fig.tight_layout()
-    _save_if_requested(fig, path)
+    save_if_requested(fig, path)
     return fig
 
 
@@ -96,5 +96,5 @@ def plotField(
     ax.set_ylabel("y")
     ax.set_title(title)
     fig.tight_layout()
-    _save_if_requested(fig, path)
+    save_if_requested(fig, path)
     return fig

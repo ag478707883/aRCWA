@@ -21,7 +21,7 @@ ComplexArray = np.ndarray
 FactorizationMode = Literal["auto", "standard", "normal-vector", "jones"]
 
 
-def _resolveEpsilon(value: complex | float | IsotropicMaterial) -> complex:
+def resolveEpsilon(value: complex | float | IsotropicMaterial) -> complex:
     if isinstance(value, IsotropicMaterial):
         return value.epsilon()
     array = np.asarray(value)
@@ -37,7 +37,7 @@ def _resolveEpsilon(value: complex | float | IsotropicMaterial) -> complex:
     return complex(value)
 
 
-def _normalizeVectors(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
+def normalizeVectors(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
     length = np.sqrt(np.real(x) ** 2 + np.real(y) ** 2)
     safe = length > 1e-12
     return (
@@ -58,6 +58,7 @@ class Pattern2D:
     shape: tuple[int, int]
     background: complex | float | IsotropicMaterial
     name: str = ""
+    supersample: int = 1
     epsilon: np.ndarray = field(init=False)
     normalField: np.ndarray | None = field(default=None, init=False)
 
@@ -66,7 +67,10 @@ class Pattern2D:
             raise ValueError("period values must be positive")
         if self.shape[0] <= 0 or self.shape[1] <= 0:
             raise ValueError("shape must be (ny, nx) with positive values")
-        self.epsilon = np.full(self.shape, _resolveEpsilon(self.background), dtype=complex)
+        if int(self.supersample) < 1:
+            raise ValueError("supersample must be at least 1")
+        self.supersample = int(self.supersample)
+        self.epsilon = np.full(self.shape, resolveEpsilon(self.background), dtype=complex)
 
     @property
     def nx(self) -> int:
@@ -77,10 +81,16 @@ class Pattern2D:
         return int(self.shape[0])
 
     def coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.sampleCoordinates()
+
+    def sampleCoordinates(self, supersample: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        supersample = self.supersample if supersample is None else int(supersample)
+        if supersample < 1:
+            raise ValueError("supersample must be at least 1")
         periodX, periodY = self.period
-        yIndex, xIndex = np.mgrid[0 : self.ny, 0 : self.nx]
-        xx = (xIndex + 0.5) / self.nx * periodX - periodX / 2
-        yy = (yIndex + 0.5) / self.ny * periodY - periodY / 2
+        yIndex, xIndex = np.mgrid[0 : self.ny * supersample, 0 : self.nx * supersample]
+        xx = (xIndex + 0.5) / (self.nx * supersample) * periodX - periodX / 2
+        yy = (yIndex + 0.5) / (self.ny * supersample) * periodY - periodY / 2
         return xx, yy
 
     def fill(
@@ -91,9 +101,35 @@ class Pattern2D:
     ) -> "Pattern2D":
         if mask.shape != self.shape:
             raise ValueError(f"mask shape {mask.shape} does not match pattern shape {self.shape}")
-        self.epsilon[mask] = _resolveEpsilon(material)
+        self.epsilon[mask] = resolveEpsilon(material)
         if normal is not None:
-            normalX, normalY = _normalizeVectors(normal[0], normal[1])
+            normalX, normalY = normalizeVectors(normal[0], normal[1])
+            if normalX.shape != self.shape:
+                normalX = blockAverage(normalX, self.shape).real
+                normalY = blockAverage(normalY, self.shape).real
+                normalX, normalY = normalizeVectors(normalX, normalY)
+            self.normalField = np.zeros(self.shape + (2,), dtype=float)
+            self.normalField[..., 0] = normalX
+            self.normalField[..., 1] = normalY
+        return self
+
+    def fillFraction(
+        self,
+        fraction: np.ndarray,
+        material: complex | float | IsotropicMaterial,
+        normal: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> "Pattern2D":
+        if fraction.shape != self.shape:
+            raise ValueError(f"fraction shape {fraction.shape} does not match pattern shape {self.shape}")
+        values = np.clip(np.asarray(fraction, dtype=float), 0.0, 1.0)
+        materialValue = resolveEpsilon(material)
+        self.epsilon = (1.0 - values) * self.epsilon + values * materialValue
+        if normal is not None:
+            normalX, normalY = normalizeVectors(normal[0], normal[1])
+            if normalX.shape != self.shape:
+                normalX = blockAverage(normalX, self.shape).real
+                normalY = blockAverage(normalY, self.shape).real
+                normalX, normalY = normalizeVectors(normalX, normalY)
             self.normalField = np.zeros(self.shape + (2,), dtype=float)
             self.normalField[..., 0] = normalX
             self.normalField[..., 1] = normalY
@@ -105,12 +141,14 @@ class Pattern2D:
         material: complex | float | IsotropicMaterial,
         center: tuple[float, float] = (0.0, 0.0),
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "Pattern2D":
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         mask = x**2 + y**2 <= radius**2
-        return self.fill(mask, material, normal=(x, y) if useNormal else None)
+        return self.fillSampled(mask, material, normal=(x, y) if useNormal else None, supersample=supersample)
 
     def ellipse(
         self,
@@ -119,8 +157,10 @@ class Pattern2D:
         center: tuple[float, float] = (0.0, 0.0),
         angle: float = 0.0,
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "Pattern2D":
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         cosine = np.cos(angle)
@@ -134,7 +174,12 @@ class Pattern2D:
         normalLocalY = yRotated / (ay * ay)
         normalX = cosine * normalLocalX - sine * normalLocalY
         normalY = sine * normalLocalX + cosine * normalLocalY
-        return self.fill(mask, material, normal=(normalX, normalY) if useNormal else None)
+        return self.fillSampled(
+            mask,
+            material,
+            normal=(normalX, normalY) if useNormal else None,
+            supersample=supersample,
+        )
 
     def rectangle(
         self,
@@ -143,8 +188,10 @@ class Pattern2D:
         center: tuple[float, float] = (0.0, 0.0),
         angle: float = 0.0,
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "Pattern2D":
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         cosine = np.cos(angle)
@@ -171,7 +218,12 @@ class Pattern2D:
             localY = np.where(useX, 0.0, signY)
         normalX = cosine * localX - sine * localY
         normalY = sine * localX + cosine * localY
-        return self.fill(mask, material, normal=(normalX, normalY) if useNormal else None)
+        return self.fillSampled(
+            mask,
+            material,
+            normal=(normalX, normalY) if useNormal else None,
+            supersample=supersample,
+        )
 
     def annulus(
         self,
@@ -180,8 +232,10 @@ class Pattern2D:
         material: complex | float | IsotropicMaterial,
         center: tuple[float, float] = (0.0, 0.0),
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "Pattern2D":
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         radius = np.sqrt(x * x + y * y)
@@ -189,7 +243,12 @@ class Pattern2D:
         mask = (radiusSquared >= innerRadius**2) & (radiusSquared <= outerRadius**2)
         safeRadius = np.where(radius > 1e-12, radius, 1.0)
         sign = np.where(np.abs(radius - innerRadius) < np.abs(radius - outerRadius), -1.0, 1.0)
-        return self.fill(mask, material, normal=(sign * x / safeRadius, sign * y / safeRadius) if useNormal else None)
+        return self.fillSampled(
+            mask,
+            material,
+            normal=(sign * x / safeRadius, sign * y / safeRadius) if useNormal else None,
+            supersample=supersample,
+        )
 
     def cross(
         self,
@@ -199,8 +258,10 @@ class Pattern2D:
         center: tuple[float, float] = (0.0, 0.0),
         angle: float = 0.0,
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "Pattern2D":
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         cosine = np.cos(angle)
@@ -209,7 +270,12 @@ class Pattern2D:
         yRotated = -sine * x + cosine * y
         horizontalMask = (np.abs(xRotated) <= armLengths[0] / 2) & (np.abs(yRotated) <= armWidths[0] / 2)
         verticalMask = (np.abs(xRotated) <= armWidths[1] / 2) & (np.abs(yRotated) <= armLengths[1] / 2)
-        return self.fill(horizontalMask | verticalMask, material, normal=(xRotated, yRotated) if useNormal else None)
+        return self.fillSampled(
+            horizontalMask | verticalMask,
+            material,
+            normal=(xRotated, yRotated) if useNormal else None,
+            supersample=supersample,
+        )
 
     def stripes(
         self,
@@ -236,14 +302,16 @@ class Pattern2D:
         vertices: Iterable[tuple[float, float]],
         material: complex | float | IsotropicMaterial,
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "Pattern2D":
         points = np.asarray(tuple(vertices), dtype=float)
         if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] < 3:
             raise ValueError("polygon vertices must be a sequence of at least three (x, y) points")
-        xx, yy = self.coordinates()
-        mask = _polygonMask(xx, yy, points)
-        normal = _polygonNormalField(xx, yy, points) if useNormal else None
-        return self.fill(mask, material, normal=normal)
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
+        mask = polygonMask(xx, yy, points)
+        normal = polygonNormalField(xx, yy, points) if useNormal else None
+        return self.fillSampled(mask, material, normal=normal, supersample=supersample)
 
     def toLayer(
         self,
@@ -258,10 +326,30 @@ class Pattern2D:
             name=name if name is not None else self.name,
             normalField=None if normal is None else normal.copy(),
             factorization=factorization,
+            sampleShape=self.shape,
         )
 
+    def fillSampled(
+        self,
+        mask: np.ndarray,
+        material: complex | float | IsotropicMaterial,
+        *,
+        normal: tuple[np.ndarray, np.ndarray] | None,
+        supersample: int,
+    ) -> "Pattern2D":
+        if supersample == 1:
+            return self.fill(mask, material, normal=normal)
+        fraction = blockAverage(mask.astype(float), self.shape).real
+        averagedNormal = None
+        if normal is not None:
+            averagedNormal = (
+                blockAverage(np.asarray(normal[0]) * mask, self.shape).real,
+                blockAverage(np.asarray(normal[1]) * mask, self.shape).real,
+            )
+        return self.fillFraction(fraction, material, normal=averagedNormal)
 
-def _polygonMask(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> ComplexArray:
+
+def polygonMask(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> ComplexArray:
     x = xx
     y = yy
     inside = np.zeros(x.shape, dtype=bool)
@@ -274,7 +362,20 @@ def _polygonMask(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> Co
     return inside
 
 
-def _polygonNormalField(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
+def blockAverage(values: ComplexArray, shape: tuple[int, int]) -> ComplexArray:
+    array = np.asarray(values)
+    ny, nx = shape
+    if array.shape == shape:
+        return array
+    if array.ndim < 2 or array.shape[0] % ny != 0 or array.shape[1] % nx != 0:
+        raise ValueError(f"cannot block-average shape {array.shape} to {shape}")
+    sy = array.shape[0] // ny
+    sx = array.shape[1] // nx
+    trailing = array.shape[2:]
+    return array.reshape(ny, sy, nx, sx, *trailing).mean(axis=(1, 3))
+
+
+def polygonNormalField(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
     bestDistance = np.full(xx.shape, np.inf, dtype=float)
     bestX = np.ones(xx.shape, dtype=float)
     bestY = np.zeros(xx.shape, dtype=float)
@@ -296,7 +397,7 @@ def _polygonNormalField(xx: ComplexArray, yy: ComplexArray, points: ComplexArray
         bestDistance = np.where(update, distance, bestDistance)
         bestX = np.where(update, normalX, bestX)
         bestY = np.where(update, normalY, bestY)
-    return _normalizeVectors(bestX, bestY)
+    return normalizeVectors(bestX, bestY)
 
 
 def homogeneousLayer(thickness: float, material: object, name: str = "", factorization: FactorizationMode = "auto") -> object:
@@ -304,7 +405,7 @@ def homogeneousLayer(thickness: float, material: object, name: str = "", factori
         from .simulation import LayerSpec
 
         return LayerSpec(thickness=thickness, epsilon=material, name=name, factorization=factorization)
-    return Layer(thickness=thickness, epsilon=_resolveEpsilon(material), name=name, factorization=factorization)
+    return Layer(thickness=thickness, epsilon=resolveEpsilon(material), name=name, factorization=factorization)
 
 
 def photonicCrystalSlab(
@@ -325,8 +426,8 @@ def photonicCrystalSlab(
             epsilon=AnalyticDisk(
                 period=period,
                 radius=radius,
-                background=_resolveEpsilon(slab),
-                inclusion=_resolveEpsilon(hole),
+                background=resolveEpsilon(slab),
+                inclusion=resolveEpsilon(hole),
                 factorization="jones" if factorization in ("auto", "jones") else "analytic",
                 jonesResolution=jonesResolution,
             ),
@@ -354,8 +455,8 @@ def analyticCircularPostLayer(
         epsilon=AnalyticDisk(
             period=period,
             radius=radius,
-            background=_resolveEpsilon(background),
-            inclusion=_resolveEpsilon(post),
+            background=resolveEpsilon(background),
+            inclusion=resolveEpsilon(post),
             center=center,
             factorization="jones" if factorization in ("auto", "jones") else "analytic",
             jonesResolution=jonesResolution,
@@ -415,8 +516,8 @@ def ellipticalPostLayer(
             epsilon=AnalyticEllipse(
                 period=period,
                 radii=radii,
-                background=_resolveEpsilon(background),
-                inclusion=_resolveEpsilon(post),
+                background=resolveEpsilon(background),
+                inclusion=resolveEpsilon(post),
                 center=center,
                 angle=angle,
                 factorization="jones" if factorization in ("auto", "jones") else "analytic",
@@ -450,8 +551,8 @@ def rectangularPostLayer(
             epsilon=AnalyticRectangle(
                 period=period,
                 size=size,
-                background=_resolveEpsilon(background),
-                inclusion=_resolveEpsilon(post),
+                background=resolveEpsilon(background),
+                inclusion=resolveEpsilon(post),
                 center=center,
                 angle=angle,
                 factorization="jones" if factorization in ("auto", "jones") else "analytic",
@@ -487,9 +588,9 @@ def annularPostLayer(
                 period=period,
                 innerRadius=innerRadius,
                 outerRadius=outerRadius,
-                background=_resolveEpsilon(background),
-                ring=_resolveEpsilon(ring),
-                hole=None if holeMaterial is None else _resolveEpsilon(holeMaterial),
+                background=resolveEpsilon(background),
+                ring=resolveEpsilon(ring),
+                hole=None if holeMaterial is None else resolveEpsilon(holeMaterial),
                 center=center,
                 factorization="jones" if factorization in ("auto", "jones") else "analytic",
                 jonesResolution=jonesResolution,
@@ -526,9 +627,9 @@ def rectangularHollowPostLayer(
             raise ValueError("analytic rectangular hollow requires the circular hole to lie inside the rectangle")
         if factorization in ("normal-vector", "jones"):
             raise ValueError("analytic rectangular hollow layers support 'auto' or 'standard' factorization")
-        backgroundValue = _resolveEpsilon(background)
-        postValue = _resolveEpsilon(post)
-        holeValue = backgroundValue if holeMaterial is None else _resolveEpsilon(holeMaterial)
+        backgroundValue = resolveEpsilon(background)
+        postValue = resolveEpsilon(post)
+        holeValue = backgroundValue if holeMaterial is None else resolveEpsilon(holeMaterial)
         rectangle = AnalyticRectangle(
             period=period,
             size=size,
@@ -567,7 +668,7 @@ def rectangularHollowPostLayer(
     )
     if factorization in ("auto", "normal-vector", "jones"):
         xx, yy = pattern.coordinates()
-        pattern.normalField = _rectangularHollowNormalField(xx, yy, size, holeRadius, center, angle)
+        pattern.normalField = rectangularHollowNormalField(xx, yy, size, holeRadius, center, angle)
     return pattern.toLayer(thickness, factorization=factorization)
 
 
@@ -590,8 +691,8 @@ def crossPostLayer(
     if analytic:
         if factorization in ("normal-vector", "jones"):
             raise ValueError("analytic cross layers support 'auto' or 'standard' factorization")
-        backgroundValue = _resolveEpsilon(background)
-        postValue = _resolveEpsilon(post)
+        backgroundValue = resolveEpsilon(background)
+        postValue = resolveEpsilon(post)
         horizontal = AnalyticRectangle(
             period=period,
             size=(armLengths[0], armWidths[0]),
@@ -651,7 +752,7 @@ def polygonPostLayer(
     return pattern.toLayer(thickness, factorization=factorization)
 
 
-def _rectangularHollowNormalField(
+def rectangularHollowNormalField(
     xx: ComplexArray,
     yy: ComplexArray,
     size: tuple[float, float],
@@ -686,7 +787,7 @@ def _rectangularHollowNormalField(
     ny = np.where(useHoleNormal, holeNy, rectNy)
 
     normal = np.zeros(xx.shape + (2,), dtype=float)
-    normal[..., 0], normal[..., 1] = _normalizeVectors(nx, ny)
+    normal[..., 0], normal[..., 1] = normalizeVectors(nx, ny)
     return normal
 
 

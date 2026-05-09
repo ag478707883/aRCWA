@@ -1,9 +1,13 @@
 import unittest
+import warnings
 
 import numpy as np
 
 import bootstrap  # noqa: F401
+import rcwa3d_anisotropic as anisotropic
 from rcwa3d_isotropic.analytic import AnalyticDisk, AnalyticRectangle
+from rcwa3d_isotropic.backend import resolveBackend
+from rcwa3d_isotropic.factorization import layerDataForTorch
 from rcwa3d_isotropic.fourier import makeHarmonics
 from rcwa3d_isotropic import (
     AIR,
@@ -26,7 +30,6 @@ from rcwa3d_isotropic import (
     stackFieldComponentsXy,
     stackFieldSliceXy,
 )
-from rcwa3d_isotropic.solver import _compileLayers
 
 
 class GeometryFieldTests(unittest.TestCase):
@@ -47,12 +50,6 @@ class GeometryFieldTests(unittest.TestCase):
 
         pattern = Pattern2D(period=period, shape=(160, 200), background=background)
         pattern.rectangle(size=size, center=center, material=inclusion, useNormal=False)
-        sampledLayer = _compileLayers(
-            [pattern.toLayer(0.1, factorization="standard")],
-            orders=(2, 2),
-            truncation="rectangular",
-        )[0]
-
         harmonics = makeHarmonics(
             wavelength=1.0,
             period=period,
@@ -62,6 +59,13 @@ class GeometryFieldTests(unittest.TestCase):
             phi=0.0,
             truncation="rectangular",
         )
+        backend = resolveBackend("cuda")
+        sampled = layerDataForTorch(
+            pattern.toLayer(0.1, factorization="standard"),
+            harmonics,
+            backend.xp,
+            backend.device,
+        )
         analytic = AnalyticRectangle(
             period=period,
             size=size,
@@ -70,7 +74,7 @@ class GeometryFieldTests(unittest.TestCase):
             inclusion=inclusion,
         ).convolutionMatrix(harmonics)
 
-        np.testing.assert_allclose(sampledLayer.epsilonMatrix, analytic, rtol=8e-3, atol=8e-3)
+        np.testing.assert_allclose(backend.asnumpy(sampled.epsilonMatrix), analytic, rtol=8e-3, atol=8e-3)
 
     def testSampledCircleConvolutionUsesCenteredPhysicalCoordinates(self) -> None:
         period = (1.0, 1.0)
@@ -81,12 +85,6 @@ class GeometryFieldTests(unittest.TestCase):
 
         pattern = Pattern2D(period=period, shape=(240, 240), background=background)
         pattern.circle(radius=radius, center=center, material=inclusion, useNormal=False)
-        sampledLayer = _compileLayers(
-            [pattern.toLayer(0.1, factorization="standard")],
-            orders=(2, 2),
-            truncation="rectangular",
-        )[0]
-
         harmonics = makeHarmonics(
             wavelength=1.0,
             period=period,
@@ -96,6 +94,13 @@ class GeometryFieldTests(unittest.TestCase):
             phi=0.0,
             truncation="rectangular",
         )
+        backend = resolveBackend("cuda")
+        sampled = layerDataForTorch(
+            pattern.toLayer(0.1, factorization="standard"),
+            harmonics,
+            backend.xp,
+            backend.device,
+        )
         analytic = AnalyticDisk(
             period=period,
             radius=radius,
@@ -104,7 +109,57 @@ class GeometryFieldTests(unittest.TestCase):
             inclusion=inclusion,
         ).convolutionMatrix(harmonics)
 
-        np.testing.assert_allclose(sampledLayer.epsilonMatrix, analytic, rtol=8e-3, atol=8e-3)
+        np.testing.assert_allclose(backend.asnumpy(sampled.epsilonMatrix), analytic, rtol=8e-3, atol=8e-3)
+
+    def testPatternSupersampleUsesAreaFractions(self) -> None:
+        pattern = Pattern2D(period=(1.0, 1.0), shape=(8, 8), background=1.0, supersample=4)
+        pattern.rectangle(size=(0.45, 1.0), material=5.0, useNormal=False)
+        fill = (np.mean(pattern.epsilon) - 1.0) / (5.0 - 1.0)
+
+        self.assertAlmostEqual(float(np.real(fill)), 0.4375, places=3)
+        self.assertGreater(np.count_nonzero((np.real(pattern.epsilon) > 1.0) & (np.real(pattern.epsilon) < 5.0)), 0)
+
+    def testHighOrdersWarnForLowSampledGrid(self) -> None:
+        pattern = Pattern2D(period=(1.0, 1.0), shape=(16, 16), background=1.0)
+        pattern.circle(radius=0.2, material=2.25)
+        simulation = RCWASimulation(
+            period=(1.0, 1.0),
+            layers=[pattern.toLayer(0.05)],
+            orders=3,
+            truncation="circular",
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            simulation.layersAtWithKey(1.0)
+
+        self.assertTrue(any("sampled grid" in str(item.message) for item in caught))
+
+    def testAnisotropicPatternSupersampleUsesAreaFractions(self) -> None:
+        pattern = anisotropic.SampledPattern(period=(1.0, 1.0), shape=(8, 8), background=1.0, supersample=4)
+        pattern.rectangle(size=(0.45, 1.0), material=5.0, useNormal=False)
+        fill = (np.mean(pattern.epsilon) - 1.0) / (5.0 - 1.0)
+
+        self.assertAlmostEqual(float(np.real(fill)), 0.4375, places=3)
+        self.assertGreater(np.count_nonzero((np.real(pattern.epsilon) > 1.0) & (np.real(pattern.epsilon) < 5.0)), 0)
+
+    def testAnisotropicHighOrdersWarnForLowSampledGrid(self) -> None:
+        pattern = anisotropic.SampledPattern(period=(1.0, 1.0), shape=(16, 16), background=1.0)
+        pattern.circle(radius=0.2, material=2.25)
+        simulation = anisotropic.RCWASimulation(
+            period=(1.0, 1.0),
+            layers=[pattern.toLayer(0.05)],
+            orders=3,
+            truncation="circular",
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            simulation.layersAt(1.0)
+
+        messages = [str(item.message) for item in caught]
+        self.assertTrue(any("sampled grid" in message for message in messages))
+        self.assertFalse(any("analytic geometry" in message for message in messages))
 
     def testLayerStackPatternsFullLayersByXyzRegions(self) -> None:
         i3 = np.eye(3, dtype=complex)
@@ -164,7 +219,7 @@ class GeometryFieldTests(unittest.TestCase):
         pattern = Pattern2D(period=(0.7, 0.5), shape=(32, 36), background=AIR)
         pattern.rectangle(size=(0.22, 0.16), material=SI1550)
         layer = pattern.toLayer(thickness=0.12)
-        result = _solveIsotropic(
+        result = solveIsotropic(
             layers=[layer],
             wavelength=1.1,
             period=pattern.period,
@@ -184,12 +239,12 @@ class GeometryFieldTests(unittest.TestCase):
         for values in fields.values():
             self.assertTrue(np.all(np.isfinite(values)))
 
-        _, _, eIntensity = fieldSliceXy(result, layerIndex=0, z=0.06, component="EIntensity", shape=(21, 25))
+        ignored, ignored, eIntensity = fieldSliceXy(result, layerIndex=0, z=0.06, component="EIntensity", shape=(21, 25))
         self.assertEqual(eIntensity.shape, (21, 25))
         self.assertTrue(np.all(np.isfinite(eIntensity)))
         self.assertTrue(np.all(eIntensity >= -1e-12))
 
-        _, _, componentMaps = fieldComponentsXy(result, layerIndex=0, z=0.06, shape=(21, 25))
+        ignored, ignored, componentMaps = fieldComponentsXy(result, layerIndex=0, z=0.06, shape=(21, 25))
         self.assertIn("Ez", componentMaps)
         self.assertIn("EIntensity", componentMaps)
         stackXyX, stackXyY, stackXyMaps = stackFieldComponentsXy(result, z=0.06, shape=(21, 25))
@@ -197,7 +252,7 @@ class GeometryFieldTests(unittest.TestCase):
         np.testing.assert_allclose(stackXyY, y, atol=1e-12)
         for component in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz", "EIntensity", "HIntensity"):
             np.testing.assert_allclose(stackXyMaps[component], componentMaps[component], rtol=1e-12, atol=1e-12)
-        _, _, stackXyIntensity = stackFieldSliceXy(result, z=0.06, component="EIntensity", shape=(21, 25))
+        ignored, ignored, stackXyIntensity = stackFieldSliceXy(result, z=0.06, component="EIntensity", shape=(21, 25))
         np.testing.assert_allclose(stackXyIntensity, componentMaps["EIntensity"], rtol=1e-12, atol=1e-12)
 
         xzX, xzZ, xzEx = fieldSliceXz(result, layerIndex=0, y=0.0, component="Ex", shape=(17, 19))
@@ -218,7 +273,7 @@ class GeometryFieldTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(stackMaps["Ez"])))
         self.assertTrue(np.all(stackMaps["EIntensity"] >= -1e-12))
         self.assertLess(np.max(np.abs(stackMaps["Ex"] - xzEx)), 1e-10)
-        _, _, layerMaps = fieldComponentsXz(result, layerIndex=0, y=0.0, shape=(17, 19))
+        ignored, ignored, layerMaps = fieldComponentsXz(result, layerIndex=0, y=0.0, shape=(17, 19))
         for component in (
             "Ex",
             "Ey",
@@ -244,7 +299,7 @@ class GeometryFieldTests(unittest.TestCase):
 
     def testMagneticIntensityMatchesAnalyticPlaneWave(self) -> None:
         layer = Layer(thickness=0.25, epsilon=1.0, name="matched air layer")
-        result = _solveIsotropic(
+        result = solveIsotropic(
             layers=[layer],
             wavelength=1.0,
             period=(1.0, 1.0),
@@ -257,7 +312,7 @@ class GeometryFieldTests(unittest.TestCase):
             truncation="circular",
         )
 
-        _x, _z, maps = fieldComponentsXz(result, layerIndex=0, shape=(5, 5))
+        x, z, maps = fieldComponentsXz(result, layerIndex=0, shape=(5, 5))
 
         np.testing.assert_allclose(maps["Hx"], 0.0, atol=1e-12)
         np.testing.assert_allclose(maps["Hz"], 0.0, atol=1e-12)
@@ -268,8 +323,8 @@ class GeometryFieldTests(unittest.TestCase):
         np.testing.assert_allclose(maps["HNormalizedIntensity"], 1.0, atol=1e-12)
         np.testing.assert_allclose(maps["HSelfNormalizedMagnitude"], 1.0, atol=1e-12)
 
-        _, _, hOverH0 = fieldSliceXz(result, layerIndex=0, component="H/H0", shape=(5, 5))
-        _, _, hOverH0Squared = fieldSliceXz(result, layerIndex=0, component="|H/H0|^2", shape=(5, 5))
+        ignored, ignored, hOverH0 = fieldSliceXz(result, layerIndex=0, component="H/H0", shape=(5, 5))
+        ignored, ignored, hOverH0Squared = fieldSliceXz(result, layerIndex=0, component="|H/H0|^2", shape=(5, 5))
         np.testing.assert_allclose(hOverH0, maps["HNormalizedMagnitude"], atol=1e-12)
         np.testing.assert_allclose(hOverH0Squared, maps["HNormalizedIntensity"], atol=1e-12)
 
@@ -302,7 +357,7 @@ class GeometryFieldTests(unittest.TestCase):
     def testIncidentNormalizedIntensityUsesActualIncidentMedium(self) -> None:
         epsilon = 2.25
         layer = Layer(thickness=0.2, epsilon=epsilon, name="matched glass layer")
-        result = _solveIsotropic(
+        result = solveIsotropic(
             layers=[layer],
             wavelength=1.0,
             period=(1.0, 1.0),
@@ -316,7 +371,7 @@ class GeometryFieldTests(unittest.TestCase):
         )
 
         incident = incidentFieldIntensities(result)
-        _x, _z, maps = fieldComponentsXz(result, layerIndex=0, shape=(5, 5))
+        x, z, maps = fieldComponentsXz(result, layerIndex=0, shape=(5, 5))
 
         self.assertAlmostEqual(incident["EIntensity"], 1.0, places=12)
         self.assertAlmostEqual(incident["HIntensity"], epsilon, places=12)
@@ -333,7 +388,7 @@ class GeometryFieldTests(unittest.TestCase):
         pattern = Pattern2D(period=(0.7, 0.5), shape=(32, 36), background=AIR)
         pattern.rectangle(size=(0.22, 0.16), material=SI1550)
         layer = pattern.toLayer(thickness=0.12)
-        sMatrixResult = _solveIsotropic(
+        sMatrixResult = solveIsotropic(
             layers=[layer],
             wavelength=1.1,
             period=pattern.period,
@@ -345,13 +400,13 @@ class GeometryFieldTests(unittest.TestCase):
         self.assertTrue(np.isfinite(sMatrixResult.reflection))
         self.assertTrue(np.isfinite(sMatrixResult.transmission))
 
-        _, _, exSMatrix = fieldSliceXy(sMatrixResult, layerIndex=0, z=0.06, component="Ex", shape=(21, 25))
+        ignored, ignored, exSMatrix = fieldSliceXy(sMatrixResult, layerIndex=0, z=0.06, component="Ex", shape=(21, 25))
         self.assertTrue(np.all(np.isfinite(exSMatrix)))
 
-        _, _, ezSMatrix = fieldSliceXy(sMatrixResult, layerIndex=0, z=0.06, component="Ez", shape=(21, 25))
+        ignored, ignored, ezSMatrix = fieldSliceXy(sMatrixResult, layerIndex=0, z=0.06, component="Ez", shape=(21, 25))
         self.assertTrue(np.all(np.isfinite(ezSMatrix)))
 
-        _, _, intensitySMatrix = fieldSliceXy(
+        ignored, ignored, intensitySMatrix = fieldSliceXy(
             sMatrixResult,
             layerIndex=0,
             z=0.06,
@@ -372,6 +427,32 @@ class GeometryFieldTests(unittest.TestCase):
         self.assertIsInstance(result.layerSolutions[0].epsilonInverse, np.ndarray)
         self.assertTrue(np.all(np.isfinite(result.layerSolutions[0].epsilonInverse)))
 
+    def testProfileReportsStabilityDiagnostics(self) -> None:
+        result = solveIsotropic(
+            layers=[Layer(thickness=0.1, epsilon=2.25)],
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            orders=(1, 1),
+            epsIncident=1.0,
+            epsTransmission=1.0,
+            returnFields=False,
+        )
+        self.assertEqual(result.diagnostics, ())
+
+        simulation = RCWASimulation(
+            period=(1.0, 1.0),
+            layers=[Layer(thickness=0.1, epsilon=2.25)],
+            orders=(1, 1),
+            truncation="circular",
+        )
+        profiled = simulation.solve(1.0, polarization="TE", profile=True)
+
+        self.assertTrue(profiled.layerEigTimings)
+        self.assertIsNotNone(profiled.layerEigTimings[0].minAbsQ)
+        self.assertIsNotNone(profiled.layerEigTimings[0].safeQThreshold)
+        self.assertIsNotNone(profiled.stackTiming)
+        self.assertTrue(profiled.stackTiming.interfaceConditionNumbers)
+
     def testTransmissionRegionStackFieldMatchesHomogeneousReconstruction(self) -> None:
         period = (0.7, 0.5)
         thickness = 0.12
@@ -379,7 +460,7 @@ class GeometryFieldTests(unittest.TestCase):
         distance = 0.08
         pattern = Pattern2D(period=period, shape=(32, 36), background=AIR)
         pattern.circle(radius=0.11, material=SI1550)
-        result = _solveIsotropic(
+        result = solveIsotropic(
             layers=[pattern.toLayer(thickness=thickness)],
             wavelength=wavelength,
             period=period,
@@ -391,7 +472,7 @@ class GeometryFieldTests(unittest.TestCase):
             returnFields=True,
         )
         x = np.linspace(-period[0] / 2, period[0] / 2, 23)
-        _x, _z, maps = stackFieldComponentsXz(
+        xGrid, zGrid, maps = stackFieldComponentsXz(
             result,
             y=0.0,
             xSpan=(-period[0] / 2, period[0] / 2),
@@ -421,7 +502,7 @@ class GeometryFieldTests(unittest.TestCase):
         distance = 0.08
         pattern = Pattern2D(period=period, shape=(32, 36), background=AIR)
         pattern.circle(radius=0.11, material=SI1550)
-        result = _solveIsotropic(
+        result = solveIsotropic(
             layers=[pattern.toLayer(thickness=thickness)],
             wavelength=wavelength,
             period=period,
@@ -456,7 +537,7 @@ class GeometryFieldTests(unittest.TestCase):
         np.testing.assert_allclose(maps["EIntensity"], expectedIntensity, rtol=1e-12, atol=1e-12)
 
 
-def _solveIsotropic(
+def solveIsotropic(
     *,
     layers,
     wavelength,

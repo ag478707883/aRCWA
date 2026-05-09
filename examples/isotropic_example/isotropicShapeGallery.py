@@ -40,7 +40,7 @@ if not SHOW:
 import matplotlib.pyplot as plt
 
 
-stripePattern = rcwa.Pattern2D(period=PERIOD, shape=GRID, background=EPS_BACKGROUND, name="sampled stripes")
+stripePattern = rcwa.Pattern2D(period=PERIOD, shape=GRID, background=EPS_BACKGROUND, name="sampled stripes", supersample=4)
 stripePattern.stripes(fillFraction=0.38, material=EPS_POST, axis="x")
 
 shapeCases = [
@@ -157,6 +157,8 @@ for label, layer in shapeCases:
         row[f"{polarizationName} R"] = float(result.reflection)
         row[f"{polarizationName} T"] = float(result.transmission)
         row[f"{polarizationName} C"] = float(result.conservation)
+        row[f"{polarizationName} A"] = float(result.absorption)
+        row[f"{polarizationName} E"] = float(result.energyError)
     rows.append(row)
 
 print("Isotropic RCWA shape gallery")
@@ -165,8 +167,8 @@ print(f"epsilon background={EPS_BACKGROUND:.6g}, post={EPS_POST:.6g}")
 for row in rows:
     print(
         f"{row['shape']:>26s}: "
-        f"TE R={row['TE R']:.5f}, TE T={row['TE T']:.5f}, TE C={row['TE C']:.5f}; "
-        f"TM R={row['TM R']:.5f}, TM T={row['TM T']:.5f}, TM C={row['TM C']:.5f}"
+        f"TE R={row['TE R']:.5f}, TE T={row['TE T']:.5f}, TE A={row['TE A']:.2e}, TE err={row['TE E']:.2e}; "
+        f"TM R={row['TM R']:.5f}, TM T={row['TM T']:.5f}, TM A={row['TM A']:.2e}, TM err={row['TM E']:.2e}"
     )
 
 if SAVE_PLOTS:

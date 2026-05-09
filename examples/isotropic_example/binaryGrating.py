@@ -69,6 +69,8 @@ print(f"epsilon background={EPS_BACKGROUND:.6g}, rod={EPS_ROD:.6g}")
 print(f"R = {result.reflection:.8f}")
 print(f"T = {result.transmission:.8f}")
 print(f"R + T = {result.conservation:.8f}")
+print(f"A = {result.absorption:.8f}")
+print(f"energy error = {result.energyError:.3e}")
 print("Propagating diffraction orders:")
 
 propagatingOrders = []
@@ -81,7 +83,7 @@ for diffractionOrder in result.orders:
         )
 
 if SAVE_PLOTS:
-    pattern = rcwa.Pattern2D(period=PERIOD, shape=(GRID, GRID), background=EPS_BACKGROUND)
+    pattern = rcwa.Pattern2D(period=PERIOD, shape=(GRID, GRID), background=EPS_BACKGROUND, supersample=4)
     pattern.circle(radius=FILL * PERIOD[0] / 2, material=EPS_ROD)
 
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), dpi=160, constrained_layout=True)
@@ -120,7 +122,7 @@ if SAVE_PLOTS:
     axes[1].text(
         0.03,
         0.95,
-        f"Total R={result.reflection:.3f}\nTotal T={result.transmission:.3f}\nR+T={result.conservation:.3f}",
+        f"Total R={result.reflection:.3f}\nTotal T={result.transmission:.3f}\nA={result.absorption:.3f}\nR+T={result.conservation:.3f}",
         transform=axes[1].transAxes,
         va="top",
         ha="left",

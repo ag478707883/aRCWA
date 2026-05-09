@@ -45,11 +45,11 @@ class AdaptiveLayerSpec:
 
     def toLayers(self) -> list[Layer]:
         intervals: list[tuple[float, float]] = []
-        self._refine(0.0, float(self.thickness), 0, intervals)
+        self.refine(0.0, float(self.thickness), 0, intervals)
         layers: list[Layer] = []
         for index, (z0, z1) in enumerate(intervals):
-            prototype = _asLayer(self.layerAt((z0 + z1) / 2), z1 - z0, self.name, self.factorization)
-            epsilon = _averageEpsilon(self.layerAt, z0, z1, self.quadratureOrder)
+            prototype = asLayer(self.layerAt((z0 + z1) / 2), z1 - z0, self.name, self.factorization)
+            epsilon = averageEpsilon(self.layerAt, z0, z1, self.quadratureOrder)
             layers.append(
                 Layer(
                     thickness=z1 - z0,
@@ -61,24 +61,24 @@ class AdaptiveLayerSpec:
             )
         return layers
 
-    def _refine(self, z0: float, z1: float, depth: int, intervals: list[tuple[float, float]]) -> None:
+    def refine(self, z0: float, z1: float, depth: int, intervals: list[tuple[float, float]]) -> None:
         if depth < self.minDepth:
             split = (z0 + z1) / 2
-            self._refine(z0, split, depth + 1, intervals)
-            self._refine(split, z1, depth + 1, intervals)
+            self.refine(z0, split, depth + 1, intervals)
+            self.refine(split, z1, depth + 1, intervals)
             return
 
-        whole = _averageEpsilon(self.layerAt, z0, z1, self.quadratureOrder)
+        whole = averageEpsilon(self.layerAt, z0, z1, self.quadratureOrder)
         split = (z0 + z1) / 2
-        left = _averageEpsilon(self.layerAt, z0, split, self.quadratureOrder)
-        right = _averageEpsilon(self.layerAt, split, z1, self.quadratureOrder)
+        left = averageEpsilon(self.layerAt, z0, split, self.quadratureOrder)
+        right = averageEpsilon(self.layerAt, split, z1, self.quadratureOrder)
         twoPanel = 0.5 * (left + right)
-        error = _relativeError(whole, twoPanel)
+        error = relativeError(whole, twoPanel)
         if error <= self.tolerance or depth >= self.maxDepth:
             intervals.append((z0, z1))
             return
-        self._refine(z0, split, depth + 1, intervals)
-        self._refine(split, z1, depth + 1, intervals)
+        self.refine(z0, split, depth + 1, intervals)
+        self.refine(split, z1, depth + 1, intervals)
 
 
 def adaptiveZStack(
@@ -106,13 +106,13 @@ def adaptiveZStack(
     ).toLayers()
 
 
-def _averageEpsilon(layerAt: LayerFactory, z0: float, z1: float, order: int) -> np.ndarray | complex:
+def averageEpsilon(layerAt: LayerFactory, z0: float, z1: float, order: int) -> np.ndarray | complex:
     nodes, weights = np.polynomial.legendre.leggauss(order)
     center = (z0 + z1) / 2
     halfWidth = (z1 - z0) / 2
     values = []
     for node in nodes:
-        layer = _asLayer(layerAt(center + halfWidth * float(node)), z1 - z0, "", "auto")
+        layer = asLayer(layerAt(center + halfWidth * float(node)), z1 - z0, "", "auto")
         values.append(np.asarray(layer.epsilon, dtype=complex))
     average = sum(float(weight) * value for weight, value in zip(weights, values)) / 2
     if np.ndim(average) == 0:
@@ -120,7 +120,7 @@ def _averageEpsilon(layerAt: LayerFactory, z0: float, z1: float, order: int) -> 
     return np.asarray(average, dtype=complex)
 
 
-def _asLayer(
+def asLayer(
     value: LayerFactoryResult,
     thickness: float,
     name: str,
@@ -131,7 +131,7 @@ def _asLayer(
     return Layer(thickness=thickness, epsilon=value, name=name, factorization=factorization)
 
 
-def _relativeError(reference: np.ndarray | complex, estimate: np.ndarray | complex) -> float:
+def relativeError(reference: np.ndarray | complex, estimate: np.ndarray | complex) -> float:
     difference = np.asarray(estimate, dtype=complex) - np.asarray(reference, dtype=complex)
     scale = max(float(np.linalg.norm(np.asarray(estimate, dtype=complex))), 1e-14)
     return float(np.linalg.norm(difference) / scale)

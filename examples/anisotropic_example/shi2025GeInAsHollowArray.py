@@ -18,15 +18,17 @@ if str(SRC) not in sys.path:
 import rcwa3d_anisotropic as rcwa
 
 
-# Runtime knobs. Edit these constants directly for local experiments.
-ORDER = 5
-TRUNCATION = "rectangular" # "rectangular" "circular"
+# Runtime knobs. Increase ORDER/GRID/POINTS for convergence studies.
+ORDER = 8
+TRUNCATION = "rectangular"
 BACKEND = "cuda"
+PRECISION = "complex128"  # Use "complex64" or "mixed" for fast spectrum scans.
 FACTORIZATION = "auto"
-GRID = 128
-WORKERS = 1
+GRID = 512
+WORKERS = 14
 POINTS = 250
 SHOW = True
+
 # Device geometry (um).
 PERIOD = 7.7
 GE_HEIGHT = 8.13
@@ -40,6 +42,7 @@ B_FIELD = 0.8
 THETA = math.radians(4.7)
 PHI = 0.0
 WAVELENGTHS = np.linspace(17.30, 18.10, POINTS)
+POLARIZATIONS = ("TE", "TM")
 
 # Material parameters.
 GE_N = 4.0
@@ -53,9 +56,14 @@ INAS_DENSITY = 7.8e17 * 1e6
 INAS_MASS = 0.033 * m_e
 
 
-def ag_epsilon(wavelength_um: float) -> complex:
+def scalar_tensor(epsilon: complex) -> np.ndarray:
+    return complex(epsilon) * np.eye(3, dtype=complex)
+
+
+def ag_tensor(wavelength_um: float) -> np.ndarray:
     omega = 2 * np.pi * c / (wavelength_um * 1e-6)
-    return AG_EPS_INF - AG_PLASMA**2 / (omega**2 + 1j * AG_GAMMA * omega)
+    epsilon = AG_EPS_INF - AG_PLASMA**2 / (omega**2 + 1j * AG_GAMMA * omega)
+    return scalar_tensor(epsilon)
 
 
 def inas_tensor(wavelength_um: float) -> np.ndarray:
@@ -76,8 +84,8 @@ def inas_tensor(wavelength_um: float) -> np.ndarray:
     )
 
 
-def make_pattern_layer() -> rcwa.CompiledLayer:
-    """Build and precompile the patterned Ge layer once for the chosen orders."""
+def make_pattern_layer() -> rcwa.Layer:
+    """Build the patterned Ge layer; RCWASimulation precompiles it once."""
 
     layer = rcwa.rectangularHollowPostLayer(
         period=(PERIOD, PERIOD),
@@ -90,25 +98,34 @@ def make_pattern_layer() -> rcwa.CompiledLayer:
         factorization=FACTORIZATION,
         name="Ge hollow array",
     )
-    return rcwa.compileLayers([layer], orders=ORDER, truncation=TRUNCATION)[0]
+    return layer
 
 
 def make_simulation() -> rcwa.RCWASimulation:
-    return rcwa.RCWASimulation(
+    return rcwa.buildSimulation(make_config(), make_layers())
+
+
+def make_config() -> rcwa.SimulationConfig:
+    return rcwa.SimulationConfig(
         period=(PERIOD, PERIOD),
-        layers=[
-            make_pattern_layer(),
-            rcwa.homogeneousLayer(INAS_HEIGHT, inas_tensor, name="InAs"),
-            rcwa.homogeneousLayer(AG_HEIGHT, ag_epsilon, name="Ag"),
-        ],
         orders=ORDER,
         truncation=TRUNCATION,
         backend=BACKEND,
-        method="smatrix",
+        precision=PRECISION,
         epsIncident=1.0,
         epsTransmission=SIO2_N**2,
+        precompile=True,
+        cacheModes=True,
         workers=WORKERS,
     )
+
+
+def make_layers() -> list[object]:
+    return [
+        make_pattern_layer(),
+        rcwa.homogeneousLayer(INAS_HEIGHT, inas_tensor, name="InAs"),
+        rcwa.homogeneousLayer(AG_HEIGHT, ag_tensor, name="Ag"),
+    ]
 
 
 def plot_spectrum(spectrum: dict[str, object]) -> Path:
@@ -140,16 +157,17 @@ def main() -> None:
     print(
         "RCWA "
         f"order={ORDER}, grid={GRID}, points={POINTS}, truncation={TRUNCATION}, "
-        f"factorization={FACTORIZATION}, backend={BACKEND}, workers={WORKERS}"
+        f"factorization={FACTORIZATION}, backend={BACKEND}, precision={PRECISION}, workers={WORKERS}"
     )
     start = time.perf_counter()
-    spectrum = make_simulation().spectrum(
+    spectrum = rcwa.solveSpectrum(
+        make_config(),
+        make_layers(),
         WAVELENGTHS,
         theta=THETA,
         phi=PHI,
-        polarizations=("TE", "TM"),
+        polarizations=POLARIZATIONS,
         bidirectional=True,
-        workers=WORKERS,
     )
     figure = plot_spectrum(spectrum)
     print(f"Saved: {figure}")

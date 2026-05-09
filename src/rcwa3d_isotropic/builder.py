@@ -24,11 +24,18 @@ class PatternLayer:
     shape: tuple[int, int]
     name: str = ""
     factorization: FactorizationMode = "auto"
+    supersample: int = 1
     pattern: Pattern2D = field(init=False)
     version: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
-        self.pattern = Pattern2D(period=self.period, shape=self.shape, background=self.background, name=self.name)
+        self.pattern = Pattern2D(
+            period=self.period,
+            shape=self.shape,
+            background=self.background,
+            name=self.name,
+            supersample=self.supersample,
+        )
 
     @property
     def epsilon(self):
@@ -40,7 +47,7 @@ class PatternLayer:
 
     def fill(self, mask, material: complex | float | IsotropicMaterial) -> "PatternLayer":
         self.pattern.fill(mask, material)
-        self._changed()
+        self.changed()
         return self
 
     def circle(
@@ -51,7 +58,7 @@ class PatternLayer:
         useNormal: bool = True,
     ) -> "PatternLayer":
         self.pattern.circle(radius, material, center=center, useNormal=useNormal)
-        self._changed()
+        self.changed()
         return self
 
     def ellipse(
@@ -63,7 +70,7 @@ class PatternLayer:
         useNormal: bool = True,
     ) -> "PatternLayer":
         self.pattern.ellipse(radii, material, center=center, angle=angle, useNormal=useNormal)
-        self._changed()
+        self.changed()
         return self
 
     def rectangle(
@@ -75,7 +82,7 @@ class PatternLayer:
         useNormal: bool = True,
     ) -> "PatternLayer":
         self.pattern.rectangle(size, material, center=center, angle=angle, useNormal=useNormal)
-        self._changed()
+        self.changed()
         return self
 
     def annulus(
@@ -87,7 +94,7 @@ class PatternLayer:
         useNormal: bool = True,
     ) -> "PatternLayer":
         self.pattern.annulus(innerRadius, outerRadius, material, center=center, useNormal=useNormal)
-        self._changed()
+        self.changed()
         return self
 
     def cross(
@@ -100,7 +107,7 @@ class PatternLayer:
         useNormal: bool = True,
     ) -> "PatternLayer":
         self.pattern.cross(armLengths, armWidths, material, center=center, angle=angle, useNormal=useNormal)
-        self._changed()
+        self.changed()
         return self
 
     def stripes(
@@ -111,7 +118,7 @@ class PatternLayer:
         center: float = 0.0,
     ) -> "PatternLayer":
         self.pattern.stripes(fillFraction, material, axis=axis, center=center)
-        self._changed()
+        self.changed()
         return self
 
     def polygon(
@@ -121,13 +128,13 @@ class PatternLayer:
         useNormal: bool = True,
     ) -> "PatternLayer":
         self.pattern.polygon(vertices, material, useNormal=useNormal)
-        self._changed()
+        self.changed()
         return self
 
     def toLayer(self) -> Layer:
         return self.pattern.toLayer(self.thickness, name=self.name, factorization=self.factorization)
 
-    def _changed(self) -> None:
+    def changed(self) -> None:
         self.version += 1
 
 
@@ -162,6 +169,7 @@ class LayerStack:
             shape=self.shape if shape is None else shape,
             name=name,
             factorization=factorization,
+            supersample=1,
         )
         self.layers.append(layer)
         return layer
@@ -192,13 +200,13 @@ class LayerStack:
         if not self.layers:
             raise ValueError("add at least one layer before setting a material region")
         if isinstance(z, tuple):
-            self._splitRange(float(min(z)), float(max(z)), slices)
+            self.splitRange(float(min(z)), float(max(z)), slices)
 
         for layer, (zStart, zEnd) in zip(self.layers, self.layerBounds()):
-            if not _zSelected(z, zStart, zEnd):
+            if not zSelected(z, zStart, zEnd):
                 continue
             xx, yy = layer.pattern.coordinates()
-            region = _axisMask(xx, x) & _axisMask(yy, y)
+            region = axisMask(xx, x) & axisMask(yy, y)
             if mask is not None:
                 zz = np.full(xx.shape, 0.5 * (zStart + zEnd), dtype=float)
                 region &= np.asarray(mask(xx, yy, zz), dtype=bool)
@@ -231,7 +239,7 @@ class LayerStack:
             material,
             z=z,
             slices=slices,
-            mask=lambda xx, yy, _zz: _rectangleMask(xx, yy, size, center, angle),
+            mask=lambda xx, yy, zz: rectangleMask(xx, yy, size, center, angle),
         )
 
     def addCylinder(
@@ -247,7 +255,7 @@ class LayerStack:
             material,
             z=z,
             slices=slices,
-            mask=lambda xx, yy, _zz: _circleMask(xx, yy, radius, center),
+            mask=lambda xx, yy, zz: circleMask(xx, yy, radius, center),
         )
 
     def addCone(
@@ -260,12 +268,12 @@ class LayerStack:
         center: tuple[float, float] = (0.0, 0.0),
         slices: int = 20,
     ) -> "LayerStack":
-        zTop, zBottom = _zRange(z)
+        zTop, zBottom = zRange(z)
 
         def mask(xx: np.ndarray, yy: np.ndarray, zz: np.ndarray) -> np.ndarray:
             fraction = np.clip((zz - zTop) / max(zBottom - zTop, 1e-30), 0.0, 1.0)
             radius = topRadius + (bottomRadius - topRadius) * fraction
-            return _circleMask(xx, yy, radius, center)
+            return circleMask(xx, yy, radius, center)
 
         return self.addVolume(material, z=(zTop, zBottom), mask=mask, slices=slices)
 
@@ -280,9 +288,9 @@ class LayerStack:
         angle: float = 0.0,
         slices: int = 20,
     ) -> "LayerStack":
-        zTop, zBottom = _zRange(z)
-        top = _pairSize(topSize)
-        bottom = _pairSize(bottomSize)
+        zTop, zBottom = zRange(z)
+        top = pairSize(topSize)
+        bottom = pairSize(bottomSize)
 
         def mask(xx: np.ndarray, yy: np.ndarray, zz: np.ndarray) -> np.ndarray:
             fraction = np.clip((zz - zTop) / max(zBottom - zTop, 1e-30), 0.0, 1.0)
@@ -290,7 +298,7 @@ class LayerStack:
                 top[0] + (bottom[0] - top[0]) * fraction,
                 top[1] + (bottom[1] - top[1]) * fraction,
             )
-            return _rectangleMask(xx, yy, size, center, angle)
+            return rectangleMask(xx, yy, size, center, angle)
 
         return self.addVolume(material, z=(zTop, zBottom), mask=mask, slices=slices)
 
@@ -302,12 +310,12 @@ class LayerStack:
         vertices: Iterable[tuple[float, float]],
         slices: int = 1,
     ) -> "LayerStack":
-        points = _polygonPoints(vertices)
+        points = polygonPoints(vertices)
         return self.addVolume(
             material,
             z=z,
             slices=slices,
-            mask=lambda xx, yy, _zz: _polygonMask(xx, yy, points),
+            mask=lambda xx, yy, zz: polygonMask(xx, yy, points),
         )
 
     def addPolygonPyramid(
@@ -321,15 +329,15 @@ class LayerStack:
         center: tuple[float, float] | None = None,
         slices: int = 20,
     ) -> "LayerStack":
-        zTop, zBottom = _zRange(z)
-        points = _polygonPoints(vertices)
+        zTop, zBottom = zRange(z)
+        points = polygonPoints(vertices)
         pivot = np.mean(points, axis=0) if center is None else np.asarray(center, dtype=float)
 
         def mask(xx: np.ndarray, yy: np.ndarray, zz: np.ndarray) -> np.ndarray:
             fraction = np.clip((zz - zTop) / max(zBottom - zTop, 1e-30), 0.0, 1.0)
             scale = topScale + (bottomScale - topScale) * fraction
             scaled = pivot + (points - pivot) * scale
-            return _polygonMask(xx, yy, scaled)
+            return polygonMask(xx, yy, scaled)
 
         return self.addVolume(material, z=(zTop, zBottom), mask=mask, slices=slices)
 
@@ -367,7 +375,7 @@ class LayerStack:
     def toLayers(self) -> list[Layer]:
         return [layer.toLayer() for layer in self.layers]
 
-    def _splitAt(self, z: float) -> None:
+    def splitAt(self, z: float) -> None:
         if z <= 0.0 or z >= self.totalThickness:
             return
         tolerance = 1e-12 * max(1.0, self.totalThickness)
@@ -376,22 +384,22 @@ class LayerStack:
                 return
             if zStart + tolerance < z < zEnd - tolerance:
                 layer = self.layers[index]
-                upper = _copyPatternLayer(layer, z - zStart)
-                lower = _copyPatternLayer(layer, zEnd - z)
+                upper = copyPatternLayer(layer, z - zStart)
+                lower = copyPatternLayer(layer, zEnd - z)
                 self.layers[index : index + 1] = [upper, lower]
                 return
 
-    def _splitRange(self, zStart: float, zEnd: float, slices: int) -> None:
+    def splitRange(self, zStart: float, zEnd: float, slices: int) -> None:
         if slices < 1:
             raise ValueError("slices must be at least 1")
-        low, high = _zRange((zStart, zEnd))
-        self._splitAt(low)
-        self._splitAt(high)
+        low, high = zRange((zStart, zEnd))
+        self.splitAt(low)
+        self.splitAt(high)
         for index in range(1, int(slices)):
-            self._splitAt(low + (high - low) * index / int(slices))
+            self.splitAt(low + (high - low) * index / int(slices))
 
 
-def _copyPatternLayer(layer: PatternLayer, thickness: float) -> PatternLayer:
+def copyPatternLayer(layer: PatternLayer, thickness: float) -> PatternLayer:
     copy = PatternLayer(
         period=layer.period,
         thickness=float(thickness),
@@ -399,13 +407,14 @@ def _copyPatternLayer(layer: PatternLayer, thickness: float) -> PatternLayer:
         shape=layer.pattern.shape,
         name=layer.name,
         factorization=layer.factorization,
+        supersample=layer.pattern.supersample,
     )
     copy.pattern.epsilon = layer.pattern.epsilon.copy()
     copy.pattern.normalField = None if layer.pattern.normalField is None else layer.pattern.normalField.copy()
     return copy
 
 
-def _zRange(z: tuple[float, float]) -> tuple[float, float]:
+def zRange(z: tuple[float, float]) -> tuple[float, float]:
     low = float(min(z))
     high = float(max(z))
     if high <= low:
@@ -413,7 +422,7 @@ def _zRange(z: tuple[float, float]) -> tuple[float, float]:
     return low, high
 
 
-def _rotatedCoordinates(
+def rotatedCoordinates(
     xx: np.ndarray,
     yy: np.ndarray,
     center: tuple[float, float],
@@ -426,7 +435,7 @@ def _rotatedCoordinates(
     return cosine * x + sine * y, -sine * x + cosine * y
 
 
-def _rectangleMask(
+def rectangleMask(
     xx: np.ndarray,
     yy: np.ndarray,
     size: tuple[float, float],
@@ -437,11 +446,11 @@ def _rectangleMask(
     sy = np.asarray(size[1])
     if np.any(sx < 0) or np.any(sy < 0):
         raise ValueError("rectangle size values must be non-negative")
-    xr, yr = _rotatedCoordinates(xx, yy, center, angle)
+    xr, yr = rotatedCoordinates(xx, yy, center, angle)
     return (np.abs(xr) <= sx / 2) & (np.abs(yr) <= sy / 2)
 
 
-def _circleMask(
+def circleMask(
     xx: np.ndarray,
     yy: np.ndarray,
     radius: float | np.ndarray,
@@ -454,14 +463,14 @@ def _circleMask(
     return x * x + y * y <= np.asarray(radius) ** 2
 
 
-def _polygonPoints(vertices: Iterable[tuple[float, float]]) -> np.ndarray:
+def polygonPoints(vertices: Iterable[tuple[float, float]]) -> np.ndarray:
     points = np.asarray(tuple(vertices), dtype=float)
     if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] < 3:
         raise ValueError("polygon vertices must be a sequence of at least three (x, y) points")
     return points
 
 
-def _polygonMask(xx: np.ndarray, yy: np.ndarray, points: np.ndarray) -> np.ndarray:
+def polygonMask(xx: np.ndarray, yy: np.ndarray, points: np.ndarray) -> np.ndarray:
     inside = np.zeros(xx.shape, dtype=bool)
     x1 = points[-1, 0]
     y1 = points[-1, 1]
@@ -472,14 +481,14 @@ def _polygonMask(xx: np.ndarray, yy: np.ndarray, points: np.ndarray) -> np.ndarr
     return inside
 
 
-def _pairSize(value: float | tuple[float, float]) -> tuple[float, float]:
+def pairSize(value: float | tuple[float, float]) -> tuple[float, float]:
     if isinstance(value, tuple):
         return (float(value[0]), float(value[1]))
     scalar = float(value)
     return (scalar, scalar)
 
 
-def _axisMask(values: np.ndarray, selector: AxisSelector) -> np.ndarray:
+def axisMask(values: np.ndarray, selector: AxisSelector) -> np.ndarray:
     if selector is None:
         return np.ones(values.shape, dtype=bool)
     if callable(selector):
@@ -497,7 +506,7 @@ def _axisMask(values: np.ndarray, selector: AxisSelector) -> np.ndarray:
     raise ValueError("region selectors must be None, a two-value range, a slice, a mask array, or a callable")
 
 
-def _zSelected(selector: AxisSelector, zStart: float, zEnd: float) -> bool:
+def zSelected(selector: AxisSelector, zStart: float, zEnd: float) -> bool:
     if selector is None:
         return True
     center = 0.5 * (zStart + zEnd)

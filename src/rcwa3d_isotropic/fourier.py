@@ -46,7 +46,7 @@ def makeHarmonics(
     """Create Fourier order indices and normalized in-plane wave vectors."""
 
     nx, ny = normalizeOrders(orders)
-    entries = _harmonicEntries(nx, ny, truncation)
+    entries = harmonicEntries(nx, ny, truncation)
 
     mxValues = np.array([item[0] for item in entries], dtype=int)
     myValues = np.array([item[1] for item in entries], dtype=int)
@@ -61,7 +61,7 @@ def makeHarmonics(
         kx=kx.astype(complex),
         ky=ky.astype(complex),
         orders=(nx, ny),
-        truncation=_normalizeTruncation(truncation),
+        truncation=normalizeTruncation(truncation),
     )
 
 
@@ -73,14 +73,14 @@ def normalizeOrders(orders: OrderSpec) -> tuple[int, int]:
     return int(orders[0]), int(orders[1])
 
 
-def _harmonicEntries(nx: int, ny: int, truncation: str) -> list[tuple[int, int]]:
+def harmonicEntries(nx: int, ny: int, truncation: str) -> list[tuple[int, int]]:
     if nx < 0 or ny < 0:
         raise ValueError("orders must be non-negative")
-    truncation = _normalizeTruncation(truncation)
+    truncation = normalizeTruncation(truncation)
     entries: list[tuple[int, int]] = []
     for my in range(-ny, ny + 1):
         for mx in range(-nx, nx + 1):
-            if truncation == "circular" and not _insideCircularDomain(mx, my, nx, ny):
+            if truncation == "circular" and not insideCircularDomain(mx, my, nx, ny):
                 continue
             entries.append((mx, my))
     if not entries:
@@ -88,7 +88,7 @@ def _harmonicEntries(nx: int, ny: int, truncation: str) -> list[tuple[int, int]]
     return entries
 
 
-def _insideCircularDomain(mx: int, my: int, nx: int, ny: int) -> bool:
+def insideCircularDomain(mx: int, my: int, nx: int, ny: int) -> bool:
     if nx == 0 and ny == 0:
         return mx == 0 and my == 0
     if nx == 0:
@@ -98,7 +98,7 @@ def _insideCircularDomain(mx: int, my: int, nx: int, ny: int) -> bool:
     return (mx / nx) ** 2 + (my / ny) ** 2 <= 1.0 + 1e-12
 
 
-def _normalizeTruncation(truncation: str) -> str:
+def normalizeTruncation(truncation: str) -> str:
     value = truncation.lower().replace("_", "-")
     aliases = {
         "rect": "rectangular",
@@ -155,12 +155,12 @@ def epsilonConvolutionMatrixTorch(
     if hasattr(epsilon, "convolutionMatrixTorch"):
         return epsilon.convolutionMatrixTorch(harmonics, torch, device).to(device=device, dtype=torch.complex128)
     if hasattr(epsilon, "convolutionMatrix"):
-        return _asTorchComplex(epsilon.convolutionMatrix(harmonics), torch, device)
+        return asTorchComplex(epsilon.convolutionMatrix(harmonics), torch, device)
 
-    if _torchOrPythonScalar(epsilon, torch):
+    if torchOrPythonScalar(epsilon, torch):
         return complex(epsilon) * torch.eye(harmonics.count, dtype=torch.complex128, device=device)
 
-    grid = _asTorchComplex(epsilon, torch, device)
+    grid = asTorchComplex(epsilon, torch, device)
     if grid.ndim == 0:
         return grid.reshape(())[()] * torch.eye(harmonics.count, dtype=torch.complex128, device=device)
     if grid.ndim != 2:
@@ -174,8 +174,8 @@ def epsilonConvolutionMatrixTorch(
 
     ny, nx = grid.shape
     coeffs = torch.fft.fft2(grid) / grid.numel()
-    dmx = _asTorchLong(harmonics.deltaMx, torch, device)
-    dmy = _asTorchLong(harmonics.deltaMy, torch, device)
+    dmx = asTorchLong(harmonics.deltaMx, torch, device)
+    dmy = asTorchLong(harmonics.deltaMy, torch, device)
     dmxFloat = dmx.to(torch.float64)
     dmyFloat = dmy.to(torch.float64)
     pi = torch.as_tensor(np.pi, dtype=torch.float64, device=device)
@@ -185,19 +185,19 @@ def epsilonConvolutionMatrixTorch(
     return coeffs[torch.remainder(dmy, ny), torch.remainder(dmx, nx)] * centeredCellPhase
 
 
-def _asTorchComplex(value: object, torch: Any, device: Any) -> Any:
+def asTorchComplex(value: object, torch: Any, device: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.to(device=device, dtype=torch.complex128)
     return torch.as_tensor(np.asarray(value), dtype=torch.complex128, device=device)
 
 
-def _asTorchLong(value: object, torch: Any, device: Any) -> Any:
+def asTorchLong(value: object, torch: Any, device: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.to(device=device, dtype=torch.long)
     return torch.as_tensor(np.asarray(value), dtype=torch.long, device=device)
 
 
-def _torchOrPythonScalar(value: object, torch: Any) -> bool:
+def torchOrPythonScalar(value: object, torch: Any) -> bool:
     return np.isscalar(value) or (isinstance(value, torch.Tensor) and value.ndim == 0)
 
 

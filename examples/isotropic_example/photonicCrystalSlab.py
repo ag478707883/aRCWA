@@ -24,6 +24,7 @@ TRUNCATION = "circular"
 BACKEND = "cuda"
 PRECOMPILE = True
 CACHE_MODES = True
+WORKERS = 1
 
 POLARIZATION = "TM"
 POLARIZATIONS = ("TE", "TM") if POLARIZATION == "both" else (POLARIZATION,)
@@ -69,12 +70,13 @@ simulation = rcwa.RCWASimulation(
     backend=BACKEND,
     precompile=PRECOMPILE,
     cacheModes=CACHE_MODES,
+    workers=WORKERS,
 )
 
 backend = rcwa.resolveBackend(BACKEND)
 backend.synchronize()
 startTime = time.perf_counter()
-spectrum = simulation.spectrum(wavelengths, polarizations=POLARIZATIONS)
+spectrum = simulation.spectrum(wavelengths, polarizations=POLARIZATIONS, workers=WORKERS)
 backend.synchronize()
 elapsed = time.perf_counter() - startTime
 profileResult = simulation.solve(wavelengths[len(wavelengths) // 2], polarization=POLARIZATIONS[0], profile=True)
@@ -83,23 +85,37 @@ print("Photonic crystal slab")
 print(f"method={METHOD}, truncation={TRUNCATION}, order={ORDER}, points={POINTS}, factorization={FACTORIZATION}")
 print(f"frequency range a/lambda: {normalizedFrequency[0]:.4f} - {normalizedFrequency[-1]:.4f}")
 print(f"epsilon slab={EPS_SLAB:.6g}, hole={EPS_HOLE:.6g}")
-print(f"backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, elapsed={elapsed:.3f} s")
+print(f"backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, workers={WORKERS}, elapsed={elapsed:.3f} s")
 for timing in profileResult.layerEigTimings:
-    print(f"  layer {timing.layerIndex} eig: {timing.kind}, shape={timing.matrixShape}, time={timing.eigTimeSeconds:.4f} s")
+    print(
+        f"  layer {timing.layerIndex}: {timing.kind}, shape={timing.matrixShape}, "
+        f"factor={timing.factorizationTimeSeconds:.4f} s, inv={timing.inverseTimeSeconds:.4f} s, "
+        f"pq={timing.pqTimeSeconds:.4f} s, eig={timing.eigTimeSeconds:.4f} s, "
+        f"min|q|={timing.minAbsQ:.3e}"
+    )
+if profileResult.stackTiming is not None:
+    stackTiming = profileResult.stackTiming
+    print(
+        f"  stack: interfaces={stackTiming.interfaceTimeSeconds:.4f} s, "
+        f"cascade={stackTiming.cascadeTimeSeconds:.4f} s, prepare={stackTiming.totalPrepareTimeSeconds:.4f} s, "
+        f"max cond={stackTiming.maxInterfaceCondition:.3e}"
+    )
+    for warning in stackTiming.stabilityWarnings:
+        print(f"  stability warning: {warning}")
 for label in POLARIZATIONS:
     reflection = spectrum[label]["reflection"]
     peak = int(np.argmax(reflection))
-    conservationError = float(np.max(np.abs(spectrum[label]["conservation"] - 1.0)))
+    energyError = float(np.nanmax(spectrum[label]["energyError"]))
     print(
         f"  {label}: max R={reflection[peak]:.6f} at a/lambda={normalizedFrequency[peak]:.6f}; "
-        f"max |R+T-1|={conservationError:.2e}"
+        f"max energy error={energyError:.2e}"
     )
 
 if SAVE_PLOTS:
     outputDir = REPO_ROOT / "examples" / "outputs"
     outputDir.mkdir(parents=True, exist_ok=True)
     displayGrid = 160
-    pattern = rcwa.Pattern2D(period=PERIOD, shape=(displayGrid, displayGrid), background=EPS_SLAB)
+    pattern = rcwa.Pattern2D(period=PERIOD, shape=(displayGrid, displayGrid), background=EPS_SLAB, supersample=4)
     pattern.circle(radius=RADIUS, material=EPS_HOLE)
     epsilonCell = np.real(pattern.epsilon)
 

@@ -21,11 +21,12 @@ import rcwa3d_anisotropic as rcwa
 
 
 # Runtime knobs. Increase ORDER/GRID/POINTS for convergence studies.
-ORDER = 10
+ORDER = 5
 TRUNCATION = "circular"
 BACKEND = "cuda"
+PRECISION = "complex128"  # Use "complex64" or "mixed" for fast spectrum scans.
 FACTORIZATION = "auto"
-GRID = 64
+GRID = 128
 WORKERS = 1
 POINTS = 101
 SHOW = True
@@ -65,11 +66,16 @@ INAS_MASS = 0.033 * m_e
 INAS_HALL_SIGN = 1.0
 
 
-def al_epsilon(wavelength_um: float) -> complex:
+def scalar_tensor(epsilon: complex) -> np.ndarray:
+    return complex(epsilon) * np.eye(3, dtype=complex)
+
+
+def al_tensor(wavelength_um: float) -> np.ndarray:
     """Return Al Drude permittivity from Eq. (8) of the paper."""
 
     omega = 2 * np.pi * c / (wavelength_um * 1e-6)
-    return AL_EPS_INF - AL_PLASMA**2 / (omega * (omega + 1j * AL_GAMMA))
+    epsilon = AL_EPS_INF - AL_PLASMA**2 / (omega * (omega + 1j * AL_GAMMA))
+    return scalar_tensor(epsilon)
 
 
 def inas_tensor(wavelength_um: float) -> np.ndarray:
@@ -92,37 +98,46 @@ def inas_tensor(wavelength_um: float) -> np.ndarray:
     )
 
 
-def make_nanopore_layer() -> rcwa.CompiledLayer:
-    """Build and precompile the Si slab with a cylindrical air nanopore."""
+def make_nanopore_layer() -> rcwa.Layer:
+    """Build the sampled Si nanopore layer; RCWASimulation precompiles it once."""
 
-    layer = rcwa.PatternLayer(
+    return rcwa.circularPostLayer(
         period=(PERIOD, PERIOD),
         thickness=SI_HEIGHT,
         background=SI_INDEX**2,
+        post=1.0,
+        radius=HOLE_RADIUS,
         shape=(GRID, GRID),
         factorization=FACTORIZATION,
         name="Si nanopore array",
     )
-    layer.circle(radius=HOLE_RADIUS, material=1.0)
-    return rcwa.compileLayers([layer.toLayer()], orders=ORDER, truncation=TRUNCATION)[0]
 
 
 def make_simulation() -> rcwa.RCWASimulation:
-    return rcwa.RCWASimulation(
+    return rcwa.buildSimulation(make_config(), make_layers())
+
+
+def make_config() -> rcwa.SimulationConfig:
+    return rcwa.SimulationConfig(
         period=(PERIOD, PERIOD),
-        layers=[
-            make_nanopore_layer(),
-            rcwa.homogeneousLayer(INAS_HEIGHT, inas_tensor, name="InAs"),
-            rcwa.homogeneousLayer(AL_HEIGHT, al_epsilon, name="Al mirror"),
-        ],
         orders=ORDER,
         truncation=TRUNCATION,
         backend=BACKEND,
-        method="smatrix",
+        precision=PRECISION,
         epsIncident=1.0,
         epsTransmission=SI_INDEX**2,
+        precompile=True,
+        cacheModes=True,
         workers=WORKERS,
     )
+
+
+def make_layers() -> list[object]:
+    return [
+        make_nanopore_layer(),
+        rcwa.homogeneousLayer(INAS_HEIGHT, inas_tensor, name="InAs"),
+        rcwa.homogeneousLayer(AL_HEIGHT, al_tensor, name="Al mirror"),
+    ]
 
 
 def top_view_map() -> tuple[np.ndarray, tuple[float, float, float, float]]:
@@ -173,7 +188,7 @@ def draw_cross_section_guides(axis: plt.Axes) -> None:
         axis.axhline(z_value, color="black", linestyle="--", linewidth=0.9, alpha=0.75)
 
 
-def _plot_spectrum_panel(
+def plot_spectrum_panel(
     axis: plt.Axes,
     wavelengths: np.ndarray,
     data: dict[str, np.ndarray],
@@ -236,7 +251,7 @@ def plot_result(spectrum: dict[str, object]) -> Path:
     axes[0, 1].set_xlabel("x (um)")
     axes[0, 1].set_ylabel("height from bottom (um)")
 
-    _plot_spectrum_panel(
+    plot_spectrum_panel(
         axes[1, 0],
         wavelengths,
         spectrum["TE"],
@@ -244,7 +259,7 @@ def plot_result(spectrum: dict[str, object]) -> Path:
         guide_wavelengths=PAPER_TE_RESONANCES_UM,
         guide_eta=PAPER_TE_NONRECIPROCITY,
     )
-    _plot_spectrum_panel(
+    plot_spectrum_panel(
         axes[1, 1],
         wavelengths,
         spectrum["TM"],
@@ -267,7 +282,7 @@ def plot_result(spectrum: dict[str, object]) -> Path:
     return output
 
 
-def _summarize_polarization(label: str, spectrum: dict[str, np.ndarray]) -> str:
+def summarize_polarization(label: str, spectrum: dict[str, np.ndarray]) -> str:
     eta_peak = int(np.argmax(spectrum["nonreciprocity"]))
     absorption_peak = int(np.argmax(spectrum["absorptivity"]))
     emission_peak = int(np.argmax(spectrum["emissivity"]))
@@ -283,7 +298,7 @@ def main() -> None:
     print(
         "RCWA "
         f"order={ORDER}, grid={GRID}, points={POINTS}, truncation={TRUNCATION}, "
-        f"factorization={FACTORIZATION}, backend={BACKEND}, workers={WORKERS}"
+        f"factorization={FACTORIZATION}, backend={BACKEND}, precision={PRECISION}, workers={WORKERS}"
     )
     print(
         "Fang 2024 nanopore geometry: "
@@ -291,16 +306,17 @@ def main() -> None:
         f"f={FILL_RATIO}, B={B_FIELD} T, theta={math.degrees(THETA):.1f} deg"
     )
     start = time.perf_counter()
-    spectrum = make_simulation().spectrum(
+    spectrum = rcwa.solveSpectrum(
+        make_config(),
+        make_layers(),
         WAVELENGTHS,
         theta=THETA,
         phi=PHI,
         polarizations=POLARIZATIONS,
         bidirectional=True,
-        workers=WORKERS,
     )
-    print(_summarize_polarization("TE", spectrum["TE"]))
-    print(_summarize_polarization("TM", spectrum["TM"]))
+    print(summarize_polarization("TE", spectrum["TE"]))
+    print(summarize_polarization("TM", spectrum["TM"]))
     figure = plot_result(spectrum)
     print(f"Saved: {figure}")
     print(f"Elapsed: {time.perf_counter() - start:.2f} s")

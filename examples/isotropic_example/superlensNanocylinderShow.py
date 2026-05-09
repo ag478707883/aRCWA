@@ -30,7 +30,7 @@ NORMALIZE = False
 PERIOD = 0.35
 HEIGHT = 1.30
 WAVELENGTH = 0.66
-ORDER = 8
+ORDER = 5
 DISPLAY_GRID = 196
 X_POINTS = 181
 Z_POINTS = 241
@@ -48,7 +48,12 @@ if not SHOW:
 import matplotlib.pyplot as plt
 
 
-pattern50 = rcwa.Pattern2D(period=(PERIOD, PERIOD), shape=(DISPLAY_GRID, DISPLAY_GRID), background=EPS_EMITTING)
+pattern50 = rcwa.Pattern2D(
+    period=(PERIOD, PERIOD),
+    shape=(DISPLAY_GRID, DISPLAY_GRID),
+    background=EPS_EMITTING,
+    supersample=4,
+)
 pattern50.circle(radius=0.05, material=EPS_CYLINDER)
 layer50 = rcwa.circularPostLayer(
     period=(PERIOD, PERIOD),
@@ -107,7 +112,7 @@ zPlot = np.linspace(-0.20, HEIGHT + 0.30, Z_POINTS)
 electricIntensityXz = {}
 realExXz = {}
 for label, result in (("r50", result50X), ("r100", result100X)):
-    _xMap, _zMap, fieldMaps = rcwa.stackFieldComponentsXz(
+    xMap, zMap, fieldMaps = rcwa.stackFieldComponentsXz(
         result,
         y=0.0,
         xSpan=(-PERIOD / 2, PERIOD / 2),
@@ -118,7 +123,7 @@ for label, result in (("r50", result50X), ("r100", result100X)):
     realExXz[label] = np.real(fieldMaps["Ex"])
 
 xyPlaneZ = HEIGHT + XY_DISTANCE_ABOVE_TOP
-_xXy, _yXy, fieldMapsXy = rcwa.stackFieldComponentsXy(
+xXy, yXy, fieldMapsXy = rcwa.stackFieldComponentsXy(
     result50X,
     z=xyPlaneZ,
     shape=(XY_POINTS, XY_POINTS),
@@ -130,8 +135,14 @@ print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile=
 print("normal-incidence fields: p=x-polarized, s=y-polarized")
 print(f"epsilon cylinder={EPS_CYLINDER:.6g}, substrate={EPS_SUBSTRATE:.6g}, emitting={EPS_EMITTING:.6g}")
 print(f"elapsed={elapsed:.3f} s")
-print(f"r=50 nm x-pol: R={result50X.reflection:.6f}, T={result50X.transmission:.6f}, R+T={result50X.conservation:.6f}")
-print(f"r=100 nm x-pol: R={result100X.reflection:.6f}, T={result100X.transmission:.6f}, R+T={result100X.conservation:.6f}")
+print(
+    f"r=50 nm x-pol: R={result50X.reflection:.6f}, T={result50X.transmission:.6f}, "
+    f"A={result50X.absorption:.6f}, energy error={result50X.energyError:.2e}"
+)
+print(
+    f"r=100 nm x-pol: R={result100X.reflection:.6f}, T={result100X.transmission:.6f}, "
+    f"A={result100X.absorption:.6f}, energy error={result100X.energyError:.2e}"
+)
 print(f"Max |E|^2 in x-z slice, r=50 nm x-pol: {np.max(electricIntensityXz['r50']):.6f}")
 print(f"Max |E|^2 in x-z slice, r=100 nm x-pol: {np.max(electricIntensityXz['r100']):.6f}")
 print(

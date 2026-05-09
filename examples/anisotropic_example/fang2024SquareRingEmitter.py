@@ -19,13 +19,13 @@ import rcwa3d_anisotropic as rcwa
 
 
 # Runtime knobs. Increase ORDER/GRID/POINTS for convergence studies.
-ORDER = 7
+ORDER = 15
 TRUNCATION = "circular"
 BACKEND = "cuda"
 FACTORIZATION = "auto"
 GRID = 128
 WORKERS = 1
-POINTS = 501
+POINTS = 201
 SHOW = True
 
 # Fang et al. 2024, Near-infrared multi-band small-angle TE-polarization
@@ -60,9 +60,14 @@ Ag_wp = 1.39e16
 Ag_gamma = 2.7e13
 
 
-def Ag_epsilon(wavelength_um: float) -> complex:
+def scalar_tensor(epsilon: complex) -> np.ndarray:
+    return complex(epsilon) * np.eye(3, dtype=complex)
+
+
+def Ag_tensor(wavelength_um: float) -> np.ndarray:
     omega = 2 * np.pi * c / (wavelength_um * 1e-6)
-    return Ag_eps_inf - Ag_wp**2 / (omega**2 + 1j * Ag_gamma * omega)
+    epsilon = Ag_eps_inf - Ag_wp**2 / (omega**2 + 1j * Ag_gamma * omega)
+    return scalar_tensor(epsilon)
 
 
 def ceyig_tensor() -> np.ndarray:
@@ -84,7 +89,7 @@ def ceyig_tensor() -> np.ndarray:
     )
 
 
-def _square_boundary_normal(
+def square_boundary_normal(
     xx: np.ndarray,
     yy: np.ndarray,
     width: float,
@@ -111,16 +116,16 @@ def square_ring_normal_field(
 ) -> np.ndarray:
     """Composite normal field for the square ring's outer and inner walls."""
 
-    outer_nx, outer_ny, outer_distance = _square_boundary_normal(xx, yy, outer_width)
-    inner_nx, inner_ny, inner_distance = _square_boundary_normal(xx, yy, inner_width)
+    outer_nx, outer_ny, outer_distance = square_boundary_normal(xx, yy, outer_width)
+    inner_nx, inner_ny, inner_distance = square_boundary_normal(xx, yy, inner_width)
     use_inner_wall = inner_distance <= outer_distance
     normal_x = np.where(use_inner_wall, inner_nx, outer_nx)
     normal_y = np.where(use_inner_wall, inner_ny, outer_ny)
     return np.stack((normal_x, normal_y), axis=-1).astype(float)
 
 
-def make_pattern_layer() -> rcwa.CompiledLayer:
-    """Build and precompile the sampled silicon square-ring array layer."""
+def make_pattern_layer() -> rcwa.Layer:
+    """Build the sampled silicon square-ring layer with an explicit boundary normal field."""
 
     layer = rcwa.PatternLayer(
         period=(PERIOD, PERIOD),
@@ -135,25 +140,33 @@ def make_pattern_layer() -> rcwa.CompiledLayer:
 
     xx, yy = layer.pattern.coordinates()
     layer.pattern.normalField = square_ring_normal_field(xx, yy, OUTER_WIDTH, INNER_WIDTH)
-    return rcwa.compileLayers([layer.toLayer()], orders=ORDER, truncation=TRUNCATION)[0]
+    return layer.toLayer()
 
 
 def make_simulation() -> rcwa.RCWASimulation:
-    return rcwa.RCWASimulation(
+    return rcwa.buildSimulation(make_config(), make_layers())
+
+
+def make_config() -> rcwa.SimulationConfig:
+    return rcwa.SimulationConfig(
         period=(PERIOD, PERIOD),
-        layers=[
-            make_pattern_layer(),
-            rcwa.homogeneousLayer(CEYIG_HEIGHT, ceyig_tensor(), name="Ce:YIG"),
-            rcwa.homogeneousLayer(AG_HEIGHT, Ag_epsilon, name="Ag"),
-        ],
         orders=ORDER,
         truncation=TRUNCATION,
         backend=BACKEND,
-        method="smatrix",
         epsIncident=1.0,
         epsTransmission=SI_INDEX**2,
+        precompile=True,
+        cacheModes=True,
         workers=WORKERS,
     )
+
+
+def make_layers() -> list[object]:
+    return [
+        make_pattern_layer(),
+        rcwa.homogeneousLayer(CEYIG_HEIGHT, ceyig_tensor(), name="Ce:YIG"),
+        rcwa.homogeneousLayer(AG_HEIGHT, Ag_tensor, name="Ag"),
+    ]
 
 
 def plot_spectrum(spectrum: dict[str, object]) -> Path:
@@ -215,13 +228,14 @@ def main() -> None:
         f"w1={INNER_WIDTH:.3f} um, w2={OUTER_WIDTH:.3f} um, theta={math.degrees(THETA):.1f} deg"
     )
     start = time.perf_counter()
-    spectrum = make_simulation().spectrum(
+    spectrum = rcwa.solveSpectrum(
+        make_config(),
+        make_layers(),
         WAVELENGTHS,
         theta=THETA,
         phi=PHI,
         polarizations=POLARIZATIONS,
         bidirectional=True,
-        workers=WORKERS,
     )
     figure = plot_spectrum(spectrum)
     print(f"Saved: {figure}")

@@ -23,6 +23,7 @@ TRUNCATION = "circular"
 BACKEND = "cuda"
 PRECOMPILE = True
 CACHE_MODES = True
+WORKERS = 1
 
 PERIOD = (0.72, 0.48)
 THICKNESS = 0.28
@@ -40,9 +41,18 @@ if not SHOW:
 import matplotlib.pyplot as plt
 
 
-pattern = rcwa.Pattern2D(period=PERIOD, shape=(72, 108), background=EPS_AIR, name="rectangular metasurface")
-pattern.rectangle(size=(0.34, 0.18), angle=np.deg2rad(25), material=EPS_SI)
-layer = pattern.toLayer(THICKNESS)
+layer = rcwa.rectangularPostLayer(
+    period=PERIOD,
+    thickness=THICKNESS,
+    background=EPS_AIR,
+    post=EPS_SI,
+    size=(0.34, 0.18),
+    angle=np.deg2rad(25),
+    analytic=True,
+    name="analytic rectangular metasurface",
+)
+displayPattern = rcwa.Pattern2D(period=PERIOD, shape=(72, 108), background=EPS_AIR, name="rectangular metasurface", supersample=4)
+displayPattern.rectangle(size=(0.34, 0.18), angle=np.deg2rad(25), material=EPS_SI)
 simulation = rcwa.RCWASimulation(
     period=PERIOD,
     layers=[layer],
@@ -54,27 +64,34 @@ simulation = rcwa.RCWASimulation(
     backend=BACKEND,
     precompile=PRECOMPILE,
     cacheModes=CACHE_MODES,
+    workers=WORKERS,
 )
 
 if FIELD_WAVELENGTH < WAVELENGTHS[0] or FIELD_WAVELENGTH > WAVELENGTHS[-1]:
     raise ValueError("FIELD_WAVELENGTH must lie inside the plotted wavelength range")
 
-spectrum = simulation.spectrum(WAVELENGTHS, polarizations=("TE",))
+spectrum = simulation.spectrum(WAVELENGTHS, polarizations=("TE",), workers=WORKERS)
 reflection = spectrum["TE"]["reflection"]
 transmission = spectrum["TE"]["transmission"]
 conservation = spectrum["TE"]["conservation"]
+absorption = spectrum["TE"]["absorption"]
+energyError = spectrum["TE"]["energyError"]
 fieldResult = simulation.solve(FIELD_WAVELENGTH, polarization="TE", returnFields=True)
 
 print("Rectangular metasurface")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, order={ORDER}, points={POINTS}")
+print(
+    f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, "
+    f"cacheModes={CACHE_MODES}, workers={WORKERS}, order={ORDER}, points={POINTS}"
+)
 print(f"field wavelength={FIELD_WAVELENGTH:.4f}")
 print(f"epsilon air={EPS_AIR:.6g}, silicon={EPS_SI:.6g}")
-print(f"Max |R + T - 1|: {np.max(np.abs(conservation - 1)):.3e}")
+print(f"Max absorption: {float(np.max(absorption)):.3e}")
+print(f"Max energy error: {float(np.nanmax(energyError)):.3e}")
 
 if SAVE_PLOTS:
     outputDir = REPO_ROOT / "examples" / "outputs"
     outputDir.mkdir(parents=True, exist_ok=True)
-    fig = plotEpsilon(layer.epsilon, PERIOD, outputDir / "rectangular_metasurface_cell.png", title="Rectangular metasurface unit cell")
+    fig = plotEpsilon(displayPattern.epsilon, PERIOD, outputDir / "rectangular_metasurface_cell.png", title="Rectangular metasurface unit cell")
     plt.close(fig)
     spectrumOutput = outputDir / "rectangular_metasurface_spectrum.png"
     fig = plotSpectrum(

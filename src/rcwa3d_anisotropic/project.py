@@ -16,7 +16,7 @@ from .geometry import (
     stack,
 )
 from .simulation import LayerSpec, Polarization, RCWASimulation, homogeneousLayer
-from .solver import CompiledLayer, Layer, RCWAResult
+from .solver import Layer, RCWAResult
 
 
 ComplexArray = np.ndarray
@@ -36,7 +36,7 @@ class AnisotropicRCWA:
     model = rcwa.AnisotropicRCWA(period=(5.33, 5.33), order=3)
     model.add_cylinder(height=5.94, radius=1.065, material=3.48**2)
     model.add_uniform(height=1.962, material=inas_tensor)
-    model.add_uniform(height=0.50, material=ag_epsilon)
+    model.add_uniform(height=0.50, material=ag_tensor)
     spectrum = model.spectrum(np.linspace(11.7, 12.0, 101), theta_deg=33)
     ```
 
@@ -48,10 +48,11 @@ class AnisotropicRCWA:
     top.circle(radius=1.065, material=3.48**2)
     ```
 
-    Materials may be scalars, 3x3 tensors, sampled tensor grids, or callables
-    of wavelength.  Length units are arbitrary but must be consistent.
-    ``method="smatrix"`` is the stable CUDA solve path and the only public
-    method exposed through this interface.
+    Static materials may be scalars, 3x3 tensors, or sampled tensor grids.
+    Wavelength-dependent material callables must return one 3x3 tensor.
+    Length units are arbitrary but must be consistent.
+    The stable CUDA S-matrix route is the only solver path exposed through
+    this interface.
     """
 
     period: tuple[float, float]
@@ -60,13 +61,13 @@ class AnisotropicRCWA:
     incident: complex = 1.0
     transmission: complex = 1.0
     backend: str = "cuda"
-    method: Literal["smatrix"] = "smatrix"
+    precision: Literal["complex128", "complex64", "mixed"] = "complex128"
     samples: tuple[int, int] = (128, 128)
     precompile: bool = True
     workers: int = 1
     layers: list[LayerInput] = field(default_factory=list)
-    _simulationCache: RCWASimulation | None = field(default=None, init=False, repr=False)
-    _simulationKey: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
+    simulationCache: RCWASimulation | None = field(default=None, init=False, repr=False)
+    simulationKey: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
 
     def add_uniform(self, height: float, material: Material, *, name: str = "") -> "AnisotropicRCWA":
         """Append a homogeneous layer."""
@@ -80,7 +81,7 @@ class AnisotropicRCWA:
         if isinstance(layer, LayerStack):
             self.layers.extend(layer.toLayers())
             return self
-        if isinstance(layer, (Layer, CompiledLayer, LayerSpec, PatternLayer)) or callable(layer):
+        if isinstance(layer, (Layer, LayerSpec, PatternLayer)) or callable(layer):
             self.layers.append(layer)
             return self
         self.layers.extend(layer)
@@ -89,7 +90,7 @@ class AnisotropicRCWA:
     def geometry_stack(self, *, samples: int | tuple[int, int] | None = None) -> LayerStack:
         """Create an editable 3D layer stack using the project's period."""
 
-        return LayerStack(period=self.period, shape=_samples(samples, self.samples))
+        return LayerStack(period=self.period, shape=normalizeSamples(samples, self.samples))
 
     def add_patterned_layer(
         self,
@@ -97,7 +98,7 @@ class AnisotropicRCWA:
         height: float,
         background: Material = 1.0,
         samples: int | tuple[int, int] | None = None,
-        factorization: Literal["auto", "standard", "normal-vector", "jones"] = "auto",
+        factorization: Literal["auto", "standard", "normal-vector"] = "auto",
         name: str = "patterned layer",
     ) -> PatternLayer:
         """Append a mutable layer, then draw patterns on it afterwards.
@@ -114,7 +115,7 @@ class AnisotropicRCWA:
             period=self.period,
             thickness=height,
             background=background,
-            shape=_samples(samples, self.samples),
+            shape=normalizeSamples(samples, self.samples),
             name=name,
             factorization=factorization,
         )
@@ -130,12 +131,10 @@ class AnisotropicRCWA:
         background: Material = 1.0,
         center: tuple[float, float] = (0.0, 0.0),
         samples: int | tuple[int, int] | None = None,
-        analytic: bool = True,
-        factorization: Literal["auto", "standard", "normal-vector", "jones"] = "auto",
-        jonesResolution: int = 512,
+        factorization: Literal["auto", "standard", "normal-vector"] = "auto",
         name: str = "cylindrical grating",
     ) -> "AnisotropicRCWA":
-        """Append a circular post layer."""
+        """Append a sampled circular post layer."""
 
         self.layers.append(
             circularPostLayer(
@@ -144,11 +143,9 @@ class AnisotropicRCWA:
                 background=background,
                 post=material,
                 radius=radius,
-                shape=_samples(samples, self.samples),
+                shape=normalizeSamples(samples, self.samples),
                 center=center,
-                analytic=analytic,
                 factorization=factorization,
-                jonesResolution=jonesResolution,
                 name=name,
             )
         )
@@ -164,12 +161,10 @@ class AnisotropicRCWA:
         center: tuple[float, float] = (0.0, 0.0),
         angle_deg: float = 0.0,
         samples: int | tuple[int, int] | None = None,
-        analytic: bool = True,
-        factorization: Literal["auto", "standard", "normal-vector", "jones"] = "auto",
-        jonesResolution: int = 512,
+        factorization: Literal["auto", "standard", "normal-vector"] = "auto",
         name: str = "rectangular grating",
     ) -> "AnisotropicRCWA":
-        """Append a rectangular post layer."""
+        """Append a sampled rectangular post layer."""
 
         self.layers.append(
             rectangularPostLayer(
@@ -180,10 +175,8 @@ class AnisotropicRCWA:
                 size=size,
                 center=center,
                 angle=np.deg2rad(angle_deg),
-                shape=_samples(samples, self.samples),
-                analytic=analytic,
+                shape=normalizeSamples(samples, self.samples),
                 factorization=factorization,
-                jonesResolution=jonesResolution,
                 name=name,
             )
         )
@@ -199,7 +192,7 @@ class AnisotropicRCWA:
         center: tuple[float, float] = (0.0, 0.0),
         angle_deg: float = 0.0,
         samples: int | tuple[int, int] | None = None,
-        factorization: Literal["auto", "standard", "normal-vector", "jones"] = "auto",
+        factorization: Literal["auto", "standard", "normal-vector"] = "auto",
         name: str = "elliptical grating",
     ) -> "AnisotropicRCWA":
         """Append an elliptical post layer."""
@@ -213,7 +206,7 @@ class AnisotropicRCWA:
                 radii=radii,
                 center=center,
                 angle=np.deg2rad(angle_deg),
-                shape=_samples(samples, self.samples),
+                shape=normalizeSamples(samples, self.samples),
                 factorization=factorization,
                 name=name,
             )
@@ -232,7 +225,7 @@ class AnisotropicRCWA:
         center: tuple[float, float] = (0.0, 0.0),
         angle_deg: float = 0.0,
         samples: int | tuple[int, int] | None = None,
-        factorization: Literal["auto", "standard", "normal-vector", "jones"] = "auto",
+        factorization: Literal["auto", "standard", "normal-vector"] = "auto",
         name: str = "rectangular hollow grating",
     ) -> "AnisotropicRCWA":
         """Append a rectangular post with a circular through-hole."""
@@ -248,7 +241,7 @@ class AnisotropicRCWA:
                 holeMaterial=hole_material,
                 center=center,
                 angle=np.deg2rad(angle_deg),
-                shape=_samples(samples, self.samples),
+                shape=normalizeSamples(samples, self.samples),
                 factorization=factorization,
                 name=name,
             )
@@ -263,7 +256,7 @@ class AnisotropicRCWA:
         material: Material,
         background: Material = 1.0,
         samples: int | tuple[int, int] | None = None,
-        factorization: Literal["auto", "standard", "normal-vector", "jones"] = "auto",
+        factorization: Literal["auto", "standard", "normal-vector"] = "auto",
         name: str = "polygon grating",
     ) -> "AnisotropicRCWA":
         """Append a sampled polygon post layer."""
@@ -275,7 +268,7 @@ class AnisotropicRCWA:
                 background=background,
                 post=material,
                 vertices=vertices,
-                shape=_samples(samples, self.samples),
+                shape=normalizeSamples(samples, self.samples),
                 factorization=factorization,
                 name=name,
             )
@@ -291,7 +284,7 @@ class AnisotropicRCWA:
     ) -> SampledPattern:
         """Create a sampled unit-cell pattern for custom drawing."""
 
-        return SampledPattern(period=self.period, shape=_samples(samples, self.samples), background=background, name=name)
+        return SampledPattern(period=self.period, shape=normalizeSamples(samples, self.samples), background=background, name=name)
 
     def add_pattern(self, pattern: SampledPattern, *, height: float, name: str | None = None) -> "AnisotropicRCWA":
         """Append a user-drawn sampled pattern."""
@@ -311,14 +304,14 @@ class AnisotropicRCWA:
         slices: int = 20,
         angle_deg: float = 0.0,
         samples: int | tuple[int, int] | None = None,
-        factorization: Literal["auto", "standard", "normal-vector", "jones"] = "auto",
+        factorization: Literal["auto", "standard", "normal-vector"] = "auto",
         name: str = "taper",
     ) -> "AnisotropicRCWA":
         """Append a taper approximated by many constant cross-section layers."""
 
         self.layers.extend(
             stack(
-                _sliced_taper(
+                sliced_taper(
                     period=self.period,
                     height=height,
                     background=background,
@@ -328,7 +321,7 @@ class AnisotropicRCWA:
                     kind=shape,
                     slices=slices,
                     angle=np.deg2rad(angle_deg),
-                    samples=_samples(samples, self.samples),
+                    samples=normalizeSamples(samples, self.samples),
                     factorization=factorization,
                     name=name,
                 )
@@ -346,28 +339,28 @@ class AnisotropicRCWA:
             complex(self.incident),
             complex(self.transmission),
             self.backend,
-            self.method,
+            self.precision,
             self.precompile,
             self.workers,
-            tuple(_layer_key(layer) for layer in self.layers),
+            tuple(layer_key(layer) for layer in self.layers),
         )
-        if self._simulationCache is not None and self._simulationKey == key:
-            return self._simulationCache
+        if self.simulationCache is not None and self.simulationKey == key:
+            return self.simulationCache
 
-        self._simulationCache = RCWASimulation(
+        self.simulationCache = RCWASimulation(
             period=self.period,
-            layers=tuple(_materialize_layer(layer) for layer in self.layers),
+            layers=tuple(materialize_layer(layer) for layer in self.layers),
             orders=self.order,
             truncation=self.truncation,
             backend=self.backend,
+            precision=self.precision,
             epsIncident=self.incident,
             epsTransmission=self.transmission,
             precompile=self.precompile,
-            method=self.method,
             workers=self.workers,
         )
-        self._simulationKey = key
-        return self._simulationCache
+        self.simulationKey = key
+        return self.simulationCache
 
     def solve(
         self,
@@ -378,16 +371,33 @@ class AnisotropicRCWA:
         theta: float | None = None,
         phi: float | None = None,
         polarization: Polarization = "TE",
-        returnFields: bool = False,
     ) -> RCWAResult:
-        """Solve one wavelength. Use theta_deg/phi_deg for ordinary scripts."""
+        """Solve one wavelength for reflection/transmission data."""
 
         return self.simulation().solve(
             wavelength,
-            theta=_angle(theta, theta_deg),
-            phi=_angle(phi, phi_deg),
+            theta=angle(theta, theta_deg),
+            phi=angle(phi, phi_deg),
             polarization=polarization,
-            returnFields=returnFields,
+        )
+
+    def solve_fields(
+        self,
+        wavelength: float,
+        *,
+        theta_deg: float = 0.0,
+        phi_deg: float = 0.0,
+        theta: float | None = None,
+        phi: float | None = None,
+        polarization: Polarization = "TE",
+    ) -> RCWAResult:
+        """Solve one wavelength and include finite-layer field data."""
+
+        return self.simulation().solveFields(
+            wavelength,
+            theta=angle(theta, theta_deg),
+            phi=angle(phi, phi_deg),
+            polarization=polarization,
         )
 
     def absorption(
@@ -404,8 +414,8 @@ class AnisotropicRCWA:
 
         return self.simulation().absorption(
             wavelength,
-            theta=_angle(theta, theta_deg),
-            phi=_angle(phi, phi_deg),
+            theta=angle(theta, theta_deg),
+            phi=angle(phi, phi_deg),
             polarization=polarization,
         )
 
@@ -426,8 +436,8 @@ class AnisotropicRCWA:
 
         return self.simulation().spectrum(
             wavelengths,
-            theta=_angle(theta, theta_deg),
-            phi=_angle(phi, phi_deg),
+            theta=angle(theta, theta_deg),
+            phi=angle(phi, phi_deg),
             polarizations=polarizations,
             excitations=excitations,
             bidirectional=bidirectional,
@@ -438,7 +448,7 @@ class AnisotropicRCWA:
 Project = AnisotropicRCWA
 
 
-def _samples(value: int | tuple[int, int] | None, default: tuple[int, int]) -> tuple[int, int]:
+def normalizeSamples(value: int | tuple[int, int] | None, default: tuple[int, int]) -> tuple[int, int]:
     if value is None:
         return default
     if isinstance(value, int):
@@ -448,25 +458,25 @@ def _samples(value: int | tuple[int, int] | None, default: tuple[int, int]) -> t
     return int(value[0]), int(value[1])
 
 
-def _angle(radians: float | None, degrees: float) -> float:
+def angle(radians: float | None, degrees: float) -> float:
     if radians is not None:
         return float(radians)
     return float(np.deg2rad(degrees))
 
 
-def _materialize_layer(layer: LayerInput) -> LayerInput:
+def materialize_layer(layer: LayerInput) -> LayerInput:
     if isinstance(layer, PatternLayer):
         return layer.toLayer()
     return layer
 
 
-def _layer_key(layer: LayerInput) -> tuple[Any, ...]:
+def layer_key(layer: LayerInput) -> tuple[Any, ...]:
     if isinstance(layer, PatternLayer):
         return ("pattern", id(layer), layer.version)
     return (type(layer).__name__, id(layer))
 
 
-def _sliced_taper(**kwargs: Any) -> list[Layer]:
+def sliced_taper(**kwargs: Any) -> list[Layer]:
     from .geometry import slicedTaperStack
 
     return slicedTaperStack(

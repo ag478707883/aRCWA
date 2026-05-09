@@ -18,7 +18,7 @@ def slabReflectance(n0: float, n1: float, n2: float, wavelength: float, thicknes
 
 class HomogeneousTests(unittest.TestCase):
     def testNoLayerMatchesFresnelInterface(self) -> None:
-        result = _solveIsotropic(
+        result = solveIsotropic(
             layers=[],
             wavelength=1.0,
             period=(1.0, 1.0),
@@ -31,11 +31,14 @@ class HomogeneousTests(unittest.TestCase):
         self.assertAlmostEqual(result.reflection, expectedReflection, places=12)
         self.assertAlmostEqual(result.transmission, expectedTransmission, places=12)
         self.assertAlmostEqual(result.conservation, 1.0, places=12)
+        self.assertAlmostEqual(result.absorption, 0.0, places=12)
+        self.assertIsNotNone(result.energyError)
+        self.assertAlmostEqual(result.energyError, 0.0, places=12)
 
     def testUniformSlabMatchesTransferMatrix(self) -> None:
         wavelength = 1.0
         thickness = 0.30
-        result = _solveIsotropic(
+        result = solveIsotropic(
             layers=[Layer(thickness=thickness, epsilon=2.25)],
             wavelength=wavelength,
             period=(1.0, 1.0),
@@ -46,6 +49,37 @@ class HomogeneousTests(unittest.TestCase):
         expectedReflection = slabReflectance(1.0, 1.5, 1.0, wavelength, thickness)
         self.assertAlmostEqual(result.reflection, expectedReflection, places=10)
         self.assertAlmostEqual(result.conservation, 1.0, places=10)
+        self.assertAlmostEqual(result.absorption, 0.0, places=10)
+        self.assertIsNotNone(result.energyError)
+        self.assertLess(result.energyError, 1e-10)
+
+    def testLossyLayerReportsAbsorptionInsteadOfEnergyError(self) -> None:
+        result = solveIsotropic(
+            layers=[Layer(thickness=0.2, epsilon=2.25 + 0.1j)],
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            orders=(0, 0),
+            epsIncident=1.0,
+            epsTransmission=1.0,
+        )
+
+        self.assertAlmostEqual(result.absorption, 1.0 - result.conservation, places=12)
+        self.assertIsNone(result.energyError)
+        self.assertIsNone(result.powerWarning)
+
+    def testComplexExteriorReportsPowerWarning(self) -> None:
+        result = solveIsotropic(
+            layers=[],
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            orders=(0, 0),
+            epsIncident=1.0 + 0.02j,
+            epsTransmission=1.0,
+        )
+
+        self.assertIsNone(result.energyError)
+        self.assertIsNotNone(result.powerWarning)
+        self.assertIn("complex permittivity", result.powerWarning)
 
     def testObliqueInterfaceMatchesFresnelForSAndP(self) -> None:
         theta = math.radians(30)
@@ -61,7 +95,7 @@ class HomogeneousTests(unittest.TestCase):
 
         for polarization in ("s", "p"):
             with self.subTest(polarization=polarization):
-                result = _solveIsotropic(
+                result = solveIsotropic(
                     layers=[],
                     wavelength=1.0,
                     period=(1.0, 1.0),
@@ -76,7 +110,7 @@ class HomogeneousTests(unittest.TestCase):
                 self.assertAlmostEqual(result.conservation, 1.0, places=12)
 
     def testSampledUniformLayerDoesNotCreateSpuriousDiffraction(self) -> None:
-        result = _solveIsotropic(
+        result = solveIsotropic(
             layers=[Layer(thickness=0.2, epsilon=np.full((24, 20), 2.25))],
             wavelength=1.0,
             period=(0.7, 0.8),
@@ -93,7 +127,7 @@ class HomogeneousTests(unittest.TestCase):
         self.assertAlmostEqual(result.conservation, 1.0, places=10)
 
 
-def _solveIsotropic(
+def solveIsotropic(
     *,
     layers,
     wavelength,

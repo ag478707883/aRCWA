@@ -24,6 +24,7 @@ TRUNCATION = "circular"
 BACKEND = "cuda"
 PRECOMPILE = True
 CACHE_MODES = True
+WORKERS = 6
 
 PERIOD_X = 0.5
 PERIOD_Y = PERIOD_X
@@ -34,7 +35,7 @@ ORDERS = (ORDER, 0)
 NX = 1024
 NY = 8
 
-FREQUENCY_THZ = np.linspace(150.0, 300.0, 581)
+FREQUENCY_THZ = np.linspace(150.0, 300.0, 1001)
 THETA_CASES = [(0.0, 0.0), (30.0, np.deg2rad(30.0))]
 POLARIZATIONS = ("TE", "TM")
 
@@ -47,13 +48,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-_yIndex, xIndex = np.mgrid[0:NY, 0:NX]
-xCell = (xIndex + 0.5) / NX * PERIOD_X - PERIOD_X / 2
 ridgeWidth = DUTY_CYCLE * PERIOD_X
-ridgeMask = np.abs(xCell) <= ridgeWidth / 2
 
-epsilonCell = np.full((NY, NX), EPS_GROOVE, dtype=complex)
-epsilonCell[ridgeMask] = EPS_GRATING
+displayPattern = rcwa.Pattern2D(
+    period=(PERIOD_X, PERIOD_Y),
+    shape=(NY, NX),
+    background=EPS_GROOVE,
+    supersample=4,
+)
+displayPattern.rectangle(size=(ridgeWidth, PERIOD_Y), material=EPS_GRATING, useNormal=False)
+epsilonCell = displayPattern.epsilon
 
 gratingEpsilon = AnalyticRectangle(
     period=(PERIOD_X, PERIOD_Y),
@@ -80,14 +84,19 @@ simulation = rcwa.RCWASimulation(
     backend=BACKEND,
     precompile=PRECOMPILE,
     cacheModes=CACHE_MODES,
+    workers=WORKERS,
 )
 
-reflection = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, _ in THETA_CASES}
-transmission = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, _ in THETA_CASES}
-conservation = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, _ in THETA_CASES}
+reflection = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, ignored in THETA_CASES}
+transmission = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, ignored in THETA_CASES}
+conservation = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, ignored in THETA_CASES}
+energyError = {(pol, thetaDeg): np.zeros_like(FREQUENCY_THZ) for pol in POLARIZATIONS for thetaDeg, ignored in THETA_CASES}
 
 print("LAWP 2020 binary grating reproduction")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}, order=({ORDER}, 0), points={FREQUENCY_THZ.size}")
+print(
+    f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, "
+    f"cacheModes={CACHE_MODES}, workers={WORKERS}, order=({ORDER}, 0), points={FREQUENCY_THZ.size}"
+)
 print(f"epsilon cover={EPS_COVER:.6g}, substrate={EPS_SUBSTRATE:.6g}, grating={EPS_GRATING:.6g}")
 
 backend = rcwa.resolveBackend(BACKEND)
@@ -96,22 +105,29 @@ startTime = time.perf_counter()
 for thetaDeg, theta in THETA_CASES:
     print(f"Solving theta={thetaDeg:.0f} deg")
     wavelengths = 299.792458 / FREQUENCY_THZ
-    thetaSpectrum = simulation.spectrum(wavelengths, theta=theta, phi=0.0, polarizations=POLARIZATIONS)
+    thetaSpectrum = simulation.spectrum(
+        wavelengths,
+        theta=theta,
+        phi=0.0,
+        polarizations=POLARIZATIONS,
+        workers=WORKERS,
+    )
     for polarizationName in POLARIZATIONS:
         key = (polarizationName, thetaDeg)
         reflection[key] = thetaSpectrum[polarizationName]["reflection"]
         transmission[key] = thetaSpectrum[polarizationName]["transmission"]
         conservation[key] = thetaSpectrum[polarizationName]["conservation"]
+        energyError[key] = thetaSpectrum[polarizationName]["energyError"]
 backend.synchronize()
 elapsed = time.perf_counter() - startTime
 
 for key in [("TE", 0.0), ("TE", 30.0), ("TM", 0.0), ("TM", 30.0)]:
     peakIndex = int(np.argmax(reflection[key]))
-    maxError = float(np.max(np.abs(conservation[key] - 1.0)))
+    maxError = float(np.nanmax(energyError[key]))
     print(
         f"{key[0]}, theta={key[1]:.0f} deg: "
         f"max R={reflection[key][peakIndex]:.6f} at {FREQUENCY_THZ[peakIndex]:.3f} THz, "
-        f"max |R+T-1|={maxError:.2e}"
+        f"max energy error={maxError:.2e}"
     )
 print(f"Elapsed: {elapsed:.2f} s")
 

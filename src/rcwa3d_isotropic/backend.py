@@ -42,16 +42,16 @@ def resolveBackend(backend: str | ArrayBackend | None = None) -> ArrayBackend:
 
     value = "cuda" if backend is None else str(backend).lower()
     if value in ("cuda", "gpu", "torch", "torch-cuda", "auto"):
-        torch = _importTorch()
+        torch = importTorch()
         if not torch.cuda.is_available():
             raise RuntimeError("the isotropic solver requires a CUDA-enabled torch installation and visible CUDA device")
-        return _cudaBackend(torch)
+        return cudaBackend(torch)
     if value in ("cpu", "numpy", "torch-cpu", "pytorch-cpu"):
         raise ValueError("the isotropic solver is CUDA-only; use backend='cuda'")
     raise ValueError("backend must be 'cuda', 'gpu', 'torch', 'torch-cuda', 'auto', an ArrayBackend, or None")
 
 
-def _importTorch() -> Any:
+def importTorch() -> Any:
     try:
         import torch
     except Exception as exc:  # pragma: no cover - depends on optional torch install
@@ -59,6 +59,6 @@ def _importTorch() -> Any:
     return torch
 
 
-def _cudaBackend(torch: Any) -> ArrayBackend:
+def cudaBackend(torch: Any) -> ArrayBackend:
     device = torch.device("cuda")
     return ArrayBackend("cuda", torch, torch.linalg, isTorch=True, isCuda=True, device=device)

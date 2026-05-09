@@ -20,6 +20,8 @@ import rcwa3d_anisotropic as rcwa
 # Runtime knobs. Edit these constants directly for local experiments.
 ORDER = (1, 1)
 TRUNCATION = "circular"
+BACKEND = "cuda"
+PRECISION = "complex128"  # Use "complex64" or "mixed" for fast spectrum scans.
 GRID = 20
 POINTS = 61
 SHOW = False
@@ -36,13 +38,12 @@ POST_SIZE = (0.52, 0.34)
 THETA = math.radians(9.0)
 PHI = math.radians(17.0)
 WAVELENGTHS = np.linspace(0.95, 1.15, POINTS)
-METHOD = "smatrix"
 
 
-def build_compiled_layer() -> rcwa.CompiledLayer:
-    """Create one static tensor metasurface layer for the CUDA S-matrix solve."""
+def build_layer() -> rcwa.Layer:
+    """Create one static tensor metasurface layer for the CUDA S-matrix simulation."""
 
-    layer = rcwa.rectangularPostLayer(
+    return rcwa.rectangularPostLayer(
         period=PERIOD,
         thickness=THICKNESS,
         background=1.0,
@@ -52,52 +53,49 @@ def build_compiled_layer() -> rcwa.CompiledLayer:
         factorization="standard",
         name="anisotropic tensor post",
     )
-    return rcwa.compileLayers([layer], orders=ORDER, truncation=TRUNCATION)[0]
 
 
-def solve_smatrix_spectrum(layer: rcwa.CompiledLayer) -> dict[str, np.ndarray]:
-    reflection = np.empty_like(WAVELENGTHS)
-    transmission = np.empty_like(WAVELENGTHS)
-    conservation = np.empty_like(WAVELENGTHS)
+def make_simulation() -> rcwa.RCWASimulation:
+    return rcwa.RCWASimulation(
+        period=PERIOD,
+        layers=[build_layer()],
+        orders=ORDER,
+        truncation=TRUNCATION,
+        backend=BACKEND,
+        precision=PRECISION,
+        precompile=True,
+        cacheModes=True,
+        epsIncident=1.0,
+        epsTransmission=1.0,
+    )
 
-    for index, wavelength in enumerate(WAVELENGTHS):
-        result = rcwa.solveStack(
-            layers=[layer],
-            wavelength=float(wavelength),
-            period=PERIOD,
-            orders=ORDER,
-            epsIncident=1.0,
-            epsTransmission=1.0,
-            theta=THETA,
-            phi=PHI,
-            sAmplitude=0.0,
-            pAmplitude=1.0,
-            truncation=TRUNCATION,
-            method=METHOD,
-            backend="cuda",
-        )
-        reflection[index] = result.reflection
-        transmission[index] = result.transmission
-        conservation[index] = result.conservation
 
+def solveSMatrixSpectrum(simulation: rcwa.RCWASimulation) -> dict[str, np.ndarray]:
+    spectrum = simulation.spectrum(
+        WAVELENGTHS,
+        theta=THETA,
+        phi=PHI,
+        polarizations=("TM",),
+        bidirectional=False,
+    )
+    data = spectrum["TM"]
     return {
-        "reflection": reflection,
-        "transmission": transmission,
-        "conservation": conservation,
+        "wavelengths": spectrum["wavelengths"],
+        "absorptivity": data["absorptivity"],
     }
 
 
 def plot_results(result: dict[str, np.ndarray]) -> Path:
-    figure, axes = plt.subplots(3, 1, figsize=(8.5, 8.2), sharex=True, constrained_layout=True)
+    figure, axes = plt.subplots(2, 1, figsize=(8.5, 6.4), sharex=True, constrained_layout=True)
+    wavelengths = result["wavelengths"]
+    absorption = result["absorptivity"]
 
-    axes[0].plot(WAVELENGTHS, result["reflection"], label=METHOD)
-    axes[1].plot(WAVELENGTHS, result["transmission"], label=METHOD)
-    axes[2].semilogy(WAVELENGTHS, np.abs(result["conservation"] - 1.0) + 1e-18, label=METHOD)
+    axes[0].plot(wavelengths, absorption, label="A = 1 - R - T")
+    axes[1].semilogy(wavelengths, np.abs(absorption) + 1e-18, label="|A|")
 
-    axes[0].set_ylabel("Reflection")
-    axes[1].set_ylabel("Transmission")
-    axes[2].set_ylabel("|R + T - 1|")
-    axes[2].set_xlabel("Wavelength")
+    axes[0].set_ylabel("Absorptivity")
+    axes[1].set_ylabel("|A|")
+    axes[1].set_xlabel("Wavelength")
 
     for axis in axes:
         axis.grid(True, alpha=0.25)
@@ -121,11 +119,12 @@ def plot_results(result: dict[str, np.ndarray]) -> Path:
 def main() -> None:
     print(
         "Solving anisotropic stable CUDA S-matrix "
-        f"on one tensor metasurface case, order={ORDER}, grid={GRID}, points={POINTS}"
+        f"on one tensor metasurface case, order={ORDER}, grid={GRID}, points={POINTS}, "
+        f"backend={BACKEND}, precision={PRECISION}"
     )
     start = time.perf_counter()
-    layer = build_compiled_layer()
-    result = solve_smatrix_spectrum(layer)
+    simulation = make_simulation()
+    result = solveSMatrixSpectrum(simulation)
     output = plot_results(result)
 
     center = POINTS // 2
@@ -133,11 +132,9 @@ def main() -> None:
     print(
         "center wavelength "
         f"{WAVELENGTHS[center]:.4f}: "
-        f"R={result['reflection'][center]:.8f}, "
-        f"T={result['transmission'][center]:.8f}, "
-        f"R+T={result['conservation'][center]:.8f}"
+        f"A={result['absorptivity'][center]:.8e}"
     )
-    print(f"max |R+T-1|={np.max(np.abs(result['conservation'] - 1.0)):.3e}")
+    print(f"max |A|={np.max(np.abs(result['absorptivity'])):.3e}")
 
     print(f"elapsed: {time.perf_counter() - start:.2f} s")
 

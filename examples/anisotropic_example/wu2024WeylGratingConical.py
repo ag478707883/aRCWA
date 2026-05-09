@@ -22,14 +22,15 @@ from rcwa3d_anisotropic.phase import forwardKz, planeWaveFields
 
 
 # Runtime knobs. Increase ORDER/GRID_X/POINTS for convergence studies.
-ORDER = 5
+ORDER = 15
 TRUNCATION = "rectangular"
 BACKEND = "cuda"
+PRECISION = "complex128"  # Use "complex64" or "mixed" for fast spectrum scans.
 FACTORIZATION = "auto"
-GRID_X = 768
+GRID_X = 512
 GRID_Y = 8
 WORKERS = 1
-POINTS = 401
+POINTS = 201
 SHOW = True
 
 # Wu & Qing 2024, Fig. 2 TE-optimized conical-incidence structure.
@@ -77,18 +78,23 @@ RS = e**2 / (4 * np.pi * epsilon_0 * hbar * WEYL_VF)
 XI = np.linspace(0.0, WEYL_CUTOFF, WEYL_INTEGRATION_POINTS)
 
 
-def _fermi_difference(energy: complex | np.ndarray) -> complex | np.ndarray:
+def fermi_difference(energy: complex | np.ndarray) -> complex | np.ndarray:
     return 1 / (np.exp((-energy - EF) / (k * WEYL_TEMPERATURE)) + 1) - 1 / (
         np.exp((energy - EF) / (k * WEYL_TEMPERATURE)) + 1
     )
 
 
-G_XI = _fermi_difference(EF * XI)
+G_XI = fermi_difference(EF * XI)
 
 
-def ag_epsilon(wavelength_um: float) -> complex:
+def scalar_tensor(epsilon: complex) -> np.ndarray:
+    return complex(epsilon) * np.eye(3, dtype=complex)
+
+
+def ag_tensor(wavelength_um: float) -> np.ndarray:
     omega = 2 * np.pi * c / (wavelength_um * 1e-6)
-    return AG_EPS_INF - AG_PLASMA**2 / (omega**2 + 1j * AG_GAMMA * omega)
+    epsilon = AG_EPS_INF - AG_PLASMA**2 / (omega**2 + 1j * AG_GAMMA * omega)
+    return scalar_tensor(epsilon)
 
 
 def weyl_diagonal_and_hall(wavelength_um: float) -> tuple[complex, complex]:
@@ -98,7 +104,7 @@ def weyl_diagonal_and_hall(wavelength_um: float) -> tuple[complex, complex]:
     epsilon_a = WEYL_B * e**2 / (2 * np.pi**2 * hbar * epsilon_0 * omega)
     omega_bar = hbar * (omega + 1j / WEYL_TAU) / EF
 
-    g_omega = complex(_fermi_difference(EF * omega_bar / 2.0))
+    g_omega = complex(fermi_difference(EF * omega_bar / 2.0))
     f1 = epsilon_0 * RS * WEYL_POINTS * EF / (6 * hbar) * omega_bar * g_omega
     f2 = 1j * epsilon_0 * RS * WEYL_POINTS * EF / (6 * np.pi * hbar)
     f3 = (1 + (np.pi**2 / 3) * (k * WEYL_TEMPERATURE / EF) ** 2) * 4.0 / omega_bar
@@ -130,8 +136,8 @@ def weyl_tensor(wavelength_um: float) -> np.ndarray:
     )
 
 
-def make_grating_layer() -> rcwa.CompiledLayer:
-    """Build and precompile the 1D Si grating layer."""
+def make_grating_layer() -> rcwa.Layer:
+    """Build the 1D Si grating layer; RCWASimulation precompiles it once."""
 
     pattern = rcwa.SampledPattern(
         period=(PERIOD, PERIOD),
@@ -140,26 +146,34 @@ def make_grating_layer() -> rcwa.CompiledLayer:
         name="Si grating",
     )
     pattern.stripes(fillFraction=SI_WIDTH / PERIOD, material=SI_EPSILON, axis="x")
-    layer = pattern.toLayer(SI_HEIGHT, factorization=FACTORIZATION)
-    return rcwa.compileLayers([layer], orders=(ORDER, 0), truncation=TRUNCATION)[0]
+    return pattern.toLayer(SI_HEIGHT, factorization=FACTORIZATION)
 
 
 def make_simulation() -> rcwa.RCWASimulation:
-    return rcwa.RCWASimulation(
+    return rcwa.buildSimulation(make_config(), make_layers())
+
+
+def make_config() -> rcwa.SimulationConfig:
+    return rcwa.SimulationConfig(
         period=(PERIOD, PERIOD),
-        layers=[
-            make_grating_layer(),
-            rcwa.homogeneousLayer(WEYL_HEIGHT, weyl_tensor, name="Weyl semimetal"),
-            rcwa.homogeneousLayer(AG_HEIGHT, ag_epsilon, name="Ag mirror"),
-        ],
         orders=(ORDER, 0),
         truncation=TRUNCATION,
         backend=BACKEND,
-        method="smatrix",
+        precision=PRECISION,
         epsIncident=1.0,
         epsTransmission=SIO2_INDEX**2,
+        precompile=True,
+        cacheModes=True,
         workers=WORKERS,
     )
+
+
+def make_layers() -> list[object]:
+    return [
+        make_grating_layer(),
+        rcwa.homogeneousLayer(WEYL_HEIGHT, weyl_tensor, name="Weyl semimetal"),
+        rcwa.homogeneousLayer(AG_HEIGHT, ag_tensor, name="Ag mirror"),
+    ]
 
 
 def structure_map() -> tuple[np.ndarray, tuple[float, float, float, float]]:
@@ -184,7 +198,7 @@ def incident_h_magnitude(theta: float) -> float:
     kx0 = np.sin(theta) * np.cos(PHI)
     ky0 = np.sin(theta) * np.sin(PHI)
     kz0 = forwardKz(1.0 - kx0**2 - ky0**2)[()]
-    s_field, _p_field = planeWaveFields(kx0, ky0, kz0, 1.0)
+    s_field, p_field = planeWaveFields(kx0, ky0, kz0, 1.0)
     hz0 = kx0 * s_field[1] - ky0 * s_field[0]
     return float(np.sqrt(np.real(np.abs(s_field[2]) ** 2 + np.abs(s_field[3]) ** 2 + np.abs(hz0) ** 2)))
 
@@ -211,7 +225,7 @@ def magnetic_field_xz(
     shape: tuple[int, int] = FIELD_SHAPE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if not result.layerSolutions:
-        raise ValueError("result does not contain layer fields; solve with returnFields=True")
+        raise ValueError("result does not contain layer fields; call solveFields() for field maps")
 
     reference = result.layerSolutions[0]
     total_thickness = sum(layer.thickness for layer in result.layerSolutions)
@@ -245,19 +259,17 @@ def magnetic_field_xz(
 def solve_magnetic_fields(
     simulation: rcwa.RCWASimulation,
 ) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    forward = simulation.solve(
+    forward = simulation.solveFields(
         TARGET_WAVELENGTH,
         theta=THETA,
         phi=PHI,
         polarization="TE",
-        returnFields=True,
     )
-    backward = simulation.solve(
+    backward = simulation.solveFields(
         TARGET_WAVELENGTH,
         theta=-THETA,
         phi=PHI,
         polarization="TE",
-        returnFields=True,
     )
     return magnetic_field_xz(forward, THETA), magnetic_field_xz(backward, -THETA)
 
@@ -372,7 +384,7 @@ def main() -> None:
     print(
         "RCWA "
         f"order={ORDER}, grid=({GRID_Y}, {GRID_X}), points={POINTS}, truncation={TRUNCATION}, "
-        f"factorization={FACTORIZATION}, backend={BACKEND}, workers={WORKERS}"
+        f"factorization={FACTORIZATION}, backend={BACKEND}, precision={PRECISION}, workers={WORKERS}"
     )
     print(
         "Wu 2024 geometry: "

@@ -20,7 +20,7 @@ class TorchLayerData:
 
 def layerDataForTorch(layer: Layer | CompiledLayer, harmonics: Harmonics, torch: Any, device: Any) -> TorchLayerData:
     if hasattr(layer, "epsilonMatrix") and hasattr(layer, "epsilonInverse"):
-        factorized = _compiledLayerDataForTorch(layer, harmonics, torch, device)
+        factorized = compiledLayerDataForTorch(layer, harmonics, torch, device)
         return TorchLayerData(
             factorized.epsilonMatrix,
             factorized.epsilonInverse,
@@ -30,16 +30,16 @@ def layerDataForTorch(layer: Layer | CompiledLayer, harmonics: Harmonics, torch:
         )
 
     epsilon = getattr(layer, "epsilon")
-    factorizationMode = _normalizeFactorization(getattr(layer, "factorization", "auto"))
+    factorizationMode = normalizeFactorization(getattr(layer, "factorization", "auto"))
     normalField = getattr(layer, "normalField", None)
     needsFullFactorization = (
-        _useAnalyticNormalVector(epsilon, factorizationMode)
+        useAnalyticNormalVector(epsilon, factorizationMode)
         or factorizationMode in ("normal-vector", "jones")
         or (factorizationMode == "auto" and normalField is not None)
-        or _shouldAutoGenerateNormalField(epsilon, factorizationMode)
+        or shouldAutoGenerateNormalField(epsilon, factorizationMode)
     )
     if needsFullFactorization:
-        factorized = _rawLayerDataForTorch(layer, harmonics, torch, device)
+        factorized = rawLayerDataForTorch(layer, harmonics, torch, device)
         return TorchLayerData(
             factorized.epsilonMatrix,
             factorized.epsilonInverse,
@@ -54,7 +54,7 @@ def layerDataForTorch(layer: Layer | CompiledLayer, harmonics: Harmonics, torch:
         epsilonInverse=None,
         displacementMatrices=None,
         homogeneousEpsilon=homogeneousEpsilon(epsilon),
-        factorization=_analyticFactorizationName(epsilon),
+        factorization=analyticFactorizationName(epsilon),
     )
 
 
@@ -67,29 +67,33 @@ def pqMatricesTorch(
     device: Any,
 ) -> tuple[Any, Any]:
     n = harmonics.count
-    identity = torch.eye(n, dtype=torch.complex128, device=device)
     kx = toTorchComplex(harmonics.kx, torch, device)
     ky = toTorchComplex(harmonics.ky, torch, device)
+    row = torch.arange(n, device=device)
 
-    p11 = kx[:, None] * epsilonInverse * ky[None, :]
-    p12 = identity - kx[:, None] * epsilonInverse * kx[None, :]
-    p21 = ky[:, None] * epsilonInverse * ky[None, :] - identity
-    p22 = -ky[:, None] * epsilonInverse * kx[None, :]
+    pMatrix = torch.empty((2 * n, 2 * n), dtype=torch.complex128, device=device)
+    pMatrix[:n, :n] = kx[:, None] * epsilonInverse * ky[None, :]
+    pMatrix[:n, n:] = -kx[:, None] * epsilonInverse * kx[None, :]
+    pMatrix[n:, :n] = ky[:, None] * epsilonInverse * ky[None, :]
+    pMatrix[n:, n:] = -ky[:, None] * epsilonInverse * kx[None, :]
+    pMatrix[row, n + row] += 1.0
+    pMatrix[n + row, row] -= 1.0
 
+    qMatrix = torch.zeros((2 * n, 2 * n), dtype=torch.complex128, device=device)
     if displacementMatrices is None:
-        cxx = epsilonMatrix
-        cxy = torch.zeros_like(epsilonMatrix)
-        cyx = torch.zeros_like(epsilonMatrix)
-        cyy = epsilonMatrix
+        qMatrix[:n, n:] = -epsilonMatrix
+        qMatrix[n:, :n] = epsilonMatrix
     else:
         cxx, cxy, cyx, cyy = displacementMatrices
+        qMatrix[:n, :n] = -cyx
+        qMatrix[:n, n:] = -cyy
+        qMatrix[n:, :n] = cxx
+        qMatrix[n:, n:] = cxy
 
-    q11 = -torch.diag(kx * ky) - cyx
-    q12 = torch.diag(kx * kx) - cyy
-    q21 = cxx - torch.diag(ky * ky)
-    q22 = cxy + torch.diag(ky * kx)
-    pMatrix = torch.cat([torch.cat([p11, p12], dim=1), torch.cat([p21, p22], dim=1)], dim=0)
-    qMatrix = torch.cat([torch.cat([q11, q12], dim=1), torch.cat([q21, q22], dim=1)], dim=0)
+    qMatrix[row, row] -= kx * ky
+    qMatrix[row, n + row] += kx * kx
+    qMatrix[n + row, row] -= ky * ky
+    qMatrix[n + row, n + row] += ky * kx
     return pMatrix, qMatrix
 
 
@@ -116,7 +120,7 @@ def homogeneousEpsilon(epsilon: object) -> complex | None:
     return None
 
 
-def _compiledLayerDataForTorch(
+def compiledLayerDataForTorch(
     layer: Layer | CompiledLayer,
     harmonics: Harmonics,
     torch: Any,
@@ -141,23 +145,23 @@ def _compiledLayerDataForTorch(
     )
 
 
-def _rawLayerDataForTorch(layer: Layer, harmonics: Harmonics, torch: Any, device: Any) -> TorchLayerData:
+def rawLayerDataForTorch(layer: Layer, harmonics: Harmonics, torch: Any, device: Any) -> TorchLayerData:
     epsilon = getattr(layer, "epsilon")
     epsilonMatrix = epsilonConvolutionMatrixTorch(epsilon, harmonics, torch, device)
     epsilonInverse = solveIdentityTorch(epsilonMatrix, torch, device)
-    factorizationMode = _normalizeFactorization(getattr(layer, "factorization", "auto"))
+    factorizationMode = normalizeFactorization(getattr(layer, "factorization", "auto"))
     normalField = getattr(layer, "normalField", None)
     displacementMatrices: tuple[Any, Any, Any, Any] | None = None
-    factorization = _analyticFactorizationName(epsilon)
+    factorization = analyticFactorizationName(epsilon)
 
-    if normalField is None and _shouldAutoGenerateNormalField(epsilon, factorizationMode):
-        normalField = _estimateNormalFieldTorch(epsilon, torch, device)
+    if normalField is None and shouldAutoGenerateNormalField(epsilon, factorizationMode):
+        normalField = estimateNormalFieldTorch(epsilon, torch, device)
 
-    if _useAnalyticNormalVector(epsilon, factorizationMode):
-        displacementMatrices = _analyticNormalVectorDisplacementMatricesTorch(epsilon, harmonics, torch, device)
+    if useAnalyticNormalVector(epsilon, factorizationMode):
+        displacementMatrices = analyticNormalVectorDisplacementMatricesTorch(epsilon, harmonics, torch, device)
         factorization = "analytic-normal-vector-li"
     elif normalField is not None and factorizationMode in ("auto", "normal-vector", "jones"):
-        displacementMatrices = _normalVectorDisplacementMatricesTorch(epsilon, normalField, harmonics, torch, device)
+        displacementMatrices = normalVectorDisplacementMatricesTorch(epsilon, normalField, harmonics, torch, device)
         factorization = "normal-vector-li"
     elif factorizationMode in ("normal-vector", "jones"):
         raise ValueError("normal-vector factorization requires a normalField or an analytic shape with normal vectors")
@@ -171,7 +175,7 @@ def _rawLayerDataForTorch(layer: Layer, harmonics: Harmonics, torch: Any, device
     )
 
 
-def _normalizeFactorization(value: str) -> str:
+def normalizeFactorization(value: str) -> str:
     normalized = str(value).lower().replace("_", "-")
     aliases = {
         "auto": "auto",
@@ -189,13 +193,13 @@ def _normalizeFactorization(value: str) -> str:
     return aliases[normalized]
 
 
-def _analyticFactorizationName(epsilon: object) -> str:
+def analyticFactorizationName(epsilon: object) -> str:
     if hasattr(epsilon, "convolutionMatrix"):
         return "analytic-li"
     return "standard"
 
 
-def _useAnalyticNormalVector(epsilon: object, factorizationMode: str) -> bool:
+def useAnalyticNormalVector(epsilon: object, factorizationMode: str) -> bool:
     return bool(
         hasattr(epsilon, "normalVectorMatrices")
         and hasattr(epsilon, "reciprocalConvolutionMatrix")
@@ -206,7 +210,7 @@ def _useAnalyticNormalVector(epsilon: object, factorizationMode: str) -> bool:
     )
 
 
-def _shouldAutoGenerateNormalField(epsilon: object, factorizationMode: str) -> bool:
+def shouldAutoGenerateNormalField(epsilon: object, factorizationMode: str) -> bool:
     if factorizationMode not in ("auto", "normal-vector", "jones"):
         return False
     if hasattr(epsilon, "convolutionMatrix") or np.isscalar(epsilon):
@@ -215,11 +219,11 @@ def _shouldAutoGenerateNormalField(epsilon: object, factorizationMode: str) -> b
     if array.ndim != 2 or array.shape == (3, 3):
         return False
     if factorizationMode == "auto":
-        return _looksPiecewiseConstant(array)
+        return looksPiecewiseConstant(array)
     return True
 
 
-def _looksPiecewiseConstant(values: object) -> bool:
+def looksPiecewiseConstant(values: object) -> bool:
     grid = np.asarray(values)
     if grid.ndim != 2 or grid.size == 0:
         return False
@@ -233,7 +237,7 @@ def _looksPiecewiseConstant(values: object) -> bool:
     return 1 < uniqueCount <= max(16, grid.size // 4)
 
 
-def _estimateNormalFieldTorch(values: object, torch: Any, device: Any) -> Any:
+def estimateNormalFieldTorch(values: object, torch: Any, device: Any) -> Any:
     grid = toTorchComplex(values, torch, device)
     if grid.ndim != 2:
         raise ValueError("normal-field estimation requires a 2D scalar grid")
@@ -253,7 +257,7 @@ def _estimateNormalFieldTorch(values: object, torch: Any, device: Any) -> Any:
     return normals
 
 
-def _analyticNormalVectorDisplacementMatricesTorch(
+def analyticNormalVectorDisplacementMatricesTorch(
     epsilon: object,
     harmonics: Harmonics,
     torch: Any,
@@ -269,10 +273,10 @@ def _analyticNormalVectorDisplacementMatricesTorch(
         nx, ny, tx, ty = epsilon.normalVectorMatricesTorch(harmonics, torch, device)
     else:
         nx, ny, tx, ty = tuple(toTorchComplex(matrix, torch, device) for matrix in epsilon.normalVectorMatrices(harmonics))
-    return _normalVectorBlocks(direct, inverseRule, nx, ny, tx, ty)
+    return normalVectorBlocks(direct, inverseRule, nx, ny, tx, ty)
 
 
-def _normalVectorDisplacementMatricesTorch(
+def normalVectorDisplacementMatricesTorch(
     epsilon: object,
     normalField: object,
     harmonics: Harmonics,
@@ -280,7 +284,7 @@ def _normalVectorDisplacementMatricesTorch(
     device: Any,
 ) -> tuple[Any, Any, Any, Any]:
     grid = toTorchComplex(epsilon, torch, device)
-    normals = _toTorchReal(normalField, torch, device)
+    normals = toTorchReal(normalField, torch, device)
     if grid.ndim != 2:
         raise ValueError("normal-vector factorization requires a 2D scalar epsilon grid")
     if tuple(normals.shape) != tuple(grid.shape) + (2,):
@@ -301,10 +305,10 @@ def _normalVectorDisplacementMatricesTorch(
     ny = epsilonConvolutionMatrixTorch(normalY, harmonics, torch, device)
     tx = epsilonConvolutionMatrixTorch(tangentX, harmonics, torch, device)
     ty = epsilonConvolutionMatrixTorch(tangentY, harmonics, torch, device)
-    return _normalVectorBlocks(direct, inverseRule, nx, ny, tx, ty)
+    return normalVectorBlocks(direct, inverseRule, nx, ny, tx, ty)
 
 
-def _normalVectorBlocks(
+def normalVectorBlocks(
     direct: Any,
     inverseRule: Any,
     nx: Any,
@@ -319,7 +323,7 @@ def _normalVectorBlocks(
     return cxx, cxy, cyx, cyy
 
 
-def _toTorchReal(value: object, torch: Any, device: Any) -> Any:
+def toTorchReal(value: object, torch: Any, device: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.to(device=device, dtype=torch.float64)
     return torch.as_tensor(np.asarray(value), dtype=torch.float64, device=device)

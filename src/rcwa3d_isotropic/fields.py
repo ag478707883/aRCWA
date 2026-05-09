@@ -80,7 +80,7 @@ def layerFourierFields(layerSolution: LayerFieldSolution, z: float) -> dict[str,
     ey = values[n : 2 * n]
     hx = values[2 * n : 3 * n]
     hy = values[3 * n :]
-    return _completeFourierFields(
+    return completeFourierFields(
         ex=ex,
         ey=ey,
         hx=hx,
@@ -122,7 +122,7 @@ def homogeneousFourierFields(
         ey[index] = field[1]
         hx[index] = field[2]
         hy[index] = field[3]
-    return _completeFourierFields(ex=ex, ey=ey, hx=hx, hy=hy, kx=kx, ky=ky, epsilon=epsilon)
+    return completeFourierFields(ex=ex, ey=ey, hx=hx, hy=hy, kx=kx, ky=ky, epsilon=epsilon)
 
 
 def fieldSliceXy(
@@ -138,11 +138,11 @@ def fieldSliceXy(
     such as ``EMagnitude`` / ``HIntensity``.
     """
 
-    layer = _resultLayer(result, layerIndex)
+    layer = resultLayer(result, layerIndex)
     fourierFields = layerFourierFields(layer, z)
-    maps = _fieldMapsXy(layer, fourierFields, shape)
-    _addIncidentNormalizedIntensities(maps, result)
-    return maps["x"], maps["y"], _selectComponent(maps, component)
+    maps = fieldMapsXy(layer, fourierFields, shape)
+    addIncidentNormalizedIntensities(maps, result)
+    return maps["x"], maps["y"], selectComponent(maps, component)
 
 
 def fieldComponentsXy(
@@ -153,9 +153,9 @@ def fieldComponentsXy(
 ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     """Return all six field components and intensities on an x/y plane."""
 
-    layer = _resultLayer(result, layerIndex)
-    maps = _fieldMapsXy(layer, layerFourierFields(layer, z), shape)
-    _addIncidentNormalizedIntensities(maps, result)
+    layer = resultLayer(result, layerIndex)
+    maps = fieldMapsXy(layer, layerFourierFields(layer, z), shape)
+    addIncidentNormalizedIntensities(maps, result)
     x = maps.pop("x")
     y = maps.pop("y")
     return x, y, maps
@@ -185,7 +185,7 @@ def stackFieldSliceXy(
         ySpan=ySpan,
         shape=shape,
     )
-    return x, y, _selectComponent(maps, component)
+    return x, y, selectComponent(maps, component)
 
 
 def stackFieldComponentsXy(
@@ -211,8 +211,8 @@ def stackFieldComponentsXy(
     xValues = np.linspace(float(xSpan[0]), float(xSpan[1]), nx)
     yValues = np.linspace(float(ySpan[0]), float(ySpan[1]), ny)
     xx, yy = np.meshgrid(xValues, yValues)
-    totalThickness, layerStarts, layerEnds = _stackLayerBounds(result)
-    fourierFields = _stackFourierFieldsAtZ(result, reference, layerStarts, layerEnds, totalThickness, float(z))
+    totalThickness, layerStarts, layerEnds = stackLayerBounds(result)
+    fourierFields = stackFourierFieldsAtZ(result, reference, layerStarts, layerEnds, totalThickness, float(z))
 
     maps = {
         component: reconstructFourierGrid(
@@ -227,8 +227,8 @@ def stackFieldComponentsXy(
     }
     maps["x"] = xx
     maps["y"] = yy
-    _addIntensities(maps)
-    _addIncidentNormalizedIntensities(maps, result)
+    addIntensities(maps)
+    addIncidentNormalizedIntensities(maps, result)
     x = maps.pop("x")
     y = maps.pop("y")
     return x, y, maps
@@ -243,10 +243,10 @@ def fieldSliceXz(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct one x/z field map inside a finite layer."""
 
-    layer = _resultLayer(result, layerIndex)
-    maps = _fieldMapsXz(layer, y, shape)
-    _addIncidentNormalizedIntensities(maps, result)
-    return maps["x"], maps["z"], _selectComponent(maps, component)
+    layer = resultLayer(result, layerIndex)
+    maps = fieldMapsXz(layer, y, shape)
+    addIncidentNormalizedIntensities(maps, result)
+    return maps["x"], maps["z"], selectComponent(maps, component)
 
 
 def fieldComponentsXz(
@@ -257,9 +257,9 @@ def fieldComponentsXz(
 ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     """Return all six field components and intensities inside a finite layer."""
 
-    layer = _resultLayer(result, layerIndex)
-    maps = _fieldMapsXz(layer, y, shape)
-    _addIncidentNormalizedIntensities(maps, result)
+    layer = resultLayer(result, layerIndex)
+    maps = fieldMapsXz(layer, y, shape)
+    addIncidentNormalizedIntensities(maps, result)
     x = maps.pop("x")
     z = maps.pop("z")
     return x, z, maps
@@ -293,7 +293,7 @@ def stackFieldSliceXz(
         zPadding=zPadding,
         shape=shape,
     )
-    return x, z, _selectComponent(maps, component)
+    return x, z, selectComponent(maps, component)
 
 
 def stackFieldComponentsXz(
@@ -310,12 +310,12 @@ def stackFieldComponentsXz(
     if not result.layerSolutions:
         raise ValueError("result does not contain layer fields; solve with returnFields=True")
     reference = result.layerSolutions[0]
-    periodX, _periodY = reference.period
+    periodX, periodY = reference.period
     totalThickness = float(sum(layer.thickness for layer in result.layerSolutions))
     if xSpan is None:
         xSpan = (-periodX / 2, periodX / 2)
     if zSpan is None:
-        before, after = _normalizePadding(zPadding, reference.wavelength)
+        before, after = normalizePadding(zPadding, reference.wavelength)
         zSpan = (-before, totalThickness + after)
 
     nz, nx = shape
@@ -324,10 +324,10 @@ def stackFieldComponentsXz(
     xx, zz = np.meshgrid(xValues, zValues)
     maps = {component: np.zeros_like(xx, dtype=complex) for component in FIELD_COMPONENTS}
 
-    totalThickness, layerStarts, layerEnds = _stackLayerBounds(result)
+    totalThickness, layerStarts, layerEnds = stackLayerBounds(result)
 
     for row, zValue in enumerate(zValues):
-        fourierFields = _stackFourierFieldsAtZ(
+        fourierFields = stackFourierFieldsAtZ(
             result,
             reference,
             layerStarts,
@@ -348,8 +348,8 @@ def stackFieldComponentsXz(
 
     maps["x"] = xx
     maps["z"] = zz
-    _addIntensities(maps)
-    _addIncidentNormalizedIntensities(maps, result)
+    addIntensities(maps)
+    addIncidentNormalizedIntensities(maps, result)
     x = maps.pop("x")
     z = maps.pop("z")
     return x, z, maps
@@ -377,7 +377,7 @@ def incidentFieldIntensities(result: RCWAResult) -> dict[str, float]:
     kz = forwardKz(result.epsIncident - kx**2 - ky**2)
     sField, pField = planeWaveFields(kx[0], ky[0], kz[0], result.epsIncident)
     tangential = result.sAmplitude * sField + result.pAmplitude * pField
-    fields = _completeFourierFields(
+    fields = completeFourierFields(
         ex=np.asarray([tangential[0]], dtype=complex),
         ey=np.asarray([tangential[1]], dtype=complex),
         hx=np.asarray([tangential[2]], dtype=complex),
@@ -391,7 +391,7 @@ def incidentFieldIntensities(result: RCWAResult) -> dict[str, float]:
     return {"EIntensity": electric, "HIntensity": magnetic}
 
 
-def _completeFourierFields(
+def completeFourierFields(
     *,
     ex: np.ndarray,
     ey: np.ndarray,
@@ -413,7 +413,7 @@ def _completeFourierFields(
     return {"Ex": ex, "Ey": ey, "Ez": ez, "Hx": hx, "Hy": hy, "Hz": hz}
 
 
-def _fieldMapsXy(
+def fieldMapsXy(
     layer: LayerFieldSolution,
     fourierFields: dict[str, np.ndarray],
     shape: tuple[int, int],
@@ -430,13 +430,13 @@ def _fieldMapsXy(
             period=layer.period,
             shape=shape,
         )
-    _addIntensities(maps)
+    addIntensities(maps)
     return maps
 
 
-def _fieldMapsXz(layer: LayerFieldSolution, y: float, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+def fieldMapsXz(layer: LayerFieldSolution, y: float, shape: tuple[int, int]) -> dict[str, np.ndarray]:
     nz, nx = shape
-    periodX, _periodY = layer.period
+    periodX, periodY = layer.period
     x = np.linspace(-periodX / 2, periodX / 2, nx)
     zValues = np.linspace(0.0, layer.thickness, nz)
     xx, zz = np.meshgrid(x, zValues)
@@ -449,11 +449,11 @@ def _fieldMapsXz(layer: LayerFieldSolution, y: float, shape: tuple[int, int]) ->
             maps[component][row, :] = np.sum(fourierFields[component][:, None] * lateralPhase, axis=0)
     maps["x"] = xx
     maps["z"] = zz
-    _addIntensities(maps)
+    addIntensities(maps)
     return maps
 
 
-def _addIntensities(maps: dict[str, np.ndarray]) -> None:
+def addIntensities(maps: dict[str, np.ndarray]) -> None:
     maps["EIntensity"] = np.maximum(
         np.real(
             np.abs(maps["Ex"]) ** 2 + np.abs(maps["Ey"]) ** 2 + np.abs(maps["Ez"]) ** 2
@@ -468,18 +468,18 @@ def _addIntensities(maps: dict[str, np.ndarray]) -> None:
     )
     maps["EMagnitude"] = np.sqrt(maps["EIntensity"])
     maps["HMagnitude"] = np.sqrt(maps["HIntensity"])
-    maps["ESelfNormalizedMagnitude"] = _normalizeByOwnMaximum(maps["EMagnitude"])
-    maps["HSelfNormalizedMagnitude"] = _normalizeByOwnMaximum(maps["HMagnitude"])
+    maps["ESelfNormalizedMagnitude"] = normalizeByOwnMaximum(maps["EMagnitude"])
+    maps["HSelfNormalizedMagnitude"] = normalizeByOwnMaximum(maps["HMagnitude"])
 
 
-def _normalizeByOwnMaximum(values: np.ndarray) -> np.ndarray:
+def normalizeByOwnMaximum(values: np.ndarray) -> np.ndarray:
     scale = float(np.max(np.asarray(values, dtype=float))) if values.size else 0.0
     if not np.isfinite(scale) or scale <= 0.0:
         return np.zeros_like(values, dtype=float)
     return np.asarray(values, dtype=float) / scale
 
 
-def _addIncidentNormalizedIntensities(maps: dict[str, np.ndarray], result: RCWAResult) -> None:
+def addIncidentNormalizedIntensities(maps: dict[str, np.ndarray], result: RCWAResult) -> None:
     incident = incidentFieldIntensities(result)
     electric = max(float(incident["EIntensity"]), 1e-300)
     magnetic = max(float(incident["HIntensity"]), 1e-300)
@@ -489,7 +489,7 @@ def _addIncidentNormalizedIntensities(maps: dict[str, np.ndarray], result: RCWAR
     maps["HNormalizedMagnitude"] = maps["HMagnitude"] / np.sqrt(magnetic)
 
 
-def _selectComponent(maps: dict[str, np.ndarray], component: str) -> np.ndarray:
+def selectComponent(maps: dict[str, np.ndarray], component: str) -> np.ndarray:
     normalized = "".join(character for character in component.lower() if character.isalnum())
     aliases = {
         "ex": "Ex",
@@ -565,13 +565,13 @@ def _selectComponent(maps: dict[str, np.ndarray], component: str) -> np.ndarray:
     return maps[key]
 
 
-def _resultLayer(result: RCWAResult, layerIndex: int) -> LayerFieldSolution:
+def resultLayer(result: RCWAResult, layerIndex: int) -> LayerFieldSolution:
     if not result.layerSolutions:
         raise ValueError("result does not contain layer fields; call RCWASimulation.solve(..., returnFields=True)")
     return result.layerSolutions[layerIndex]
 
 
-def _incidentAmplitudeArrays(result: RCWAResult, layer: LayerFieldSolution) -> tuple[np.ndarray, np.ndarray]:
+def incidentAmplitudeArrays(result: RCWAResult, layer: LayerFieldSolution) -> tuple[np.ndarray, np.ndarray]:
     s = np.zeros(layer.mx.size, dtype=complex)
     p = np.zeros(layer.mx.size, dtype=complex)
     zero = np.where((layer.mx == 0) & (layer.my == 0))[0]
@@ -582,13 +582,13 @@ def _incidentAmplitudeArrays(result: RCWAResult, layer: LayerFieldSolution) -> t
     return s, p
 
 
-def _stackLayerBounds(result: RCWAResult) -> tuple[float, np.ndarray, np.ndarray]:
+def stackLayerBounds(result: RCWAResult) -> tuple[float, np.ndarray, np.ndarray]:
     layerStarts = np.concatenate([[0.0], np.cumsum([layer.thickness for layer in result.layerSolutions[:-1]])])
     layerEnds = np.cumsum([layer.thickness for layer in result.layerSolutions])
     return float(layerEnds[-1]), layerStarts, layerEnds
 
 
-def _stackFourierFieldsAtZ(
+def stackFourierFieldsAtZ(
     result: RCWAResult,
     reference: LayerFieldSolution,
     layerStarts: np.ndarray,
@@ -600,7 +600,7 @@ def _stackFourierFieldsAtZ(
     ky = reference.ky
     if z < 0.0:
         kzIncident = forwardKz(result.epsIncident - kx**2 - ky**2)
-        incidentS, incidentP = _incidentAmplitudeArrays(result, reference)
+        incidentS, incidentP = incidentAmplitudeArrays(result, reference)
         incident = homogeneousFourierFields(
             kx,
             ky,
@@ -635,12 +635,12 @@ def _stackFourierFieldsAtZ(
             reference.wavelength,
         )
 
-    layerIndex = _layerIndexForZ(z, layerEnds)
+    layerIndex = layerIndexForZ(z, layerEnds)
     localZ = float(z - layerStarts[layerIndex])
     return layerFourierFields(result.layerSolutions[layerIndex], localZ)
 
 
-def _normalizePadding(
+def normalizePadding(
     zPadding: float | tuple[float, float] | None,
     wavelength: float,
 ) -> tuple[float, float]:
@@ -653,6 +653,6 @@ def _normalizePadding(
     return float(zPadding[0]), float(zPadding[1])
 
 
-def _layerIndexForZ(z: float, layerEnds: np.ndarray) -> int:
+def layerIndexForZ(z: float, layerEnds: np.ndarray) -> int:
     index = int(np.searchsorted(layerEnds, z, side="right"))
     return min(index, layerEnds.size - 1)

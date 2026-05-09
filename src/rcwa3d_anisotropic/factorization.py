@@ -1,29 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Union
+from typing import Mapping
 
 import numpy as np
 from numpy.typing import ArrayLike
 
-from .analytic import (
-    AnalyticDisk,
-    AnalyticRectangle,
-    analyticDiskConvolution,
-    analyticDiskJonesMatrices,
-    analyticRectangleConvolution,
-    analyticRectangleJonesMatrices,
-)
-from .fourier import Harmonics, epsilonConvolutionMatrix
+from .fourier import Harmonics, epsilonConvolutionMatrix, epsilonConvolutionMatrices
 
 
 ComplexArray = np.ndarray
 TensorLike = object
-AnalyticShape = Union[AnalyticDisk, AnalyticRectangle]
-_ANALYTIC_SHAPES = (AnalyticDisk, AnalyticRectangle)
 
-_AXIS = {"x": 0, "y": 1, "z": 2}
-_COMPONENT_NAMES = {
+AXIS = {"x": 0, "y": 1, "z": 2}
+COMPONENT_NAMES = {
     "xx": (0, 0),
     "xy": (0, 1),
     "xz": (0, 2),
@@ -96,199 +86,95 @@ def tensorConvolutionData(
       off-diagonal terms are zero; diagonal terms must be supplied.
     """
 
-    factorizationMode = _normalizeFactorization(factorization)
-    constantTensor = _constantTensor(epsilon)
-    if isinstance(epsilon, _ANALYTIC_SHAPES):
-        components, factorization = _analyticShapeTensorMatrices(epsilon, harmonics)
-    elif _isScalarGrid(epsilon):
-        if normalField is None and _shouldAutoGenerateNormalField(epsilon, factorizationMode):
-            normalField = _estimateNormalField(epsilon, harmonics.orders, harmonics.truncation)
+    factorizationMode = normalizeFactorization(factorization)
+    constantTensorValue = constantTensor(epsilon)
+    if isScalarGrid(epsilon):
+        if normalField is None and shouldAutoGenerateNormalField(epsilon, factorizationMode):
+            normalField = estimateNormalField(epsilon, harmonics.orders, harmonics.truncation)
         if normalField is not None:
-            components = _normalVectorScalarTensorMatrices(epsilon, normalField, harmonics)
+            components = normalVectorScalarTensorMatrices(epsilon, normalField, harmonics)
             factorization = "normal-vector-li"
-        elif factorizationMode in ("normal-vector", "jones"):
+        elif factorizationMode == "normal-vector":
             raise ValueError("vector factorization requires a scalar epsilon grid with material contrast")
         else:
-            components = _tensorComponentMatrices(epsilon, harmonics)
+            components = tensorComponentMatrices(epsilon, harmonics)
             factorization = "z-li"
     elif normalField is not None:
         raise ValueError("normal-vector factorization requires a scalar 2D epsilon grid")
     else:
-        components = _tensorComponentMatrices(epsilon, harmonics)
+        components = tensorComponentMatrices(epsilon, harmonics)
         factorization = "z-li"
     try:
-        etaZz = _solveIdentity(components[2][2])
+        etaZz = solveIdentity(components[2][2])
     except np.linalg.LinAlgError as exc:
         raise ValueError("epsilon_zz convolution matrix is singular; Li inverse factorization failed") from exc
     return TensorConvolutionData(
         components=components,
         etaZz=etaZz,
-        constantTensor=constantTensor if factorization == "z-li" else None,
+        constantTensor=constantTensorValue if factorization == "z-li" else None,
         factorization=factorization,
     )
 
 
-def constantTensor(epsilon: TensorLike) -> ComplexArray | None:
-    """Return a homogeneous 3x3 tensor for scalar/constant tensor inputs."""
-
-    return _constantTensor(epsilon)
-
-
-def liFactorizedSystemMatrix(data: TensorConvolutionData, harmonics: Harmonics) -> ComplexArray:
-    """Build the full 4N x 4N first-order Maxwell matrix for tensor epsilon.
-
-    The state vector is ``[Ex, Ey, Hx, Hy]`` and modes satisfy
-    ``d f / d(k0 z) = i A f``.  Ez is eliminated through
-    ``Dz = Ky Hx - Kx Hy`` using ``[epsilon_zz]^-1``.  This gives the Li
-    inverse-rule Schur-complement blocks for all xz/zx tensor couplings.
-    """
-
-    n = harmonics.count
-    identity = np.eye(n, dtype=complex)
-    diagonal = np.arange(n)
-    kx = harmonics.kx
-    ky = harmonics.ky
-    c = data.components
-    eta = data.etaZz
-
-    cxx, cxy, cxz = c[0]
-    cyx, cyy, cyz = c[1]
-    czx, czy, _czz = c[2]
-
-    cxzEta = cxz @ eta
-    cyzEta = cyz @ eta
-    etaCzx = eta @ czx
-    etaCzy = eta @ czy
-
-    dxEx = cxx - cxzEta @ czx
-    dxEy = cxy - cxzEta @ czy
-    dxHx = cxzEta * ky[np.newaxis, :]
-    dxHy = -cxzEta * kx[np.newaxis, :]
-
-    dyEx = cyx - cyzEta @ czx
-    dyEy = cyy - cyzEta @ czy
-    dyHx = cyzEta * ky[np.newaxis, :]
-    dyHy = -cyzEta * kx[np.newaxis, :]
-
-    a11 = -kx[:, np.newaxis] * etaCzx
-    a12 = -kx[:, np.newaxis] * etaCzy
-    a13 = kx[:, np.newaxis] * eta * ky[np.newaxis, :]
-    a14 = identity - kx[:, np.newaxis] * eta * kx[np.newaxis, :]
-
-    a21 = -ky[:, np.newaxis] * etaCzx
-    a22 = -ky[:, np.newaxis] * etaCzy
-    a23 = ky[:, np.newaxis] * eta * ky[np.newaxis, :] - identity
-    a24 = -ky[:, np.newaxis] * eta * kx[np.newaxis, :]
-
-    a31 = -dyEx.copy()
-    a31[diagonal, diagonal] -= kx * ky
-    a32 = -dyEy.copy()
-    a32[diagonal, diagonal] += kx * kx
-    a33 = -dyHx
-    a34 = -dyHy
-
-    a41 = dxEx.copy()
-    a41[diagonal, diagonal] -= ky * ky
-    a42 = dxEy.copy()
-    a42[diagonal, diagonal] += ky * kx
-    a43 = dxHx
-    a44 = dxHy
-
-    system = np.empty((4 * n, 4 * n), dtype=complex)
-    system[0:n, 0:n] = a11
-    system[0:n, n : 2 * n] = a12
-    system[0:n, 2 * n : 3 * n] = a13
-    system[0:n, 3 * n : 4 * n] = a14
-    system[n : 2 * n, 0:n] = a21
-    system[n : 2 * n, n : 2 * n] = a22
-    system[n : 2 * n, 2 * n : 3 * n] = a23
-    system[n : 2 * n, 3 * n : 4 * n] = a24
-    system[2 * n : 3 * n, 0:n] = a31
-    system[2 * n : 3 * n, n : 2 * n] = a32
-    system[2 * n : 3 * n, 2 * n : 3 * n] = a33
-    system[2 * n : 3 * n, 3 * n : 4 * n] = a34
-    system[3 * n : 4 * n, 0:n] = a41
-    system[3 * n : 4 * n, n : 2 * n] = a42
-    system[3 * n : 4 * n, 2 * n : 3 * n] = a43
-    system[3 * n : 4 * n, 3 * n : 4 * n] = a44
-    return system
-
-
-def _tensorComponentMatrices(
+def tensorComponentMatrices(
     epsilon: TensorLike,
     harmonics: Harmonics,
 ) -> tuple[tuple[ComplexArray, ComplexArray, ComplexArray], ...]:
     if isinstance(epsilon, Mapping):
-        return _mappingTensorMatrices(epsilon, harmonics)
+        return mappingTensorMatrices(epsilon, harmonics)
 
     if np.isscalar(epsilon):
-        scalar = _convolution(epsilon, harmonics)
-        zero = _zero(harmonics.count)
-        return ((scalar, zero, zero), (zero, scalar.copy(), zero.copy()), (zero.copy(), zero.copy(), scalar.copy()))
+        scalar = convolution(epsilon, harmonics)
+        zeroMatrix = zero(harmonics.count)
+        return (
+            (scalar, zeroMatrix, zeroMatrix),
+            (zeroMatrix, scalar.copy(), zeroMatrix.copy()),
+            (zeroMatrix.copy(), zeroMatrix.copy(), scalar.copy()),
+        )
 
     array = np.asarray(epsilon, dtype=complex)
     if array.ndim == 0:
-        scalar = _convolution(array.item(), harmonics)
-        zero = _zero(harmonics.count)
-        return ((scalar, zero, zero), (zero, scalar.copy(), zero.copy()), (zero.copy(), zero.copy(), scalar.copy()))
+        scalar = convolution(array.item(), harmonics)
+        zeroMatrix = zero(harmonics.count)
+        return (
+            (scalar, zeroMatrix, zeroMatrix),
+            (zeroMatrix, scalar.copy(), zeroMatrix.copy()),
+            (zeroMatrix.copy(), zeroMatrix.copy(), scalar.copy()),
+        )
 
     if array.ndim == 2 and array.shape == (3, 3):
-        return _constantTensorMatrices(array, harmonics)
+        return constantTensorMatrices(array, harmonics)
 
     if array.ndim == 2:
-        scalar = _convolution(array, harmonics)
-        zero = _zero(harmonics.count)
-        return ((scalar, zero, zero), (zero, scalar.copy(), zero.copy()), (zero.copy(), zero.copy(), scalar.copy()))
+        scalar = convolution(array, harmonics)
+        zeroMatrix = zero(harmonics.count)
+        return (
+            (scalar, zeroMatrix, zeroMatrix),
+            (zeroMatrix, scalar.copy(), zeroMatrix.copy()),
+            (zeroMatrix.copy(), zeroMatrix.copy(), scalar.copy()),
+        )
 
     if array.ndim == 4 and array.shape[-2:] == (3, 3):
-        return tuple(
-            tuple(_convolution(array[..., row, col], harmonics) for col in range(3)) for row in range(3)
+        matrices = epsilonConvolutionMatrices(
+            tuple(array[..., row, col] for row in range(3) for col in range(3)),
+            harmonics,
         )
+        return tuple(tuple(matrices[3 * row + col] for col in range(3)) for row in range(3))
 
     if array.ndim == 4 and array.shape[:2] == (3, 3):
-        return tuple(
-            tuple(_convolution(array[row, col, ...], harmonics) for col in range(3)) for row in range(3)
+        matrices = epsilonConvolutionMatrices(
+            tuple(array[row, col, ...] for row in range(3) for col in range(3)),
+            harmonics,
         )
+        return tuple(tuple(matrices[3 * row + col] for col in range(3)) for row in range(3))
 
     raise ValueError(
         "anisotropic epsilon must be a scalar, a 2D scalar grid, a (3, 3) tensor, "
-        "a (ny, nx, 3, 3) tensor grid, an analytic shape, or a component mapping"
+        "a (ny, nx, 3, 3) tensor grid, or a component mapping"
     )
 
 
-def _analyticShapeTensorMatrices(
-    shape: AnalyticShape,
-    harmonics: Harmonics,
-) -> tuple[tuple[tuple[ComplexArray, ComplexArray, ComplexArray], ...], str]:
-    zero = _zero(harmonics.count)
-    if shape.factorization == "jones":
-        cxx, cxy, cyx, cyy, czz = _analyticJonesMatrices(shape, harmonics)
-        return ((cxx, cxy, zero.copy()), (cyx, cyy, zero.copy()), (zero.copy(), zero.copy(), czz)), "jones-li"
-
-    direct = _analyticConvolution(shape, harmonics)
-    return (
-        (direct, zero.copy(), zero.copy()),
-        (zero.copy(), direct.copy(), zero.copy()),
-        (zero.copy(), zero.copy(), direct.copy()),
-    ), "analytic-li"
-
-
-def _analyticConvolution(shape: AnalyticShape, harmonics: Harmonics) -> ComplexArray:
-    if isinstance(shape, AnalyticRectangle):
-        return analyticRectangleConvolution(shape, harmonics)
-    return analyticDiskConvolution(shape, harmonics)
-
-
-def _analyticJonesMatrices(
-    shape: AnalyticShape,
-    harmonics: Harmonics,
-) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
-    if isinstance(shape, AnalyticRectangle):
-        return analyticRectangleJonesMatrices(shape, harmonics)
-    return analyticDiskJonesMatrices(shape, harmonics)
-
-
-def _normalVectorScalarTensorMatrices(
+def normalVectorScalarTensorMatrices(
     epsilon: TensorLike,
     normalField: ArrayLike,
     harmonics: Harmonics,
@@ -309,56 +195,59 @@ def _normalVectorScalarTensorMatrices(
     tangentX = -normalY
     tangentY = normalX
 
-    nx = epsilonConvolutionMatrix(normalX, harmonics)
-    ny = epsilonConvolutionMatrix(normalY, harmonics)
-    tx = epsilonConvolutionMatrix(tangentX, harmonics)
-    ty = epsilonConvolutionMatrix(tangentY, harmonics)
+    nx, ny, tx, ty, direct, reciprocal = epsilonConvolutionMatrices(
+        (normalX, normalY, tangentX, tangentY, grid, 1.0 / grid),
+        harmonics,
+    )
+    inverseRule = solveIdentity(reciprocal)
+    zeroMatrix = zero(harmonics.count)
 
-    direct = epsilonConvolutionMatrix(grid, harmonics)
-    inverseRule = _solveIdentity(epsilonConvolutionMatrix(1.0 / grid, harmonics))
-    zero = _zero(harmonics.count)
+    normalMatrices = np.stack((nx, ny), axis=0)
+    tangentMatrices = np.stack((tx, ty), axis=0)
+    normalBlocks = normalMatrices[:, None, :, :] @ inverseRule @ normalMatrices[None, :, :, :]
+    tangentBlocks = tangentMatrices[:, None, :, :] @ direct @ tangentMatrices[None, :, :, :]
+    displacementBlocks = normalBlocks + tangentBlocks
+    cxx = displacementBlocks[0, 0]
+    cxy = displacementBlocks[0, 1]
+    cyx = displacementBlocks[1, 0]
+    cyy = displacementBlocks[1, 1]
+    return ((cxx, cxy, zeroMatrix.copy()), (cyx, cyy, zeroMatrix.copy()), (zeroMatrix.copy(), zeroMatrix.copy(), direct))
 
-    cxx = nx @ inverseRule @ nx + tx @ direct @ tx
-    cxy = nx @ inverseRule @ ny + tx @ direct @ ty
-    cyx = ny @ inverseRule @ nx + ty @ direct @ tx
-    cyy = ny @ inverseRule @ ny + ty @ direct @ ty
-    return ((cxx, cxy, zero.copy()), (cyx, cyy, zero.copy()), (zero.copy(), zero.copy(), direct))
 
-
-def _mappingTensorMatrices(
+def mappingTensorMatrices(
     epsilon: Mapping[object, ArrayLike | complex],
     harmonics: Harmonics,
 ) -> tuple[tuple[ComplexArray, ComplexArray, ComplexArray], ...]:
     n = harmonics.count
-    components: list[list[ComplexArray | None]] = [[None for _ in range(3)] for _ in range(3)]
+    components: list[list[ComplexArray | None]] = [[None for ignored in range(3)] for ignored in range(3)]
     for key, value in epsilon.items():
-        row, col = _componentIndex(key)
-        components[row][col] = _convolution(value, harmonics)
+        row, col = componentIndex(key)
+        components[row][col] = convolution(value, harmonics)
 
     for index, name in enumerate(("xx", "yy", "zz")):
         if components[index][index] is None:
             raise ValueError(f"component mapping epsilon is missing required diagonal component '{name}'")
 
-    zero = _zero(n)
+    zeroMatrix = zero(n)
     return tuple(
-        tuple(components[row][col] if components[row][col] is not None else zero.copy() for col in range(3))
+        tuple(components[row][col] if components[row][col] is not None else zeroMatrix.copy() for col in range(3))
         for row in range(3)
     )
 
 
-def _componentIndex(key: object) -> tuple[int, int]:
+def componentIndex(key: object) -> tuple[int, int]:
     if isinstance(key, str):
         normalized = key.lower().replace("epsilon", "").replace("eps", "").replace("_", "").replace("-", "")
-        if normalized in _COMPONENT_NAMES:
-            return _COMPONENT_NAMES[normalized]
-        if len(normalized) == 2 and normalized[0] in _AXIS and normalized[1] in _AXIS:
-            return _AXIS[normalized[0]], _AXIS[normalized[1]]
+        if normalized in COMPONENT_NAMES:
+            return COMPONENT_NAMES[normalized]
+        if len(normalized) == 2 and normalized[0] in AXIS and normalized[1] in AXIS:
+            return AXIS[normalized[0]], AXIS[normalized[1]]
     if isinstance(key, tuple) and len(key) == 2:
         row, col = key
         if isinstance(row, str):
-            row = _AXIS[row.lower()]
+            row = AXIS[row.lower()]
         if isinstance(col, str):
-            col = _AXIS[col.lower()]
+            col = AXIS[col.lower()]
         row = int(row)
         col = int(col)
         if 0 <= row < 3 and 0 <= col < 3:
@@ -366,9 +255,7 @@ def _componentIndex(key: object) -> tuple[int, int]:
     raise ValueError(f"unknown tensor component key {key!r}")
 
 
-def _constantTensor(epsilon: TensorLike) -> ComplexArray | None:
-    if isinstance(epsilon, _ANALYTIC_SHAPES):
-        return None
+def constantTensor(epsilon: TensorLike) -> ComplexArray | None:
     if isinstance(epsilon, Mapping):
         tensor = np.zeros((3, 3), dtype=complex)
         present = np.zeros((3, 3), dtype=bool)
@@ -376,7 +263,7 @@ def _constantTensor(epsilon: TensorLike) -> ComplexArray | None:
             array = np.asarray(value, dtype=complex)
             if array.ndim != 0:
                 return None
-            row, col = _componentIndex(key)
+            row, col = componentIndex(key)
             tensor[row, col] = complex(array.item())
             present[row, col] = True
         if not (present[0, 0] and present[1, 1] and present[2, 2]):
@@ -394,14 +281,14 @@ def _constantTensor(epsilon: TensorLike) -> ComplexArray | None:
     return None
 
 
-def _isScalarGrid(epsilon: TensorLike) -> bool:
-    if isinstance(epsilon, _ANALYTIC_SHAPES) or isinstance(epsilon, Mapping) or np.isscalar(epsilon):
+def isScalarGrid(epsilon: TensorLike) -> bool:
+    if isinstance(epsilon, Mapping) or np.isscalar(epsilon):
         return False
     array = np.asarray(epsilon)
     return bool(array.ndim == 2 and array.shape != (3, 3))
 
 
-def _normalizeFactorization(value: str) -> str:
+def normalizeFactorization(value: str) -> str:
     normalized = str(value).lower().replace("_", "-")
     aliases = {
         "auto": "auto",
@@ -411,25 +298,23 @@ def _normalizeFactorization(value: str) -> str:
         "normal-vector": "normal-vector",
         "normal-vector-li": "normal-vector",
         "nv": "normal-vector",
-        "jones": "jones",
-        "jones-li": "jones",
     }
     if normalized not in aliases:
-        raise ValueError("factorization must be 'auto', 'standard', 'normal-vector', or 'jones'")
+        raise ValueError("factorization must be 'auto', 'standard', or 'normal-vector'")
     return aliases[normalized]
 
 
-def _shouldAutoGenerateNormalField(epsilon: TensorLike, factorizationMode: str) -> bool:
-    if factorizationMode not in ("auto", "normal-vector", "jones"):
+def shouldAutoGenerateNormalField(epsilon: TensorLike, factorizationMode: str) -> bool:
+    if factorizationMode not in ("auto", "normal-vector"):
         return False
-    if not _isScalarGrid(epsilon):
+    if not isScalarGrid(epsilon):
         return False
     if factorizationMode == "auto":
-        return _looksPiecewiseConstant(epsilon)
+        return looksPiecewiseConstant(epsilon)
     return True
 
 
-def _looksPiecewiseConstant(values: ArrayLike) -> bool:
+def looksPiecewiseConstant(values: ArrayLike) -> bool:
     grid = np.asarray(values)
     if grid.ndim != 2 or grid.size == 0:
         return False
@@ -443,7 +328,7 @@ def _looksPiecewiseConstant(values: ArrayLike) -> bool:
     return 1 < uniqueCount <= max(16, grid.size // 4)
 
 
-def _estimateNormalField(
+def estimateNormalField(
     values: ArrayLike,
     orders: int | tuple[int, int] | None = None,
     truncation: str | None = None,
@@ -467,7 +352,7 @@ def _estimateNormalField(
     return normals
 
 
-def _constantTensorMatrices(
+def constantTensorMatrices(
     tensor: ComplexArray,
     harmonics: Harmonics,
 ) -> tuple[tuple[ComplexArray, ComplexArray, ComplexArray], ...]:
@@ -475,15 +360,13 @@ def _constantTensorMatrices(
     return tuple(tuple(complex(tensor[row, col]) * identity for col in range(3)) for row in range(3))
 
 
-def _convolution(value: ArrayLike | complex, harmonics: Harmonics) -> ComplexArray:
-    if isinstance(value, _ANALYTIC_SHAPES):
-        return _analyticConvolution(value, harmonics)
+def convolution(value: ArrayLike | complex, harmonics: Harmonics) -> ComplexArray:
     return epsilonConvolutionMatrix(value, harmonics)
 
 
-def _zero(size: int) -> ComplexArray:
+def zero(size: int) -> ComplexArray:
     return np.zeros((size, size), dtype=complex)
 
 
-def _solveIdentity(matrix: ComplexArray) -> ComplexArray:
+def solveIdentity(matrix: ComplexArray) -> ComplexArray:
     return np.linalg.solve(matrix, np.eye(matrix.shape[0], dtype=complex))

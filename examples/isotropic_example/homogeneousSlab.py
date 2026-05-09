@@ -59,11 +59,13 @@ print(f"epsilon slab={EPS_SLAB:.6g}")
 print(f"R = {result.reflection:.8f}")
 print(f"T = {result.transmission:.8f}")
 print(f"R + T = {result.conservation:.8f}")
+print(f"A = {result.absorption:.8f}")
+print(f"energy error = {result.energyError:.3e}")
 
 if SAVE_PLOTS:
-    labels = ["Reflection", "Transmission", "R + T"]
-    values = [result.reflection, result.transmission, result.conservation]
-    colors = ["#31A354", "#2B8CBE", "#555555"]
+    labels = ["Reflection", "Transmission", "Absorption", "R + T"]
+    values = [result.reflection, result.transmission, result.absorption, result.conservation]
+    colors = ["#31A354", "#2B8CBE", "#D73027", "#555555"]
 
     fig, ax = plt.subplots(figsize=(5.4, 4.2), dpi=160, constrained_layout=True)
     bars = ax.bar(labels, values, color=colors)

@@ -1,189 +1,62 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 import time
 from typing import Iterable, Mapping, Sequence
 import weakref
 
 import numpy as np
-from numpy.typing import ArrayLike
 
-from .backend import ArrayBackend as _ArrayBackend
-from .backend import cpuBackend as _cpuBackend
-from .backend import resolveBackend as _resolveBackend
+from .backend import ArrayBackend as ArrayBackend
+from .backend import resolveBackend as resolveBackend
 from .factorization import TensorConvolutionData
-from .factorization import constantTensor as _constantTensor
-from .factorization import layerTensorData as _layerTensorData
-from .factorization import liFactorizedSystemMatrix as _liFactorizedSystemMatrix
-from .factorization import tensorConvolutionData as _tensorConvolutionData
-from .fourier import Harmonics as _Harmonics
-from .fourier import makeHarmonics as _makeHarmonics
-from .fourier import normalizeOrders as _normalizeOrders
-from .phase import flux as _flux
-from .phase import forwardKz as _forwardKz
-from .phase import planeWaveFields as _planeWaveFields
-from .phase import putOrderField as _putOrderField
-from .phase import singleOrderVector as _singleOrderVector
+from .factorization import constantTensor as constantTensor
+from .factorization import layerTensorData as layerTensorData
+from .factorization import tensorConvolutionData as tensorConvolutionData
+from .fourier import Harmonics as Harmonics
+from .fourier import makeHarmonics as makeHarmonics
+from .fourier import normalizeOrders as normalizeOrders
+from .phase import flux as flux
+from .phase import forwardKz as forwardKz
+from .phase import planeWaveFields as planeWaveFields
+from .phase import putOrderField as putOrderField
+from .smatrix import (
+    cascadeMany,
+    matrixDiagonal,
+    patternedHomogeneousInterfaceEnabled,
+    prefixSMatrices,
+    propagationSMatrixBidirectional,
+    propagationSMatrixBidirectionalBatch,
+    redhefferStar,
+    reflectionTransmissionOnlySMatrix,
+    solveFactored,
+    solveInterfaceBlocks,
+    suffixSMatrices,
+)
+from .types import (
+    ComplexArray,
+    DiffractionOrder,
+    Layer,
+    LayerEigTiming,
+    LayerFieldSolution,
+    PreparedBatchStack,
+    PreparedStack,
+    RCWAResult,
+    StackTiming,
+    TensorLike,
+    AutomaticFastPathPlan,
+    BackendTensorConvolutionData,
+    BatchedHarmonics,
+    BatchedHomogeneousLayer,
+    CompiledLayer,
+    PatternedHomogeneousInterfaceWork,
+    SMatrix,
+)
 
 
-ComplexArray = np.ndarray
-TensorLike = object
-_CPU_BACKEND = _cpuBackend()
-_BackendTensorCacheEntry = tuple[weakref.ReferenceType[TensorConvolutionData], "_BackendTensorConvolutionData"]
-_BACKEND_TENSOR_DATA_CACHE: dict[tuple[int, str, str], _BackendTensorCacheEntry] = {}
-
-
-@dataclass(frozen=True)
-class _BackendTensorConvolutionData:
-    components: tuple[tuple[object, object, object], ...]
-    etaZz: object
-
-
-@dataclass(frozen=True)
-class Layer:
-    """One finite tensor-material layer in a z-stacked RCWA structure.
-
-    Parameters
-    ----------
-    thickness:
-        Layer thickness in the same length unit as ``wavelength`` and
-        ``period``.
-    epsilon:
-        Relative-permittivity tensor. Accepted forms are scalar/2D-grid
-        isotropic inputs, constant ``(3, 3)`` tensors, sampled
-        ``(ny, nx, 3, 3)`` tensor fields, or component mappings such as
-        ``{"xx": grid, "yy": grid, "zz": grid, "xz": grid, "zx": grid}``.
-    normalField:
-        Optional sampled in-plane normal-vector field with shape ``(ny, nx, 2)``
-        for scalar 2D gratings.  When supplied, the in-plane displacement
-        blocks use normal-vector Li factorization, while the z-normal
-        elimination remains driven by epsilon_zz.
-    factorization:
-        Requested scalar-boundary factorization path. ``"auto"`` keeps the
-        analytic-disk Jones path when available and otherwise enables the
-        vector-field Li route for sampled piecewise-constant scalar grids.
-    name:
-        Optional label used only by callers/debugging.
-    """
-
-    thickness: float
-    epsilon: TensorLike
-    normalField: ArrayLike | None = None
-    factorization: str = "auto"
-    name: str = ""
-
-
-@dataclass(frozen=True)
-class CompiledLayer:
-    """Layer with precomputed tensor Fourier convolution data."""
-
-    thickness: float
-    tensorData: TensorConvolutionData
-    orders: tuple[int, int]
-    truncation: str = "circular"
-    normalField: ArrayLike | None = None
-    factorization: str = "auto"
-    name: str = ""
-
-
-@dataclass(frozen=True)
-class _SMatrix:
-    s11: object
-    s12: object
-    s21: object
-    s22: object
-    isIdentity: bool = False
-    isPropagation: bool = False
-
-
-@dataclass(frozen=True)
-class DiffractionOrder:
-    mx: int
-    my: int
-    kx: complex
-    ky: complex
-    kzReflected: complex
-    kzTransmitted: complex
-    reflectedPower: float
-    transmittedPower: float
-    reflectedPropagating: bool
-    transmittedPropagating: bool
-
-
-@dataclass(frozen=True)
-class LayerFieldSolution:
-    name: str
-    thickness: float
-    wavelength: float
-    period: tuple[float, float]
-    orders: tuple[int, int]
-    mx: ComplexArray
-    my: ComplexArray
-    kx: ComplexArray
-    ky: ComplexArray
-    qValues: ComplexArray
-    modeMatrix: ComplexArray
-    coefficients: ComplexArray
-
-
-@dataclass(frozen=True)
-class LayerEigTiming:
-    layerIndex: int
-    name: str
-    kind: str
-    matrixShape: tuple[int, ...]
-    eigTimeSeconds: float
-
-
-@dataclass(frozen=True)
-class RCWAResult:
-    reflection: float
-    transmission: float
-    conservation: float
-    rAmplitudes: ComplexArray
-    tAmplitudes: ComplexArray
-    orders: tuple[DiffractionOrder, ...]
-    incidentFlux: float
-    solvedBy: str
-    layerSolutions: tuple[LayerFieldSolution, ...] = ()
-    layerEigTimings: tuple[LayerEigTiming, ...] = ()
-
-
-@dataclass(frozen=True)
-class PreparedStack:
-    """Reusable anisotropic S-matrix data for one wavelength/angle state."""
-
-    layers: tuple[Layer | CompiledLayer, ...]
-    wavelength: float
-    period: tuple[float, float]
-    orders: tuple[int, int]
-    epsIncident: complex
-    epsTransmission: complex
-    theta: float
-    phi: float
-    truncation: str
-    backend: str
-    harmonics: _Harmonics
-    components: tuple[_SMatrix, ...]
-    total: _SMatrix
-    layerModes: tuple[tuple[object, object], ...]
-    incidentBackward: object
-    transmissionForward: object
-    zeroIndex: int
-    layerEigTimings: tuple[LayerEigTiming, ...] = ()
-
-    @property
-    def nPorts(self) -> int:
-        return 2 * self.harmonics.count
-
-
-@dataclass(frozen=True)
-class _AutomaticFastPathPlan:
-    label: str
-    reducedOrders: tuple[int, int]
-    fullHarmonics: _Harmonics
-    keptIndices: ComplexArray
+BackendTensorCacheKey = tuple[int, str, str, str]
+BackendTensorCacheEntry = tuple[weakref.ReferenceType[TensorConvolutionData], "BackendTensorConvolutionData"]
+BACKEND_TENSOR_DATA_CACHE: dict[BackendTensorCacheKey, BackendTensorCacheEntry] = {}
 
 
 def prepareStackSMatrix(
@@ -196,91 +69,233 @@ def prepareStackSMatrix(
     theta: float = 0.0,
     phi: float = 0.0,
     truncation: str = "circular",
-    backend: str | _ArrayBackend | None = "cuda",
+    backend: str | ArrayBackend | None = "cuda",
+    precision: str = "complex128",
     fullTotal: bool = True,
     profile: bool = False,
 ) -> PreparedStack:
-    _validateInputs(wavelength, period, orders)
-    arrayBackend = _resolveBackend(backend)
+    prepareStart = time.perf_counter()
+    validateInputs(wavelength, period, orders)
+    arrayBackend = resolveBackend(backend, precision=precision)
     xp = arrayBackend.xp
 
-    harmonics = _makeHarmonics(wavelength, period, orders, epsIncident, theta, phi, truncation=truncation)
+    harmonics = makeHarmonics(wavelength, period, orders, epsIncident, theta, phi, truncation=truncation)
     nOrders = harmonics.count
     nPorts = 2 * nOrders
     k0 = 2 * np.pi / wavelength
 
-    incidentForward = arrayBackend.asarray(_homogeneousBasis(harmonics, epsIncident, direction=1))
-    incidentBackward = arrayBackend.asarray(_homogeneousBasis(harmonics, epsIncident, direction=-1))
-    transmissionForward = arrayBackend.asarray(_homogeneousBasis(harmonics, epsTransmission, direction=1))
-    transmissionBackward = arrayBackend.asarray(_homogeneousBasis(harmonics, epsTransmission, direction=-1))
+    incidentForward = arrayBackend.asarray(homogeneousBasis(harmonics, epsIncident, direction=1))
+    incidentBackward = arrayBackend.asarray(homogeneousBasis(harmonics, epsIncident, direction=-1))
+    transmissionForward = arrayBackend.asarray(homogeneousBasis(harmonics, epsTransmission, direction=1))
+    transmissionBackward = arrayBackend.asarray(homogeneousBasis(harmonics, epsTransmission, direction=-1))
 
-    profileTimings = _profileTimingsEnabled(profile)
+    profileTimings = profileTimingsEnabled(profile)
     layerModeList: list[tuple[object, object]] = []
     layerEigTimings: list[LayerEigTiming] = []
+    layerModeCache: dict[tuple[object, ...], tuple[object, object]] | None = {} if not profileTimings else None
     for layerIndex, layer in enumerate(layers):
-        modes, timing = _layerModesWithTiming(
-            layer,
-            harmonics,
-            arrayBackend,
-            layerIndex=layerIndex,
-            collectTiming=profileTimings,
-        )
+        modeCacheKey = layerModeCacheKey(layer) if layerModeCache is not None else None
+        cachedModes = layerModeCache.get(modeCacheKey) if modeCacheKey is not None else None
+        if cachedModes is None:
+            modes, timing = layerModesWithTiming(
+                layer,
+                harmonics,
+                arrayBackend,
+                layerIndex=layerIndex,
+                collectTiming=profileTimings,
+            )
+            if layerModeCache is not None and modeCacheKey is not None:
+                layerModeCache[modeCacheKey] = modes
+        else:
+            modes, timing = cachedModes, None
         layerModeList.append(modes)
         if timing is not None:
             layerEigTimings.append(timing)
     layerModes = tuple(layerModeList)
-    layerHomogeneous = tuple(_isHomogeneousLayer(layer) for layer in layers)
+    layerHomogeneous = tuple(isHomogeneousLayer(layer) for layer in layers)
     regionForward = [incidentForward]
     regionBackward = [incidentBackward]
-    for _qValues, modeMatrix in layerModes:
+    for qValues, modeMatrix in layerModes:
         regionForward.append(modeMatrix[:, :nPorts])
         regionBackward.append(modeMatrix[:, nPorts:])
     regionForward.append(transmissionForward)
     regionBackward.append(transmissionBackward)
     regionHomogeneous = (True, *layerHomogeneous, True)
 
-    interfaces = _interfaceSMatrices(
+    interfaceStart = startTimedOperation(arrayBackend) if profileTimings else None
+    interfaces = interfaceSMatrices(
         regionForward,
         regionBackward,
         regionHomogeneous,
         nOrders,
         arrayBackend,
     )
-    components: list[_SMatrix] = []
+    conditionNumbers = (
+        interfaceConditionNumbers(regionForward, regionBackward, arrayBackend) if profileTimings else ()
+    )
+    interfaceTime = finishTimedOperation(arrayBackend, interfaceStart) if interfaceStart is not None else 0.0
+    components: list[SMatrix] = []
     for regionIndex in range(len(layers) + 1):
         components.append(interfaces[regionIndex])
         if regionIndex < len(layers):
             qValues = layerModes[regionIndex][0]
             qForward = qValues[:nPorts]
             qBackward = qValues[nPorts:]
-            propagationForward = xp.diag(xp.exp(1j * qForward * k0 * layers[regionIndex].thickness))
-            propagationBackward = xp.diag(xp.exp(-1j * qBackward * k0 * layers[regionIndex].thickness))
-            components.append(_propagationSMatrixBidirectional(propagationForward, propagationBackward, arrayBackend))
+            propagationForward = xp.exp(1j * qForward * k0 * layers[regionIndex].thickness)
+            propagationBackward = xp.exp(-1j * qBackward * k0 * layers[regionIndex].thickness)
+            components.append(propagationSMatrixBidirectional(propagationForward, propagationBackward, arrayBackend))
 
     componentTuple = tuple(components)
+    cascadeStart = startTimedOperation(arrayBackend) if profileTimings else None
+    total = (
+        cascadeMany(componentTuple, nPorts, arrayBackend)
+        if fullTotal
+        else reflectionTransmissionOnlySMatrix(componentTuple, nPorts, arrayBackend)
+    )
+    cascadeTime = finishTimedOperation(arrayBackend, cascadeStart) if cascadeStart is not None else 0.0
+    stackTiming = None
+    if profileTimings:
+        stackTiming = StackTiming(
+            interfaceTimeSeconds=interfaceTime,
+            cascadeTimeSeconds=cascadeTime,
+            totalPrepareTimeSeconds=time.perf_counter() - prepareStart,
+            interfaceConditionNumbers=conditionNumbers,
+            maxInterfaceCondition=max(conditionNumbers) if conditionNumbers else None,
+            stabilityWarnings=stabilityWarnings(layerEigTimings, conditionNumbers),
+        )
     return PreparedStack(
         layers=tuple(layers),
         wavelength=float(wavelength),
         period=period,
-        orders=tuple(_normalizeOrders(orders)),
+        orders=tuple(normalizeOrders(orders)),
         epsIncident=epsIncident,
         epsTransmission=epsTransmission,
         theta=float(theta),
         phi=float(phi),
         truncation=harmonics.truncation,
         backend=arrayBackend.name,
+        precision=backendPrecisionLabel(arrayBackend),
         harmonics=harmonics,
         components=componentTuple,
-        total=(
-            _cascadeMany(componentTuple, nPorts, arrayBackend)
-            if fullTotal
-            else _reflectionTransmissionOnlySMatrix(componentTuple, nPorts, arrayBackend)
-        ),
+        total=total,
         layerModes=layerModes,
         incidentBackward=incidentBackward,
         transmissionForward=transmissionForward,
-        zeroIndex=_zeroOrderIndex(harmonics),
+        zeroIndex=zeroOrderIndex(harmonics),
         layerEigTimings=tuple(layerEigTimings),
+        stackTiming=stackTiming,
+    )
+
+
+def prepareStackSMatrixBatch(
+    layers: Sequence[Layer | CompiledLayer | BatchedHomogeneousLayer],
+    wavelengths: Sequence[float],
+    period: tuple[float, float],
+    orders: tuple[int, int],
+    epsIncident: complex = 1.0,
+    epsTransmission: complex = 1.0,
+    theta: float | Sequence[float] = 0.0,
+    phi: float | Sequence[float] = 0.0,
+    truncation: str = "circular",
+    backend: str | ArrayBackend | None = "cuda",
+    precision: str = "complex128",
+) -> PreparedBatchStack:
+    """Prepare reflection/transmission S-matrices for a wavelength batch."""
+
+    values = np.asarray(tuple(wavelengths), dtype=float)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("wavelength batch must be a non-empty one-dimensional sequence")
+    for wavelength in values:
+        validateInputs(float(wavelength), period, orders)
+    thetaValues = batchParameterValues(theta, values.size, "theta")
+    phiValues = batchParameterValues(phi, values.size, "phi")
+
+    arrayBackend = resolveBackend(backend, precision=precision)
+    if not arrayBackend.isTorch:
+        raise ValueError("batched anisotropic spectrum preparation requires the CUDA torch backend")
+
+    harmonics = makeBatchedHarmonics(
+        wavelengths=values,
+        period=period,
+        orders=orders,
+        epsIncident=epsIncident,
+        theta=thetaValues,
+        phi=phiValues,
+        truncation=truncation,
+        backend=arrayBackend,
+    )
+    validateBatchedCompiledLayers(layers, harmonics)
+    nOrders = harmonics.count
+    nPorts = 2 * nOrders
+    k0 = arrayBackend.asarray(2 * np.pi / values)
+
+    incidentForward = homogeneousBasisBatch(harmonics, epsIncident, direction=1, backend=arrayBackend)
+    incidentBackward = homogeneousBasisBatch(harmonics, epsIncident, direction=-1, backend=arrayBackend)
+    transmissionForward = homogeneousBasisBatch(harmonics, epsTransmission, direction=1, backend=arrayBackend)
+    transmissionBackward = homogeneousBasisBatch(harmonics, epsTransmission, direction=-1, backend=arrayBackend)
+
+    layerModeCache: dict[tuple[object, ...], tuple[object, object]] = {}
+    layerModeList = []
+    for layer in layers:
+        modeCacheKey = layerModeCacheKey(layer)
+        cachedModes = layerModeCache.get(modeCacheKey) if modeCacheKey is not None else None
+        if cachedModes is None:
+            cachedModes = layerModesBatch(layer, harmonics, arrayBackend)
+            if modeCacheKey is not None:
+                layerModeCache[modeCacheKey] = cachedModes
+        layerModeList.append(cachedModes)
+    layerModes = tuple(layerModeList)
+    layerHomogeneous = tuple(isHomogeneousLayer(layer) for layer in layers)
+    regionForward = [incidentForward]
+    regionBackward = [incidentBackward]
+    for qValues, modeMatrix in layerModes:
+        regionForward.append(modeMatrix[..., :, :nPorts])
+        regionBackward.append(modeMatrix[..., :, nPorts:])
+    regionForward.append(transmissionForward)
+    regionBackward.append(transmissionBackward)
+    regionHomogeneous = (True, *layerHomogeneous, True)
+
+    interfaces = interfaceSMatrices(
+        regionForward,
+        regionBackward,
+        regionHomogeneous,
+        nOrders,
+        arrayBackend,
+    )
+    components: list[SMatrix] = []
+    for regionIndex in range(len(layers) + 1):
+        components.append(interfaces[regionIndex])
+        if regionIndex < len(layers):
+            qValues = layerModes[regionIndex][0]
+            qForward = qValues[..., :nPorts]
+            qBackward = qValues[..., nPorts:]
+            propagationForward = arrayBackend.xp.exp(
+                1j * qForward * k0[:, None] * layers[regionIndex].thickness
+            )
+            propagationBackward = arrayBackend.xp.exp(
+                -1j * qBackward * k0[:, None] * layers[regionIndex].thickness
+            )
+            components.append(propagationSMatrixBidirectionalBatch(propagationForward, propagationBackward, arrayBackend))
+
+    total = reflectionTransmissionOnlySMatrix(tuple(components), nPorts, arrayBackend)
+    return PreparedBatchStack(
+        layers=tuple(layers),
+        wavelengths=values.copy(),
+        period=period,
+        orders=tuple(normalizeOrders(orders)),
+        epsIncident=epsIncident,
+        epsTransmission=epsTransmission,
+        theta=batchStoredParameter(thetaValues),
+        phi=batchStoredParameter(phiValues),
+        truncation=harmonics.truncation,
+        backend=arrayBackend.name,
+        precision=backendPrecisionLabel(arrayBackend),
+        harmonics=harmonics,
+        total=total,
+        incidentForward=incidentForward,
+        incidentBackward=incidentBackward,
+        transmissionForward=transmissionForward,
+        zeroIndex=zeroOrderIndexFromOrders(harmonics.mx, harmonics.my),
     )
 
 
@@ -290,36 +305,72 @@ def evaluatePreparedStack(
     pAmplitude: complex = 0.0,
     *,
     solvedBy: str = "smatrix",
-    returnFields: bool = False,
 ) -> RCWAResult:
-    arrayBackend = _resolveBackend(prepared.backend)
-    incident = _incidentField(
+    arrayBackend = resolveBackend(prepared.backend, precision=prepared.precision)
+    incident = incidentField(
         harmonics=prepared.harmonics,
         eps=prepared.epsIncident,
         sAmplitude=sAmplitude,
         pAmplitude=pAmplitude,
     )
-    incidentFlux = _checkedIncidentFlux(incident)
-    incidentAmplitudes = _incidentAmplitudes(prepared, sAmplitude, pAmplitude, arrayBackend)
-    rAmplitudes = prepared.total.s11 @ incidentAmplitudes
-    tAmplitudes = prepared.total.s21 @ incidentAmplitudes
+    incidentFlux = checkedIncidentFlux(incident)
+    incidentVector = incidentAmplitudes(prepared, sAmplitude, pAmplitude, arrayBackend)
+    rAmplitudes = prepared.total.s11 @ incidentVector
+    tAmplitudes = prepared.total.s21 @ incidentVector
 
-    if returnFields and prepared.layers:
-        layerSolutions = _smatrixLayerSolutions(
+    return result(
+        harmonics=prepared.harmonics,
+        epsIncident=prepared.epsIncident,
+        epsTransmission=prepared.epsTransmission,
+        reflectedBasis=arrayBackend.toNumpy(prepared.incidentBackward),
+        transmittedBasis=arrayBackend.toNumpy(prepared.transmissionForward),
+        rAmplitudes=arrayBackend.toNumpy(rAmplitudes),
+        tAmplitudes=arrayBackend.toNumpy(tAmplitudes),
+        incidentFlux=incidentFlux,
+        solvedBy=solvedBy,
+        layerSolutions=(),
+        layerEigTimings=prepared.layerEigTimings,
+        stackTiming=prepared.stackTiming,
+    )
+
+
+def evaluatePreparedFieldStack(
+    prepared: PreparedStack,
+    sAmplitude: complex = 1.0,
+    pAmplitude: complex = 0.0,
+    *,
+    solvedBy: str = "smatrix-fields",
+) -> RCWAResult:
+    """Evaluate a full prepared stack and attach finite-layer field data."""
+
+    arrayBackend = resolveBackend(prepared.backend, precision=prepared.precision)
+    incident = incidentField(
+        harmonics=prepared.harmonics,
+        eps=prepared.epsIncident,
+        sAmplitude=sAmplitude,
+        pAmplitude=pAmplitude,
+    )
+    incidentFlux = checkedIncidentFlux(incident)
+    incidentVector = incidentAmplitudes(prepared, sAmplitude, pAmplitude, arrayBackend)
+    rAmplitudes = prepared.total.s11 @ incidentVector
+    tAmplitudes = prepared.total.s21 @ incidentVector
+    layerSolutions = (
+        smatrixLayerSolutions(
             layers=prepared.layers,
             layerModes=prepared.layerModes,
             components=prepared.components,
-            incidentAmplitudes=incidentAmplitudes,
+            incidentAmplitudes=incidentVector,
             harmonics=prepared.harmonics,
             wavelength=prepared.wavelength,
             period=prepared.period,
             orders=prepared.orders,
             backend=arrayBackend,
         )
-    else:
-        layerSolutions = ()
+        if prepared.layers
+        else ()
+    )
 
-    return _result(
+    return result(
         harmonics=prepared.harmonics,
         epsIncident=prepared.epsIncident,
         epsTransmission=prepared.epsTransmission,
@@ -331,6 +382,7 @@ def evaluatePreparedStack(
         solvedBy=solvedBy,
         layerSolutions=layerSolutions,
         layerEigTimings=prepared.layerEigTimings,
+        stackTiming=prepared.stackTiming,
     )
 
 
@@ -344,9 +396,9 @@ def evaluatePreparedBatch(
     if not labels:
         return {}
 
-    arrayBackend = _resolveBackend(prepared.backend)
+    arrayBackend = resolveBackend(prepared.backend, precision=prepared.precision)
     incidentColumns = arrayBackend.asarray(
-        np.column_stack([_incidentAmplitudeVector(prepared, *excitations[label]) for label in labels])
+        np.column_stack([incidentAmplitudeVector(prepared, *excitations[label]) for label in labels])
     )
     reflected = prepared.total.s11 @ incidentColumns
     transmitted = prepared.total.s21 @ incidentColumns
@@ -359,13 +411,13 @@ def evaluatePreparedBatch(
     results: dict[str, RCWAResult] = {}
     for column, label in enumerate(labels):
         sAmplitude, pAmplitude = excitations[label]
-        incident = _incidentField(
+        incident = incidentField(
             harmonics=prepared.harmonics,
             eps=prepared.epsIncident,
             sAmplitude=sAmplitude,
             pAmplitude=pAmplitude,
         )
-        results[label] = _result(
+        results[label] = result(
             harmonics=prepared.harmonics,
             epsIncident=prepared.epsIncident,
             epsTransmission=prepared.epsTransmission,
@@ -373,10 +425,11 @@ def evaluatePreparedBatch(
             transmittedBasis=transmittedBasis,
             rAmplitudes=reflectedNumpy[:, column],
             tAmplitudes=transmittedNumpy[:, column],
-            incidentFlux=_checkedIncidentFlux(incident),
+            incidentFlux=checkedIncidentFlux(incident),
             solvedBy=solvedBy,
             layerSolutions=(),
             layerEigTimings=prepared.layerEigTimings,
+            stackTiming=prepared.stackTiming,
         )
     return results
 
@@ -389,12 +442,22 @@ def evaluatePreparedBatchPowers(
     if not labels:
         return {}
 
-    arrayBackend = _resolveBackend(prepared.backend)
+    arrayBackend = resolveBackend(prepared.backend, precision=prepared.precision)
     incidentColumns = arrayBackend.asarray(
-        np.column_stack([_incidentAmplitudeVector(prepared, *excitations[label]) for label in labels])
+        np.column_stack([incidentAmplitudeVector(prepared, *excitations[label]) for label in labels])
     )
     reflected = prepared.total.s11 @ incidentColumns
     transmitted = prepared.total.s21 @ incidentColumns
+
+    if arrayBackend.isTorch:
+        return evaluatePreparedBatchPowersOnBackend(
+            prepared,
+            labels,
+            excitations,
+            arrayBackend,
+            reflected,
+            transmitted,
+        )
 
     reflectedBasis = arrayBackend.toNumpy(prepared.incidentBackward)
     transmittedBasis = arrayBackend.toNumpy(prepared.transmissionForward)
@@ -404,15 +467,15 @@ def evaluatePreparedBatchPowers(
     powers: dict[str, tuple[float, float]] = {}
     for column, label in enumerate(labels):
         sAmplitude, pAmplitude = excitations[label]
-        incident = _incidentField(
+        incident = incidentField(
             harmonics=prepared.harmonics,
             eps=prepared.epsIncident,
             sAmplitude=sAmplitude,
             pAmplitude=pAmplitude,
         )
-        incidentFlux = _checkedIncidentFlux(incident)
-        reflectedFluxes = _homogeneousOrderFluxes(reflectedBasis, reflectedNumpy[:, column], prepared.harmonics.count)
-        transmittedFluxes = _homogeneousOrderFluxes(
+        incidentFlux = checkedIncidentFlux(incident)
+        reflectedFluxes = homogeneousOrderFluxes(reflectedBasis, reflectedNumpy[:, column], prepared.harmonics.count)
+        transmittedFluxes = homogeneousOrderFluxes(
             transmittedBasis,
             transmittedNumpy[:, column],
             prepared.harmonics.count,
@@ -423,126 +486,104 @@ def evaluatePreparedBatchPowers(
     return powers
 
 
-def solveStack(
-    layers: Sequence[Layer | CompiledLayer],
-    wavelength: float,
-    period: tuple[float, float],
-    orders: tuple[int, int],
-    epsIncident: complex = 1.0,
-    epsTransmission: complex = 1.0,
-    theta: float = 0.0,
-    phi: float = 0.0,
-    sAmplitude: complex = 1.0,
-    pAmplitude: complex = 0.0,
-    returnFields: bool = False,
-    method: str = "smatrix",
-    truncation: str = "circular",
-    backend: str | _ArrayBackend | None = "cuda",
-    profile: bool = False,
-) -> RCWAResult:
-    """Solve a 2D-periodic stack with tensor permittivity in finite layers.
-
-    The finite layers may include non-zero xz/zx tensor components.  The layer
-    eigenproblem uses the full 4N first-order Maxwell matrix with Li inverse
-    factorization through ``epsilon_zz``.  Angles are in radians. Harmonic
-    orders are ``(nx, ny)``, producing ``mx=-nx..nx`` and ``my=-ny..ny``.
-    """
-
-    _requireSMatrixMethod(method)
-    return _solveStackSMatrix(
-        layers=layers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        sAmplitude=sAmplitude,
-        pAmplitude=pAmplitude,
-        returnFields=returnFields,
-        truncation=truncation,
-        backend=backend,
-        profile=profile,
-    )
-
-
-def solveStackBatch(
-    layers: Sequence[Layer | CompiledLayer],
-    wavelength: float,
-    period: tuple[float, float],
-    orders: tuple[int, int],
+def evaluatePreparedSpectrumBatchPowers(
+    prepared: PreparedBatchStack,
     excitations: Mapping[str, tuple[complex, complex]],
-    epsIncident: complex = 1.0,
-    epsTransmission: complex = 1.0,
-    theta: float = 0.0,
-    phi: float = 0.0,
-    method: str = "smatrix",
-    truncation: str = "circular",
-    backend: str | _ArrayBackend | None = "cuda",
-    profile: bool = False,
-) -> dict[str, RCWAResult]:
-    """Solve several incident polarizations while reusing layer modes.
+) -> dict[str, tuple[ComplexArray, ComplexArray]]:
+    """Evaluate reflected/transmitted powers for all wavelengths on CUDA."""
 
-    ``excitations`` maps result labels to ``(sAmplitude, pAmplitude)``.  The
-    S-matrix path builds layer eigenmodes and cascades the stack once, then
-    applies the resulting network to each incident vector.
-    """
+    labels = tuple(excitations)
+    if not labels:
+        return {}
 
-    _requireSMatrixMethod(method)
-    return _solveStackSMatrixBatch(
-        layers=layers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        excitations=excitations,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        backend=backend,
-        profile=profile,
+    arrayBackend = resolveBackend(prepared.backend, precision=prepared.precision)
+    incidentColumns = arrayBackend.asarray(
+        np.column_stack([batchedIncidentAmplitudeVector(prepared, *excitations[label]) for label in labels])
     )
+    incidentColumns = incidentColumns[None, :, :].expand(prepared.harmonics.batchSize, -1, -1)
+    reflected = prepared.total.s11 @ incidentColumns
+    transmitted = prepared.total.s21 @ incidentColumns
+
+    torch = arrayBackend.xp.torch
+    incidentFluxes = torch.sum(
+        homogeneousOrderFluxesBatchBackend(
+            prepared.incidentForward,
+            incidentColumns,
+            prepared.harmonics.count,
+            arrayBackend,
+        ),
+        dim=1,
+    )
+    if bool(torch.any(~torch.isfinite(incidentFluxes))) or bool(torch.any(torch.abs(incidentFluxes) < 1e-14)):
+        raise ValueError("incident field has near-zero real power flux")
+    reflectedFluxes = homogeneousOrderFluxesBatchBackend(
+        prepared.incidentBackward,
+        reflected,
+        prepared.harmonics.count,
+        arrayBackend,
+    )
+    transmittedFluxes = homogeneousOrderFluxesBatchBackend(
+        prepared.transmissionForward,
+        transmitted,
+        prepared.harmonics.count,
+        arrayBackend,
+    )
+    reflection = torch.sum(-reflectedFluxes / incidentFluxes[:, None, :], dim=1)
+    transmission = torch.sum(transmittedFluxes / incidentFluxes[:, None, :], dim=1)
+
+    reflectionValues = reflection.detach().cpu().numpy()
+    transmissionValues = transmission.detach().cpu().numpy()
+    return {
+        label: (reflectionValues[:, index].copy(), transmissionValues[:, index].copy())
+        for index, label in enumerate(labels)
+    }
 
 
-def solveStackBatchPowers(
-    layers: Sequence[Layer | CompiledLayer],
-    wavelength: float,
-    period: tuple[float, float],
-    orders: tuple[int, int],
+def evaluatePreparedBatchPowersOnBackend(
+    prepared: PreparedStack,
+    labels: tuple[str, ...],
     excitations: Mapping[str, tuple[complex, complex]],
-    epsIncident: complex = 1.0,
-    epsTransmission: complex = 1.0,
-    theta: float = 0.0,
-    phi: float = 0.0,
-    method: str = "smatrix",
-    truncation: str = "circular",
-    backend: str | _ArrayBackend | None = "cuda",
-    profile: bool = False,
+    backend: ArrayBackend,
+    reflected: object,
+    transmitted: object,
 ) -> dict[str, tuple[float, float]]:
-    """Return ``(reflection, transmission)`` for several incident states.
+    """Evaluate batch powers on the CUDA backend and transfer only scalars."""
 
-    This is the same S-matrix solve as :func:`solveStackBatch`, but it skips
-    constructing full ``RCWAResult`` objects.  It is intended for spectrum
-    sweeps where only absorptivity is needed.
-    """
+    torch = backend.xp.torch
+    incidentFluxes = [
+        checkedIncidentFlux(
+            incidentField(
+                harmonics=prepared.harmonics,
+                eps=prepared.epsIncident,
+                sAmplitude=excitations[label][0],
+                pAmplitude=excitations[label][1],
+            )
+        )
+        for label in labels
+    ]
+    incidentFlux = torch.as_tensor(incidentFluxes, dtype=backend.floatDtype, device=backend.device)
 
-    _requireSMatrixMethod(method)
-    return _solveStackSMatrixBatchPowers(
-        layers=layers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        excitations=excitations,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        backend=backend,
-        profile=profile,
+    reflectedFluxes = homogeneousOrderFluxesBackend(
+        prepared.incidentBackward,
+        reflected,
+        prepared.harmonics.count,
+        backend,
     )
+    transmittedFluxes = homogeneousOrderFluxesBackend(
+        prepared.transmissionForward,
+        transmitted,
+        prepared.harmonics.count,
+        backend,
+    )
+    reflection = torch.sum(-reflectedFluxes / incidentFlux[None, :], dim=0)
+    transmission = torch.sum(transmittedFluxes / incidentFlux[None, :], dim=0)
+
+    reflectionValues = reflection.detach().cpu().numpy()
+    transmissionValues = transmission.detach().cpu().numpy()
+    return {
+        label: (float(reflectionValues[index]), float(transmissionValues[index]))
+        for index, label in enumerate(labels)
+    }
 
 
 def compileLayers(
@@ -552,10 +593,10 @@ def compileLayers(
 ) -> tuple[CompiledLayer, ...]:
     """Precompute tensor convolution matrices for a fixed harmonic truncation."""
 
-    normalizedOrders = _normalizeOrders(orders)
+    normalizedOrders = normalizeOrders(orders)
     if normalizedOrders[0] < 0 or normalizedOrders[1] < 0:
         raise ValueError("orders must be non-negative")
-    harmonics = _makeHarmonics(
+    harmonics = makeHarmonics(
         wavelength=1.0,
         period=(1.0, 1.0),
         orders=normalizedOrders,
@@ -569,7 +610,7 @@ def compileLayers(
         compiledLayers.append(
             CompiledLayer(
                 thickness=layer.thickness,
-                tensorData=_tensorConvolutionData(
+                tensorData=tensorConvolutionData(
                     layer.epsilon,
                     harmonics,
                     normalField=layer.normalField,
@@ -580,292 +621,50 @@ def compileLayers(
                 normalField=layer.normalField,
                 factorization=getattr(layer, "factorization", "auto"),
                 name=layer.name,
+                sampleShape=getattr(layer, "sampleShape", sampleShapeFromEpsilon(layer.epsilon)),
             )
         )
     return tuple(compiledLayers)
 
 
-def _solveStackSMatrix(
+def sampleShapeFromEpsilon(epsilon: object) -> tuple[int, int] | None:
+    if epsilon is None or hasattr(epsilon, "convolutionMatrix"):
+        return None
+    if isinstance(epsilon, Mapping):
+        shapes = [sampleShapeFromEpsilon(value) for value in epsilon.values()]
+        shapes = [shape for shape in shapes if shape is not None]
+        return shapes[0] if shapes and all(shape == shapes[0] for shape in shapes) else None
+    array = np.asarray(epsilon)
+    if array.ndim == 2 and array.shape != (3, 3):
+        return int(array.shape[0]), int(array.shape[1])
+    if array.ndim == 4 and array.shape[-2:] == (3, 3):
+        return int(array.shape[0]), int(array.shape[1])
+    if array.ndim == 4 and array.shape[:2] == (3, 3):
+        return int(array.shape[2]), int(array.shape[3])
+    return None
+
+
+def warmBackendTensorCache(
     layers: Sequence[Layer | CompiledLayer],
-    wavelength: float,
-    period: tuple[float, float],
-    orders: tuple[int, int],
-    epsIncident: complex = 1.0,
-    epsTransmission: complex = 1.0,
-    theta: float = 0.0,
-    phi: float = 0.0,
-    sAmplitude: complex = 1.0,
-    pAmplitude: complex = 0.0,
-    returnFields: bool = False,
-    truncation: str = "circular",
-    backend: str | _ArrayBackend | None = "cuda",
-    profile: bool = False,
-) -> RCWAResult:
-    fastPlan = _automaticFastPathPlan(
-        layers=layers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        returnFields=returnFields,
-    )
-    if fastPlan is not None:
-        return _solveStackReducedSMatrix(
-            layers=layers,
-            wavelength=wavelength,
-            period=period,
-            epsIncident=epsIncident,
-            epsTransmission=epsTransmission,
-            theta=theta,
-            phi=phi,
-            sAmplitude=sAmplitude,
-            pAmplitude=pAmplitude,
-            truncation=truncation,
-            backend=backend,
-            plan=fastPlan,
-            profile=profile,
-        )
+    backend: str | ArrayBackend | None = "cuda",
+    precision: str = "complex128",
+) -> None:
+    """Materialize compiled tensor convolution data on the target backend."""
 
-    prepared = prepareStackSMatrix(
-        layers=layers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        backend=backend,
-        fullTotal=returnFields,
-        profile=profile,
-    )
-    return evaluatePreparedStack(
-        prepared,
-        sAmplitude=sAmplitude,
-        pAmplitude=pAmplitude,
-        solvedBy=f"smatrix-{prepared.backend}",
-        returnFields=returnFields,
-    )
+    arrayBackend = resolveBackend(backend, precision=precision)
+    for layer in layers:
+        if isinstance(layer, CompiledLayer):
+            backendTensorConvolutionData(layer.tensorData, arrayBackend)
 
 
-def _solveStackSMatrixBatch(
-    layers: Sequence[Layer | CompiledLayer],
-    wavelength: float,
-    period: tuple[float, float],
-    orders: tuple[int, int],
-    excitations: Mapping[str, tuple[complex, complex]],
-    epsIncident: complex = 1.0,
-    epsTransmission: complex = 1.0,
-    theta: float = 0.0,
-    phi: float = 0.0,
-    truncation: str = "circular",
-    backend: str | _ArrayBackend | None = "cuda",
-    profile: bool = False,
-) -> dict[str, RCWAResult]:
-    fastPlan = _automaticFastPathPlan(
-        layers=layers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        returnFields=False,
-    )
-    if fastPlan is not None:
-        return _solveStackReducedSMatrixBatch(
-            layers=layers,
-            wavelength=wavelength,
-            period=period,
-            epsIncident=epsIncident,
-            epsTransmission=epsTransmission,
-            theta=theta,
-            phi=phi,
-            excitations=excitations,
-            truncation=truncation,
-            backend=backend,
-            plan=fastPlan,
-            profile=profile,
-        )
-
-    prepared = prepareStackSMatrix(
-        layers=layers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        backend=backend,
-        fullTotal=False,
-        profile=profile,
-    )
-    return evaluatePreparedBatch(prepared, excitations, solvedBy=f"smatrix-batch-{prepared.backend}")
+def backendPrecisionLabel(backend: ArrayBackend) -> str:
+    torch = getattr(backend.xp, "torch", None)
+    if torch is not None and backend.complexDtype is torch.complex64:
+        return "complex64"
+    return "complex128"
 
 
-def _solveStackSMatrixBatchPowers(
-    layers: Sequence[Layer | CompiledLayer],
-    wavelength: float,
-    period: tuple[float, float],
-    orders: tuple[int, int],
-    excitations: Mapping[str, tuple[complex, complex]],
-    epsIncident: complex = 1.0,
-    epsTransmission: complex = 1.0,
-    theta: float = 0.0,
-    phi: float = 0.0,
-    truncation: str = "circular",
-    backend: str | _ArrayBackend | None = "cuda",
-    profile: bool = False,
-) -> dict[str, tuple[float, float]]:
-    fastPlan = _automaticFastPathPlan(
-        layers=layers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        returnFields=False,
-    )
-    if fastPlan is not None:
-        reducedResults = _solveStackReducedSMatrixBatch(
-            layers=layers,
-            wavelength=wavelength,
-            period=period,
-            epsIncident=epsIncident,
-            epsTransmission=epsTransmission,
-            theta=theta,
-            phi=phi,
-            excitations=excitations,
-            truncation=truncation,
-            backend=backend,
-            plan=fastPlan,
-            profile=profile,
-        )
-        return {label: (result.reflection, result.transmission) for label, result in reducedResults.items()}
-
-    prepared = prepareStackSMatrix(
-        layers=layers,
-        wavelength=wavelength,
-        period=period,
-        orders=orders,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        backend=backend,
-        fullTotal=False,
-        profile=profile,
-    )
-    return evaluatePreparedBatchPowers(prepared, excitations)
-
-
-def _solveStackReducedSMatrix(
-    layers: Sequence[Layer | CompiledLayer],
-    wavelength: float,
-    period: tuple[float, float],
-    epsIncident: complex,
-    epsTransmission: complex,
-    theta: float,
-    phi: float,
-    sAmplitude: complex,
-    pAmplitude: complex,
-    truncation: str,
-    backend: str | _ArrayBackend | None,
-    plan: _AutomaticFastPathPlan,
-    profile: bool = False,
-) -> RCWAResult:
-    reducedLayers = _reducedFastPathLayers(layers, plan)
-    prepared = prepareStackSMatrix(
-        layers=reducedLayers,
-        wavelength=wavelength,
-        period=period,
-        orders=plan.reducedOrders,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        backend=backend,
-        fullTotal=False,
-        profile=profile,
-    )
-    reduced = evaluatePreparedStack(
-        prepared,
-        sAmplitude=sAmplitude,
-        pAmplitude=pAmplitude,
-        solvedBy=f"smatrix-{plan.label}-{prepared.backend}",
-        returnFields=False,
-    )
-    return _embedReducedResult(
-        reduced,
-        fullHarmonics=plan.fullHarmonics,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        sAmplitude=sAmplitude,
-        pAmplitude=pAmplitude,
-        solvedBy=f"smatrix-{plan.label}-{prepared.backend}",
-    )
-
-
-def _solveStackReducedSMatrixBatch(
-    layers: Sequence[Layer | CompiledLayer],
-    wavelength: float,
-    period: tuple[float, float],
-    epsIncident: complex,
-    epsTransmission: complex,
-    theta: float,
-    phi: float,
-    excitations: Mapping[str, tuple[complex, complex]],
-    truncation: str,
-    backend: str | _ArrayBackend | None,
-    plan: _AutomaticFastPathPlan,
-    profile: bool = False,
-) -> dict[str, RCWAResult]:
-    reducedLayers = _reducedFastPathLayers(layers, plan)
-    prepared = prepareStackSMatrix(
-        layers=reducedLayers,
-        wavelength=wavelength,
-        period=period,
-        orders=plan.reducedOrders,
-        epsIncident=epsIncident,
-        epsTransmission=epsTransmission,
-        theta=theta,
-        phi=phi,
-        truncation=truncation,
-        backend=backend,
-        fullTotal=False,
-        profile=profile,
-    )
-    reducedResults = evaluatePreparedBatch(
-        prepared,
-        excitations,
-        solvedBy=f"smatrix-batch-{plan.label}-{prepared.backend}",
-    )
-    return {
-        label: _embedReducedResult(
-            reduced,
-            fullHarmonics=plan.fullHarmonics,
-            epsIncident=epsIncident,
-            epsTransmission=epsTransmission,
-            sAmplitude=excitations[label][0],
-            pAmplitude=excitations[label][1],
-            solvedBy=f"smatrix-batch-{plan.label}-{prepared.backend}",
-        )
-        for label, reduced in reducedResults.items()
-    }
-
-
-def _automaticFastPathPlan(
+def automaticFastPathPlan(
     *,
     layers: Sequence[Layer | CompiledLayer],
     wavelength: float,
@@ -875,16 +674,12 @@ def _automaticFastPathPlan(
     theta: float,
     phi: float,
     truncation: str,
-    returnFields: bool,
-) -> _AutomaticFastPathPlan | None:
-    if returnFields:
-        return None
-
-    normalizedOrders = _normalizeOrders(orders)
+) -> AutomaticFastPathPlan | None:
+    normalizedOrders = normalizeOrders(orders)
     if normalizedOrders == (0, 0):
         return None
 
-    fullHarmonics = _makeHarmonics(
+    fullHarmonics = makeHarmonics(
         wavelength,
         period,
         normalizedOrders,
@@ -893,26 +688,106 @@ def _automaticFastPathPlan(
         phi,
         truncation=truncation,
     )
-    if _hasMismatchedCompiledLayer(layers, fullHarmonics):
+    if hasMismatchedCompiledLayer(layers, fullHarmonics):
         return None
-    if all(_isHomogeneousLayer(layer) for layer in layers):
-        return _makeFastPathPlan("homogeneous-4x4", (0, 0), fullHarmonics)
+    if all(isHomogeneousLayer(layer) for layer in layers):
+        return makeFastPathPlan("homogeneous-4x4", (0, 0), fullHarmonics)
 
     nx, ny = normalizedOrders
-    if ny > 0 and _stackInvariantAlong("y", layers, fullHarmonics):
-        return _makeFastPathPlan("1d-x-4x4", (nx, 0), fullHarmonics)
-    if nx > 0 and _stackInvariantAlong("x", layers, fullHarmonics):
-        return _makeFastPathPlan("1d-y-4x4", (0, ny), fullHarmonics)
+    if ny > 0 and stackInvariantAlong("y", layers, fullHarmonics):
+        return makeFastPathPlan("1d-x-4x4", (nx, 0), fullHarmonics)
+    if nx > 0 and stackInvariantAlong("x", layers, fullHarmonics):
+        return makeFastPathPlan("1d-y-4x4", (0, ny), fullHarmonics)
     return None
 
 
-def _makeFastPathPlan(
+def makeBatchedHarmonics(
+    *,
+    wavelengths: ComplexArray,
+    period: tuple[float, float],
+    orders: int | tuple[int, int],
+    epsIncident: complex,
+    theta: ComplexArray,
+    phi: ComplexArray,
+    truncation: str,
+    backend: ArrayBackend,
+) -> BatchedHarmonics:
+    reference = makeHarmonics(
+        float(wavelengths[0]),
+        period,
+        orders,
+        epsIncident,
+        float(theta[0]),
+        float(phi[0]),
+        truncation=truncation,
+    )
+    torch = backend.xp.torch
+    wavelengthTensor = torch.as_tensor(wavelengths, dtype=backend.complexDtype, device=backend.device)
+    mx = torch.as_tensor(reference.mx, dtype=backend.complexDtype, device=backend.device)
+    my = torch.as_tensor(reference.my, dtype=backend.complexDtype, device=backend.device)
+    nIncident = forwardKz(epsIncident)
+    thetaTensor = torch.as_tensor(theta, dtype=backend.complexDtype, device=backend.device)
+    phiTensor = torch.as_tensor(phi, dtype=backend.complexDtype, device=backend.device)
+    nIncidentTensor = torch.as_tensor(nIncident, dtype=backend.complexDtype, device=backend.device)
+    kx0 = nIncidentTensor * torch.sin(thetaTensor) * torch.cos(phiTensor)
+    ky0 = nIncidentTensor * torch.sin(thetaTensor) * torch.sin(phiTensor)
+    kx = kx0[:, None] + wavelengthTensor[:, None] * mx[None, :] / period[0]
+    ky = ky0[:, None] + wavelengthTensor[:, None] * my[None, :] / period[1]
+    return BatchedHarmonics(
+        mx=reference.mx.copy(),
+        my=reference.my.copy(),
+        kx=kx,
+        ky=ky,
+        orders=reference.orders,
+        truncation=reference.truncation,
+    )
+
+
+def batchParameterValues(value: float | Sequence[float], batchSize: int, name: str) -> ComplexArray:
+    array = np.asarray(value, dtype=float)
+    if array.ndim == 0:
+        return np.full(batchSize, float(array), dtype=float)
+    if array.shape != (batchSize,):
+        raise ValueError(f"{name} batch must be scalar or have shape (batch,)")
+    return array.copy()
+
+
+def batchStoredParameter(values: ComplexArray) -> float:
+    if values.size == 0:
+        return 0.0
+    first = float(values[0])
+    return first if np.allclose(values, first, rtol=0.0, atol=0.0) else float("nan")
+
+
+def validateBatchedCompiledLayers(
+    layers: Sequence[Layer | CompiledLayer | BatchedHomogeneousLayer],
+    harmonics: BatchedHarmonics,
+) -> None:
+    mismatch = [
+        layer
+        for layer in layers
+        if isinstance(layer, CompiledLayer)
+        and (layer.orders != harmonics.orders or layer.truncation != harmonics.truncation)
+    ]
+    if mismatch:
+        raise ValueError("compiled layer orders or truncation do not match the requested batched harmonics")
+    invalidHomogeneous = [
+        layer
+        for layer in layers
+        if isinstance(layer, BatchedHomogeneousLayer)
+        and (np.asarray(layer.tensors).shape != (harmonics.batchSize, 3, 3))
+    ]
+    if invalidHomogeneous:
+        raise ValueError("batched homogeneous layer tensors must have shape (batch, 3, 3)")
+
+
+def makeFastPathPlan(
     label: str,
     reducedOrders: tuple[int, int],
-    fullHarmonics: _Harmonics,
-) -> _AutomaticFastPathPlan:
-    kept = _reducedHarmonicIndices(fullHarmonics, reducedOrders)
-    return _AutomaticFastPathPlan(
+    fullHarmonics: Harmonics,
+) -> AutomaticFastPathPlan:
+    kept = reducedHarmonicIndices(fullHarmonics, reducedOrders)
+    return AutomaticFastPathPlan(
         label=label,
         reducedOrders=reducedOrders,
         fullHarmonics=fullHarmonics,
@@ -920,34 +795,34 @@ def _makeFastPathPlan(
     )
 
 
-def _reducedFastPathLayers(
+def reducedFastPathLayers(
     layers: Sequence[Layer | CompiledLayer],
-    plan: _AutomaticFastPathPlan,
+    plan: AutomaticFastPathPlan,
 ) -> tuple[Layer | CompiledLayer, ...]:
     reduced: list[Layer | CompiledLayer] = []
     for layer in layers:
-        if _isHomogeneousLayer(layer):
-            reduced.append(_homogeneousEquivalentLayer(layer))
+        if isHomogeneousLayer(layer):
+            reduced.append(homogeneousEquivalentLayer(layer))
         elif isinstance(layer, CompiledLayer):
-            reduced.append(_sliceCompiledLayer(layer, plan))
+            reduced.append(sliceCompiledLayer(layer, plan))
         else:
             reduced.append(layer)
     return tuple(reduced)
 
 
-def _homogeneousEquivalentLayer(layer: Layer | CompiledLayer) -> Layer:
+def homogeneousEquivalentLayer(layer: Layer | CompiledLayer) -> Layer:
     if isinstance(layer, CompiledLayer):
         tensor = layer.tensorData.constantTensor
         if tensor is None:
             raise RuntimeError("compiled layer is not homogeneous")
         return Layer(thickness=layer.thickness, epsilon=tensor, name=layer.name)
-    tensor = _constantTensor(getattr(layer, "epsilon"))
+    tensor = constantTensor(getattr(layer, "epsilon"))
     if tensor is None:
         raise RuntimeError("layer is not homogeneous")
     return Layer(thickness=layer.thickness, epsilon=tensor, name=getattr(layer, "name", ""))
 
 
-def _sliceCompiledLayer(layer: CompiledLayer, plan: _AutomaticFastPathPlan) -> CompiledLayer:
+def sliceCompiledLayer(layer: CompiledLayer, plan: AutomaticFastPathPlan) -> CompiledLayer:
     indices = plan.keptIndices
     indexer = np.ix_(indices, indices)
     tensorData = layer.tensorData
@@ -969,13 +844,14 @@ def _sliceCompiledLayer(layer: CompiledLayer, plan: _AutomaticFastPathPlan) -> C
         normalField=None,
         factorization=layer.factorization,
         name=layer.name,
+        sampleShape=layer.sampleShape,
     )
 
 
-def _embedReducedResult(
+def embedReducedResult(
     reduced: RCWAResult,
     *,
-    fullHarmonics: _Harmonics,
+    fullHarmonics: Harmonics,
     epsIncident: complex,
     epsTransmission: complex,
     sAmplitude: complex,
@@ -999,38 +875,39 @@ def _embedReducedResult(
             2 * reducedIndex : 2 * reducedIndex + 2
         ]
 
-    incident = _incidentField(
+    incident = incidentField(
         harmonics=fullHarmonics,
         eps=epsIncident,
         sAmplitude=sAmplitude,
         pAmplitude=pAmplitude,
     )
-    return _result(
+    return result(
         harmonics=fullHarmonics,
         epsIncident=epsIncident,
         epsTransmission=epsTransmission,
-        reflectedBasis=_homogeneousBasis(fullHarmonics, epsIncident, direction=-1),
-        transmittedBasis=_homogeneousBasis(fullHarmonics, epsTransmission, direction=1),
+        reflectedBasis=homogeneousBasis(fullHarmonics, epsIncident, direction=-1),
+        transmittedBasis=homogeneousBasis(fullHarmonics, epsTransmission, direction=1),
         rAmplitudes=rAmplitudes,
         tAmplitudes=tAmplitudes,
-        incidentFlux=_checkedIncidentFlux(incident),
+        incidentFlux=checkedIncidentFlux(incident),
         solvedBy=solvedBy,
         layerSolutions=(),
         layerEigTimings=reduced.layerEigTimings,
+        stackTiming=reduced.stackTiming,
     )
 
 
-def _reducedHarmonicIndices(harmonics: _Harmonics, reducedOrders: tuple[int, int]) -> ComplexArray:
+def reducedHarmonicIndices(harmonics: Harmonics, reducedOrders: tuple[int, int]) -> ComplexArray:
     nx, ny = reducedOrders
     mask = (np.abs(harmonics.mx) <= nx) & (np.abs(harmonics.my) <= ny)
     return np.flatnonzero(mask)
 
 
-def _stackInvariantAlong(axis: str, layers: Sequence[Layer | CompiledLayer], harmonics: _Harmonics) -> bool:
-    return all(_layerInvariantAlong(axis, layer, harmonics) for layer in layers)
+def stackInvariantAlong(axis: str, layers: Sequence[Layer | CompiledLayer], harmonics: Harmonics) -> bool:
+    return all(layerInvariantAlong(axis, layer, harmonics) for layer in layers)
 
 
-def _hasMismatchedCompiledLayer(layers: Sequence[Layer | CompiledLayer], harmonics: _Harmonics) -> bool:
+def hasMismatchedCompiledLayer(layers: Sequence[Layer | CompiledLayer], harmonics: Harmonics) -> bool:
     return any(
         isinstance(layer, CompiledLayer)
         and (layer.orders != harmonics.orders or layer.truncation != harmonics.truncation)
@@ -1038,38 +915,38 @@ def _hasMismatchedCompiledLayer(layers: Sequence[Layer | CompiledLayer], harmoni
     )
 
 
-def _layerInvariantAlong(axis: str, layer: Layer | CompiledLayer, harmonics: _Harmonics) -> bool:
-    if _isHomogeneousLayer(layer):
+def layerInvariantAlong(axis: str, layer: Layer | CompiledLayer, harmonics: Harmonics) -> bool:
+    if isHomogeneousLayer(layer):
         return True
     if isinstance(layer, CompiledLayer):
-        return _compiledLayerInvariantAlong(axis, layer, harmonics)
-    return _rawLayerInvariantAlong(axis, layer)
+        return compiledLayerInvariantAlong(axis, layer, harmonics)
+    return rawLayerInvariantAlong(axis, layer)
 
 
-def _rawLayerInvariantAlong(axis: str, layer: Layer) -> bool:
+def rawLayerInvariantAlong(axis: str, layer: Layer) -> bool:
     epsilon = getattr(layer, "epsilon")
-    if _constantTensor(epsilon) is not None:
+    if constantTensor(epsilon) is not None:
         return True
-    if not _epsilonInvariantAlong(axis, epsilon):
+    if not epsilonInvariantAlong(axis, epsilon):
         return False
     normal = getattr(layer, "normalField", None)
-    return normal is None or _arrayInvariantAlong(axis, np.asarray(normal))
+    return normal is None or arrayInvariantAlong(axis, np.asarray(normal))
 
 
-def _epsilonInvariantAlong(axis: str, epsilon: TensorLike) -> bool:
+def epsilonInvariantAlong(axis: str, epsilon: TensorLike) -> bool:
     if isinstance(epsilon, Mapping):
-        return all(_arrayInvariantAlong(axis, np.asarray(value)) for value in epsilon.values())
+        return all(arrayInvariantAlong(axis, np.asarray(value)) for value in epsilon.values())
     if np.isscalar(epsilon):
         return True
     array = np.asarray(epsilon)
     if array.ndim == 0 or (array.ndim == 2 and array.shape == (3, 3)):
         return True
     if array.ndim in (2, 4):
-        return _arrayInvariantAlong(axis, array)
+        return arrayInvariantAlong(axis, array)
     return False
 
 
-def _arrayInvariantAlong(axis: str, array: ComplexArray) -> bool:
+def arrayInvariantAlong(axis: str, array: ComplexArray) -> bool:
     if array.ndim < 2:
         return True
     if axis == "y":
@@ -1081,7 +958,7 @@ def _arrayInvariantAlong(axis: str, array: ComplexArray) -> bool:
     raise ValueError("axis must be 'x' or 'y'")
 
 
-def _compiledLayerInvariantAlong(axis: str, layer: CompiledLayer, harmonics: _Harmonics) -> bool:
+def compiledLayerInvariantAlong(axis: str, layer: CompiledLayer, harmonics: Harmonics) -> bool:
     if layer.orders != harmonics.orders or layer.truncation != harmonics.truncation:
         return False
     if layer.tensorData.constantTensor is not None:
@@ -1102,12 +979,12 @@ def _compiledLayerInvariantAlong(axis: str, layer: CompiledLayer, harmonics: _Ha
     return all(np.max(np.abs(matrix[uncoupled])) <= tolerance for matrix in matrices)
 
 
-def _layerModes(
+def layerModes(
     layer: Layer | CompiledLayer,
-    harmonics: _Harmonics,
-    backend: _ArrayBackend,
+    harmonics: Harmonics,
+    backend: ArrayBackend,
 ) -> tuple[object, object]:
-    modes, _timing = _layerModesWithTiming(
+    modes, timing = layerModesWithTiming(
         layer,
         harmonics,
         backend,
@@ -1117,105 +994,281 @@ def _layerModes(
     return modes
 
 
-def _layerModesWithTiming(
+def layerModesBatch(
+    layer: Layer | CompiledLayer | BatchedHomogeneousLayer,
+    harmonics: BatchedHarmonics,
+    backend: ArrayBackend,
+) -> tuple[object, object]:
+    if isinstance(layer, BatchedHomogeneousLayer):
+        tensors = np.asarray(layer.tensors, dtype=complex)
+        if isBatchedScalarTensor(tensors):
+            return homogeneousScalarLayerModesBatch(tensors[:, 0, 0], harmonics, backend)
+        return homogeneousTensorLayerModesBatch(tensors, harmonics, backend)
+
+    if not isinstance(layer, CompiledLayer) and getattr(layer, "normalField", None) is None:
+        tensor = constantTensor(getattr(layer, "epsilon"))
+        if tensor is not None:
+            if isScalarTensor(tensor):
+                return homogeneousScalarLayerModesBatch(tensor[0, 0], harmonics, backend)
+            return homogeneousTensorLayerModesBatch(tensor, harmonics, backend)
+
+    factorized = layerTensorData(layer, batchedReferenceHarmonics(harmonics))
+    if factorized.constantTensor is not None:
+        if isScalarTensor(factorized.constantTensor):
+            return homogeneousScalarLayerModesBatch(factorized.constantTensor[0, 0], harmonics, backend)
+        return homogeneousTensorLayerModesBatch(factorized.constantTensor, harmonics, backend)
+    if hasNoLongitudinalCoupling(factorized):
+        return transverseBlockLayerModesBatch(factorized, harmonics, backend)
+    system = liFactorizedSystemMatrixBatchBackend(factorized, harmonics, backend)
+    qValues, vectors = backend.eig(system)
+    vectors = normalizeModes(vectors, backend)
+    return splitForwardBackward(qValues, vectors, 2 * harmonics.count, backend)
+
+
+def batchedReferenceHarmonics(harmonics: BatchedHarmonics) -> Harmonics:
+    return Harmonics(
+        mx=harmonics.mx,
+        my=harmonics.my,
+        kx=np.zeros(harmonics.count, dtype=complex),
+        ky=np.zeros(harmonics.count, dtype=complex),
+        orders=harmonics.orders,
+        truncation=harmonics.truncation,
+    )
+
+
+def layerModeCacheKey(layer: Layer | CompiledLayer) -> tuple[object, ...] | None:
+    if isinstance(layer, BatchedHomogeneousLayer):
+        return None
+    if isinstance(layer, CompiledLayer):
+        return ("compiled", id(layer.tensorData), layer.orders, layer.truncation)
+    if getattr(layer, "normalField", None) is None:
+        tensor = constantTensor(getattr(layer, "epsilon"))
+        if tensor is not None:
+            return (
+                "homogeneous",
+                complexArrayCacheKey(tensor),
+                getattr(layer, "factorization", "auto"),
+            )
+    return None
+
+
+def complexArrayCacheKey(value: ComplexArray) -> tuple[tuple[int, ...], tuple[complex, ...]]:
+    array = np.asarray(value, dtype=complex)
+    return tuple(int(size) for size in array.shape), tuple(complex(item) for item in array.reshape(-1))
+
+
+def layerModesWithTiming(
     layer: Layer | CompiledLayer,
-    harmonics: _Harmonics,
-    backend: _ArrayBackend,
+    harmonics: Harmonics,
+    backend: ArrayBackend,
     *,
     layerIndex: int,
     collectTiming: bool,
 ) -> tuple[tuple[object, object], LayerEigTiming | None]:
+    totalStart = startTimedOperation(backend) if collectTiming else None
     if not isinstance(layer, CompiledLayer) and getattr(layer, "normalField", None) is None:
-        tensor = _constantTensor(getattr(layer, "epsilon"))
+        tensor = constantTensor(getattr(layer, "epsilon"))
         if tensor is not None:
-            qValues, vectors, matrixShape, eigTime = _homogeneousTensorLayerModesMeasured(
-                tensor,
+            if isScalarTensor(tensor):
+                qValues, vectors, matrixShape, eigTime = homogeneousScalarLayerModes(
+                    tensor[0, 0],
+                    harmonics,
+                    backend,
+                )
+            else:
+                qValues, vectors, matrixShape, eigTime = homogeneousTensorLayerModesMeasured(
+                    tensor,
+                    harmonics,
+                    backend,
+                    collectTiming=collectTiming,
+                )
+            modes = (qValues, vectors)
+            return modes, layerEigTiming(
+                layerIndex,
+                layer,
+                "homogeneous-4x4",
+                matrixShape,
+                eigTime,
+                collectTiming,
+                totalStart=totalStart,
+                qValues=qValues,
+                backend=backend,
+            )
+
+    factorizationStart = time.perf_counter() if collectTiming else None
+    factorized = layerTensorData(layer, harmonics)
+    factorizationTime = time.perf_counter() - factorizationStart if factorizationStart is not None else 0.0
+    if factorized.constantTensor is not None:
+        if isScalarTensor(factorized.constantTensor):
+            qValues, vectors, matrixShape, eigTime = homogeneousScalarLayerModes(
+                factorized.constantTensor[0, 0],
                 harmonics,
+                backend,
+            )
+        else:
+            qValues, vectors, matrixShape, eigTime = homogeneousTensorLayerModesMeasured(
+                factorized.constantTensor,
+                harmonics,
+                backend,
                 collectTiming=collectTiming,
             )
-            modes = (backend.asarray(qValues), backend.asarray(vectors))
-            return modes, _layerEigTiming(layerIndex, layer, "homogeneous-4x4", matrixShape, eigTime, collectTiming)
-
-    factorized = _layerTensorData(layer, harmonics)
-    if factorized.constantTensor is not None:
-        qValues, vectors, matrixShape, eigTime = _homogeneousTensorLayerModesMeasured(
-            factorized.constantTensor,
-            harmonics,
-            collectTiming=collectTiming,
+        modes = (qValues, vectors)
+        return modes, layerEigTiming(
+            layerIndex,
+            layer,
+            "homogeneous-4x4",
+            matrixShape,
+            eigTime,
+            collectTiming,
+            factorizationTime=factorizationTime,
+            totalStart=totalStart,
+            qValues=qValues,
+            backend=backend,
         )
-        modes = (backend.asarray(qValues), backend.asarray(vectors))
-        return modes, _layerEigTiming(layerIndex, layer, "homogeneous-4x4", matrixShape, eigTime, collectTiming)
-    if _hasNoLongitudinalCoupling(factorized):
+    if hasNoLongitudinalCoupling(factorized):
         timing: dict[str, object] | None = {} if collectTiming else None
-        modes = _transverseBlockLayerModes(factorized, harmonics, backend, timing=timing)
-        return modes, _layerEigTimingFromDict(layerIndex, layer, "transverse-2N", timing)
-    if backend.isTorch:
-        system = _liFactorizedSystemMatrixBackend(factorized, harmonics, backend)
-    else:
-        system = backend.asarray(_liFactorizedSystemMatrix(factorized, harmonics))
-    start = _startTimedOperation(backend) if collectTiming else None
+        modes = transverseBlockLayerModes(factorized, harmonics, backend, timing=timing)
+        if timing is not None:
+            timing["factorizationTimeSeconds"] = factorizationTime
+        return modes, layerEigTimingFromDict(layerIndex, layer, "transverse-2N", timing, totalStart, backend, modes[0])
+    matrixStart = startTimedOperation(backend) if collectTiming else None
+    system = liFactorizedSystemMatrixBackend(factorized, harmonics, backend)
+    matrixBuildTime = finishTimedOperation(backend, matrixStart) if matrixStart is not None else 0.0
+    start = startTimedOperation(backend) if collectTiming else None
     qValues, vectors = backend.eig(system)
-    eigTime = _finishTimedOperation(backend, start) if start is not None else 0.0
-    vectors = _normalizeModes(vectors, backend)
-    modes = _splitForwardBackward(qValues, vectors, 2 * harmonics.count, backend)
-    return modes, _layerEigTiming(layerIndex, layer, "full-4N", tuple(system.shape), eigTime, collectTiming)
+    eigTime = finishTimedOperation(backend, start) if start is not None else 0.0
+    vectors = normalizeModes(vectors, backend)
+    modes = splitForwardBackward(qValues, vectors, 2 * harmonics.count, backend)
+    return modes, layerEigTiming(
+        layerIndex,
+        layer,
+        "full-4N",
+        tuple(system.shape),
+        eigTime,
+        collectTiming,
+        factorizationTime=factorizationTime,
+        matrixBuildTime=matrixBuildTime,
+        totalStart=totalStart,
+        qValues=modes[0],
+        backend=backend,
+    )
 
 
-def _profileTimingsEnabled(profile: bool) -> bool:
+def profileTimingsEnabled(profile: bool) -> bool:
     if profile:
         return True
     value = os.environ.get("RCWA3D_PROFILE_EIG", "").strip().lower()
     return value in ("1", "true", "yes", "on")
 
 
-def _layerEigTiming(
+def layerEigTiming(
     layerIndex: int,
     layer: Layer | CompiledLayer,
     kind: str,
     matrixShape: tuple[int, ...],
     eigTime: float,
     collectTiming: bool,
+    *,
+    factorizationTime: float = 0.0,
+    matrixBuildTime: float = 0.0,
+    totalStart: float | None = None,
+    qValues: object | None = None,
+    backend: ArrayBackend | None = None,
 ) -> LayerEigTiming | None:
     if not collectTiming:
         return None
+    totalTime = finishTimedOperation(backend, totalStart) if backend is not None and totalStart is not None else 0.0
+    minAbsQ, safeQThreshold, nearZeroCount = qStabilityStats(qValues, backend)
     return LayerEigTiming(
         layerIndex=layerIndex,
         name=getattr(layer, "name", ""),
         kind=kind,
         matrixShape=tuple(int(value) for value in matrixShape),
         eigTimeSeconds=float(eigTime),
+        factorizationTimeSeconds=float(factorizationTime),
+        matrixBuildTimeSeconds=float(matrixBuildTime),
+        totalTimeSeconds=float(totalTime),
+        minAbsQ=minAbsQ,
+        safeQThreshold=safeQThreshold,
+        nearZeroModeCount=nearZeroCount,
     )
 
 
-def _layerEigTimingFromDict(
+def layerEigTimingFromDict(
     layerIndex: int,
     layer: Layer | CompiledLayer,
     kind: str,
     timing: dict[str, object] | None,
+    totalStart: float | None = None,
+    backend: ArrayBackend | None = None,
+    qValues: object | None = None,
 ) -> LayerEigTiming | None:
     if timing is None:
         return None
-    return _layerEigTiming(
+    return layerEigTiming(
         layerIndex,
         layer,
         kind,
         tuple(timing.get("matrixShape", ())),
         float(timing.get("eigTimeSeconds", 0.0)),
         True,
+        factorizationTime=float(timing.get("factorizationTimeSeconds", 0.0)),
+        matrixBuildTime=float(timing.get("matrixBuildTimeSeconds", 0.0)),
+        totalStart=totalStart,
+        qValues=qValues,
+        backend=backend,
     )
 
 
-def _startTimedOperation(backend: _ArrayBackend) -> float:
+def qStabilityStats(qValues: object | None, backend: ArrayBackend | None) -> tuple[float | None, float | None, int]:
+    if qValues is None or backend is None:
+        return None, None, 0
+    torch = backend.xp.torch
+    if qValues.numel() == 0:
+        return float("inf"), 0.0, 0
+    absQ = torch.abs(qValues)
+    minAbs = float(torch.amin(absQ).detach().cpu().item())
+    maxAbs = float(torch.amax(absQ).detach().cpu().item())
+    threshold = 1e-12 * max(1.0, maxAbs)
+    nearZero = int(torch.count_nonzero(absQ < threshold).detach().cpu().item())
+    return minAbs, threshold, nearZero
+
+
+def stabilityWarnings(
+    layerTimings: Sequence[LayerEigTiming],
+    interfaceConditionNumbers: Sequence[float],
+) -> tuple[str, ...]:
+    warnings: list[str] = []
+    for timing in layerTimings:
+        if timing.nearZeroModeCount > 0:
+            minAbs = timing.minAbsQ if timing.minAbsQ is not None else float("nan")
+            threshold = timing.safeQThreshold if timing.safeQThreshold is not None else float("nan")
+            warnings.append(
+                f"layer {timing.layerIndex} has {timing.nearZeroModeCount} near-grazing anisotropic modes "
+                f"(min |q|={minAbs:.3e}, threshold={threshold:.3e}); "
+                "check harmonic order and wavelength sampling near Wood anomalies"
+            )
+    if interfaceConditionNumbers:
+        maximum = max(interfaceConditionNumbers)
+        if maximum > 1e10:
+            warnings.append(
+                f"max anisotropic interface condition number is {maximum:.3e}; compare nearby wavelengths "
+                "or reduce material discontinuity/factorization error"
+            )
+    return tuple(warnings)
+
+
+def startTimedOperation(backend: ArrayBackend) -> float:
     backend.synchronize()
     return time.perf_counter()
 
 
-def _finishTimedOperation(backend: _ArrayBackend, start: float) -> float:
+def finishTimedOperation(backend: ArrayBackend, start: float) -> float:
     backend.synchronize()
     return time.perf_counter() - start
 
 
-def _hasNoLongitudinalCoupling(data: TensorConvolutionData) -> bool:
+def hasNoLongitudinalCoupling(data: TensorConvolutionData) -> bool:
     longitudinal = (
         data.components[0][2],
         data.components[1][2],
@@ -1228,30 +1281,28 @@ def _hasNoLongitudinalCoupling(data: TensorConvolutionData) -> bool:
     return all(float(np.max(np.abs(matrix))) <= tolerance for matrix in longitudinal if matrix.size)
 
 
-def _transverseBlockLayerModes(
+def transverseBlockLayerModes(
     data: TensorConvolutionData,
-    harmonics: _Harmonics,
-    backend: _ArrayBackend,
+    harmonics: Harmonics,
+    backend: ArrayBackend,
     timing: dict[str, object] | None = None,
 ) -> tuple[object, object]:
-    if backend.isTorch:
-        return _transverseBlockLayerModesBackend(data, harmonics, backend, timing=timing)
-    return _transverseBlockLayerModesNumpy(data, harmonics, backend, timing=timing)
+    return transverseBlockLayerModesBackend(data, harmonics, backend, timing=timing)
 
 
-def _transverseBlockLayerModesBackend(
+def transverseBlockLayerModesBackend(
     data: TensorConvolutionData,
-    harmonics: _Harmonics,
-    backend: _ArrayBackend,
+    harmonics: Harmonics,
+    backend: ArrayBackend,
     timing: dict[str, object] | None = None,
 ) -> tuple[object, object]:
     xp = backend.xp
-    torch = xp._torch
+    torch = xp.torch
     n = harmonics.count
     diagonal = xp.arange(n)
     kx = backend.asarray(harmonics.kx)
     ky = backend.asarray(harmonics.ky)
-    cached = _backendTensorConvolutionData(data, backend)
+    cached = backendTensorConvolutionData(data, backend)
     c = cached.components
     eta = cached.etaZz
     cxx, cxy = c[0][0], c[0][1]
@@ -1286,11 +1337,11 @@ def _transverseBlockLayerModesBackend(
     eigenMatrix = pMatrix @ qMatrix
     if timing is not None:
         timing["matrixShape"] = tuple(eigenMatrix.shape)
-    start = _startTimedOperation(backend) if timing is not None else None
+    start = startTimedOperation(backend) if timing is not None else None
     qSquared, electricModes = backend.eig(eigenMatrix)
     if start is not None:
-        timing["eigTimeSeconds"] = _finishTimedOperation(backend, start)
-    qValues = _forwardKzTorch(qSquared, torch)
+        timing["eigTimeSeconds"] = finishTimedOperation(backend, start)
+    qValues = forwardKzTorch(qSquared, torch)
     safeQ = torch.where(
         torch.abs(qValues) < 1e-13,
         torch.as_tensor(1e-13, dtype=qValues.dtype, device=qValues.device),
@@ -1305,58 +1356,73 @@ def _transverseBlockLayerModesBackend(
         axis=0,
     )
     qAll = xp.concatenate([qValues, -qValues])
-    return qAll, _normalizeModes(vectors, backend)
+    return qAll, normalizeModes(vectors, backend)
 
 
-def _transverseBlockLayerModesNumpy(
+def transverseBlockLayerModesBatch(
     data: TensorConvolutionData,
-    harmonics: _Harmonics,
-    backend: _ArrayBackend,
-    timing: dict[str, object] | None = None,
+    harmonics: BatchedHarmonics,
+    backend: ArrayBackend,
 ) -> tuple[object, object]:
+    xp = backend.xp
+    torch = xp.torch
+    batchSize = harmonics.batchSize
     n = harmonics.count
-    diagonal = np.arange(n)
+    diagonal = torch.arange(n, dtype=torch.long, device=backend.device)
     kx = harmonics.kx
     ky = harmonics.ky
-    c = data.components
-    eta = data.etaZz
+    cached = backendTensorConvolutionData(data, backend)
+    c = cached.components
+    eta = cached.etaZz
     cxx, cxy = c[0][0], c[0][1]
     cyx, cyy = c[1][0], c[1][1]
 
-    identity = np.eye(n, dtype=complex)
-    p11 = kx[:, None] * eta * ky[None, :]
-    p12 = identity - kx[:, None] * eta * kx[None, :]
-    p21 = ky[:, None] * eta * ky[None, :] - identity
-    p22 = -ky[:, None] * eta * kx[None, :]
+    identity = xp.eye(n, dtype=complex)
+    p11 = kx[:, :, None] * eta[None, :, :] * ky[:, None, :]
+    p12 = identity[None, :, :] - kx[:, :, None] * eta[None, :, :] * kx[:, None, :]
+    p21 = ky[:, :, None] * eta[None, :, :] * ky[:, None, :] - identity[None, :, :]
+    p22 = -ky[:, :, None] * eta[None, :, :] * kx[:, None, :]
 
-    q11 = -cyx.copy()
-    q11[diagonal, diagonal] -= kx * ky
-    q12 = -cyy.copy()
-    q12[diagonal, diagonal] += kx * kx
-    q21 = cxx.copy()
-    q21[diagonal, diagonal] -= ky * ky
-    q22 = cxy.copy()
-    q22[diagonal, diagonal] += ky * kx
+    q11 = (-cyx).expand(batchSize, -1, -1).clone()
+    q11[:, diagonal, diagonal] = q11[:, diagonal, diagonal] - kx * ky
+    q12 = (-cyy).expand(batchSize, -1, -1).clone()
+    q12[:, diagonal, diagonal] = q12[:, diagonal, diagonal] + kx * kx
+    q21 = cxx.expand(batchSize, -1, -1).clone()
+    q21[:, diagonal, diagonal] = q21[:, diagonal, diagonal] - ky * ky
+    q22 = cxy.expand(batchSize, -1, -1).clone()
+    q22[:, diagonal, diagonal] = q22[:, diagonal, diagonal] + ky * kx
 
-    pMatrix = np.block([[p11, p12], [p21, p22]])
-    qMatrix = np.block([[q11, q12], [q21, q22]])
-    eigenMatrix = pMatrix @ qMatrix
-    if timing is not None:
-        timing["matrixShape"] = tuple(eigenMatrix.shape)
-    start = _startTimedOperation(backend) if timing is not None else None
-    qSquared, electricModes = np.linalg.eig(eigenMatrix)
-    if start is not None:
-        timing["eigTimeSeconds"] = _finishTimedOperation(backend, start)
-    qValues = _forwardKz(qSquared)
-    safeQ = qValues.copy()
-    safeQ[np.abs(safeQ) < 1e-13] = 1e-13
-    magneticModes = qMatrix @ (electricModes * (1.0 / safeQ)[None, :])
-    vectors = np.block([[electricModes, electricModes], [magneticModes, -magneticModes]])
-    qAll = np.concatenate([qValues, -qValues])
-    return backend.asarray(qAll), backend.asarray(_normalizeModes(vectors, _CPU_BACKEND))
+    pMatrix = xp.empty((batchSize, 2 * n, 2 * n), dtype=complex)
+    pMatrix[:, 0:n, 0:n] = p11
+    pMatrix[:, 0:n, n : 2 * n] = p12
+    pMatrix[:, n : 2 * n, 0:n] = p21
+    pMatrix[:, n : 2 * n, n : 2 * n] = p22
+    qMatrix = xp.empty((batchSize, 2 * n, 2 * n), dtype=complex)
+    qMatrix[:, 0:n, 0:n] = q11
+    qMatrix[:, 0:n, n : 2 * n] = q12
+    qMatrix[:, n : 2 * n, 0:n] = q21
+    qMatrix[:, n : 2 * n, n : 2 * n] = q22
+
+    qSquared, electricModes = backend.eig(pMatrix @ qMatrix)
+    qValues = forwardKzTorch(qSquared, torch)
+    safeQ = torch.where(
+        torch.abs(qValues) < 1e-13,
+        torch.as_tensor(1e-13, dtype=qValues.dtype, device=qValues.device),
+        qValues,
+    )
+    magneticModes = qMatrix @ (electricModes * (1.0 / safeQ)[:, None, :])
+    vectors = xp.concatenate(
+        [
+            xp.concatenate([electricModes, electricModes], axis=2),
+            xp.concatenate([magneticModes, -magneticModes], axis=2),
+        ],
+        axis=1,
+    )
+    qAll = xp.concatenate([qValues, -qValues], axis=1)
+    return qAll, normalizeModes(vectors, backend)
 
 
-def _forwardKzTorch(values: object, torch: object) -> object:
+def forwardKzTorch(values: object, torch: object) -> object:
     roots = torch.sqrt(values)
     flip = (torch.imag(roots) < -1e-14) | (
         (torch.abs(torch.imag(roots)) <= 1e-14) & (torch.real(roots) < 0)
@@ -1364,22 +1430,23 @@ def _forwardKzTorch(values: object, torch: object) -> object:
     return torch.where(flip, -roots, roots)
 
 
-def _liFactorizedSystemMatrixBackend(
+def liFactorizedSystemMatrixBackend(
     data: TensorConvolutionData,
-    harmonics: _Harmonics,
-    backend: _ArrayBackend,
+    harmonics: Harmonics,
+    backend: ArrayBackend,
 ) -> object:
     xp = backend.xp
     n = harmonics.count
     diagonal = xp.arange(n)
     kx = backend.asarray(harmonics.kx)
     ky = backend.asarray(harmonics.ky)
-    c = _backendTensorConvolutionData(data, backend).components
-    eta = _backendTensorConvolutionData(data, backend).etaZz
+    cached = backendTensorConvolutionData(data, backend)
+    c = cached.components
+    eta = cached.etaZz
 
     cxx, cxy, cxz = c[0]
     cyx, cyy, cyz = c[1]
-    czx, czy, _czz = c[2]
+    czx, czy = c[2][0], c[2][1]
 
     cxzEta = cxz @ eta
     cyzEta = cyz @ eta
@@ -1441,80 +1508,279 @@ def _liFactorizedSystemMatrixBackend(
     return system
 
 
-def _backendTensorConvolutionData(
+def liFactorizedSystemMatrixBatchBackend(
     data: TensorConvolutionData,
-    backend: _ArrayBackend,
-) -> _BackendTensorConvolutionData:
-    key = (id(data), backend.name, str(backend.device))
-    entry = _BACKEND_TENSOR_DATA_CACHE.get(key)
+    harmonics: BatchedHarmonics,
+    backend: ArrayBackend,
+) -> object:
+    xp = backend.xp
+    torch = xp.torch
+    batchSize = harmonics.batchSize
+    n = harmonics.count
+    diagonal = torch.arange(n, dtype=torch.long, device=backend.device)
+    kx = harmonics.kx
+    ky = harmonics.ky
+    cached = backendTensorConvolutionData(data, backend)
+    c = cached.components
+    eta = cached.etaZz
+
+    cxx, cxy, cxz = c[0]
+    cyx, cyy, cyz = c[1]
+    czx, czy = c[2][0], c[2][1]
+
+    cxzEta = cxz @ eta
+    cyzEta = cyz @ eta
+    etaCzx = eta @ czx
+    etaCzy = eta @ czy
+
+    dxEx = cxx - cxzEta @ czx
+    dxEy = cxy - cxzEta @ czy
+    dxHx = cxzEta[None, :, :] * ky[:, None, :]
+    dxHy = -cxzEta[None, :, :] * kx[:, None, :]
+
+    dyEx = cyx - cyzEta @ czx
+    dyEy = cyy - cyzEta @ czy
+    dyHx = cyzEta[None, :, :] * ky[:, None, :]
+    dyHy = -cyzEta[None, :, :] * kx[:, None, :]
+
+    identity = xp.eye(n, dtype=complex)
+    a11 = -kx[:, :, None] * etaCzx[None, :, :]
+    a12 = -kx[:, :, None] * etaCzy[None, :, :]
+    a13 = kx[:, :, None] * eta[None, :, :] * ky[:, None, :]
+    a14 = identity[None, :, :] - kx[:, :, None] * eta[None, :, :] * kx[:, None, :]
+
+    a21 = -ky[:, :, None] * etaCzx[None, :, :]
+    a22 = -ky[:, :, None] * etaCzy[None, :, :]
+    a23 = ky[:, :, None] * eta[None, :, :] * ky[:, None, :] - identity[None, :, :]
+    a24 = -ky[:, :, None] * eta[None, :, :] * kx[:, None, :]
+
+    a31 = (-dyEx).expand(batchSize, -1, -1).clone()
+    a31[:, diagonal, diagonal] = a31[:, diagonal, diagonal] - kx * ky
+    a32 = (-dyEy).expand(batchSize, -1, -1).clone()
+    a32[:, diagonal, diagonal] = a32[:, diagonal, diagonal] + kx * kx
+    a33 = -dyHx
+    a34 = -dyHy
+
+    a41 = dxEx.expand(batchSize, -1, -1).clone()
+    a41[:, diagonal, diagonal] = a41[:, diagonal, diagonal] - ky * ky
+    a42 = dxEy.expand(batchSize, -1, -1).clone()
+    a42[:, diagonal, diagonal] = a42[:, diagonal, diagonal] + ky * kx
+    a43 = dxHx
+    a44 = dxHy
+
+    system = xp.empty((batchSize, 4 * n, 4 * n), dtype=complex)
+    system[:, 0:n, 0:n] = a11
+    system[:, 0:n, n : 2 * n] = a12
+    system[:, 0:n, 2 * n : 3 * n] = a13
+    system[:, 0:n, 3 * n : 4 * n] = a14
+    system[:, n : 2 * n, 0:n] = a21
+    system[:, n : 2 * n, n : 2 * n] = a22
+    system[:, n : 2 * n, 2 * n : 3 * n] = a23
+    system[:, n : 2 * n, 3 * n : 4 * n] = a24
+    system[:, 2 * n : 3 * n, 0:n] = a31
+    system[:, 2 * n : 3 * n, n : 2 * n] = a32
+    system[:, 2 * n : 3 * n, 2 * n : 3 * n] = a33
+    system[:, 2 * n : 3 * n, 3 * n : 4 * n] = a34
+    system[:, 3 * n : 4 * n, 0:n] = a41
+    system[:, 3 * n : 4 * n, n : 2 * n] = a42
+    system[:, 3 * n : 4 * n, 2 * n : 3 * n] = a43
+    system[:, 3 * n : 4 * n, 3 * n : 4 * n] = a44
+    return system
+
+
+def backendTensorConvolutionData(
+    data: TensorConvolutionData,
+    backend: ArrayBackend,
+) -> BackendTensorConvolutionData:
+    key = (id(data), backend.name, str(backend.device), backendPrecisionLabel(backend))
+    entry = BACKEND_TENSOR_DATA_CACHE.get(key)
     if entry is not None:
         dataRef, cached = entry
         if dataRef() is data:
             return cached
-        _BACKEND_TENSOR_DATA_CACHE.pop(key, None)
+        BACKEND_TENSOR_DATA_CACHE.pop(key, None)
 
-    cached = _BackendTensorConvolutionData(
+    cached = BackendTensorConvolutionData(
         components=tuple(tuple(backend.asarray(component) for component in row) for row in data.components),
         etaZz=backend.asarray(data.etaZz),
     )
 
-    def forget(_ref: weakref.ReferenceType[TensorConvolutionData], cacheKey: tuple[int, str, str] = key) -> None:
-        _BACKEND_TENSOR_DATA_CACHE.pop(cacheKey, None)
+    def forget(ref: weakref.ReferenceType[TensorConvolutionData], cacheKey: BackendTensorCacheKey = key) -> None:
+        BACKEND_TENSOR_DATA_CACHE.pop(cacheKey, None)
 
-    _BACKEND_TENSOR_DATA_CACHE[key] = (weakref.ref(data, forget), cached)
+    BACKEND_TENSOR_DATA_CACHE[key] = (weakref.ref(data, forget), cached)
     return cached
 
 
-def _isHomogeneousLayer(layer: Layer | CompiledLayer) -> bool:
+def isHomogeneousLayer(layer: Layer | CompiledLayer) -> bool:
+    if isinstance(layer, BatchedHomogeneousLayer):
+        return True
     if isinstance(layer, CompiledLayer):
         return layer.tensorData.constantTensor is not None
     if getattr(layer, "normalField", None) is not None:
         return False
-    return _constantTensor(getattr(layer, "epsilon")) is not None
+    return constantTensor(getattr(layer, "epsilon")) is not None
 
 
-def _homogeneousTensorLayerModes(tensor: ComplexArray, harmonics: _Harmonics) -> tuple[ComplexArray, ComplexArray]:
-    qValues, vectors, _matrixShape, _eigTime = _homogeneousTensorLayerModesMeasured(
-        tensor,
-        harmonics,
-        collectTiming=False,
+def isScalarTensor(tensor: ComplexArray) -> bool:
+    array = np.asarray(tensor, dtype=complex)
+    diagonal = np.diag(array)
+    offDiagonal = array - np.diag(diagonal)
+    scale = max(1.0, float(np.max(np.abs(array))) if array.size else 1.0)
+    return bool(np.max(np.abs(offDiagonal)) <= 1e-14 * scale and np.max(np.abs(diagonal - diagonal[0])) <= 1e-14 * scale)
+
+
+def isBatchedScalarTensor(tensors: ComplexArray) -> bool:
+    array = np.asarray(tensors, dtype=complex)
+    if array.ndim != 3 or array.shape[-2:] != (3, 3):
+        return False
+    diagonal = np.stack([array[:, 0, 0], array[:, 1, 1], array[:, 2, 2]], axis=1)
+    offDiagonal = array.copy()
+    offDiagonal[:, 0, 0] = 0.0
+    offDiagonal[:, 1, 1] = 0.0
+    offDiagonal[:, 2, 2] = 0.0
+    scale = max(1.0, float(np.max(np.abs(array))) if array.size else 1.0)
+    return bool(
+        np.max(np.abs(offDiagonal)) <= 1e-14 * scale
+        and np.max(np.abs(diagonal - diagonal[:, :1])) <= 1e-14 * scale
     )
-    return qValues, vectors
 
 
-def _homogeneousTensorLayerModesMeasured(
+def homogeneousScalarLayerModes(
+    epsilon: complex,
+    harmonics: Harmonics,
+    backend: ArrayBackend,
+) -> tuple[object, object, tuple[int, ...], float]:
+    nOrders = harmonics.count
+    forward = backend.asarray(homogeneousBasis(harmonics, epsilon, direction=1))
+    backward = backend.asarray(homogeneousBasis(harmonics, epsilon, direction=-1))
+    kx = backend.asarray(harmonics.kx)
+    ky = backend.asarray(harmonics.ky)
+    qForward = forwardKzTorch(complex(epsilon) - kx * kx - ky * ky, backend.xp.torch)
+    qPairs = backend.xp.empty(2 * nOrders, dtype=complex)
+    qPairs[0::2] = qForward
+    qPairs[1::2] = qForward
+    return backend.xp.concatenate([qPairs, -qPairs]), backend.xp.concatenate([forward, backward], axis=1), (nOrders, 2), 0.0
+
+
+def homogeneousScalarLayerModesBatch(
+    epsilon: complex | ComplexArray,
+    harmonics: BatchedHarmonics,
+    backend: ArrayBackend,
+) -> tuple[object, object]:
+    nOrders = harmonics.count
+    forward = homogeneousBasisBatch(harmonics, epsilon, direction=1, backend=backend)
+    backward = homogeneousBasisBatch(harmonics, epsilon, direction=-1, backend=backend)
+    epsBatch = batchedScalarEpsilon(epsilon, harmonics, backend)
+    qForward = forwardKzTorch(epsBatch - harmonics.kx * harmonics.kx - harmonics.ky * harmonics.ky, backend.xp.torch)
+    qPairs = backend.xp.empty((harmonics.batchSize, 2 * nOrders), dtype=complex)
+    qPairs[:, 0::2] = qForward
+    qPairs[:, 1::2] = qForward
+    return backend.xp.concatenate([qPairs, -qPairs], axis=1), backend.xp.concatenate([forward, backward], axis=2)
+
+
+def batchedScalarEpsilon(
+    epsilon: complex | ComplexArray,
+    harmonics: BatchedHarmonics,
+    backend: ArrayBackend,
+) -> object:
+    torch = backend.xp.torch
+    if np.isscalar(epsilon):
+        return torch.as_tensor(complex(epsilon), dtype=backend.complexDtype, device=backend.device)
+    values = torch.as_tensor(np.asarray(epsilon, dtype=complex), dtype=backend.complexDtype, device=backend.device)
+    if values.ndim == 0:
+        return values
+    if values.shape != (harmonics.batchSize,):
+        raise ValueError("batched scalar epsilon must have shape (batch,)")
+    return values[:, None]
+
+
+def homogeneousTensorLayerModesMeasured(
     tensor: ComplexArray,
-    harmonics: _Harmonics,
+    harmonics: Harmonics,
+    backend: ArrayBackend,
     *,
     collectTiming: bool,
-) -> tuple[ComplexArray, ComplexArray, tuple[int, ...], float]:
-    nOrders = harmonics.count
-    systems = _homogeneousOrderSystemMatrices(tensor, harmonics.kx, harmonics.ky)
-    start = time.perf_counter() if collectTiming else None
-    orderQ, orderVectors = np.linalg.eig(systems)
-    eigTime = time.perf_counter() - start if start is not None else 0.0
+) -> tuple[object, object, tuple[int, ...], float]:
+    return homogeneousTensorLayerModesBackend(
+        tensor,
+        harmonics,
+        backend,
+        collectTiming=collectTiming,
+    )
 
+
+def homogeneousTensorLayerModesBackend(
+    tensor: ComplexArray,
+    harmonics: Harmonics,
+    backend: ArrayBackend,
+    *,
+    collectTiming: bool,
+) -> tuple[object, object, tuple[int, ...], float]:
+    nOrders = harmonics.count
+    systems = homogeneousOrderSystemMatricesBackend(tensor, harmonics, backend)
+    start = startTimedOperation(backend) if collectTiming else None
+    orderQ, orderVectors = backend.eig(systems)
+    eigTime = finishTimedOperation(backend, start) if start is not None else 0.0
+
+    xp = backend.xp
     qValues = orderQ.reshape(-1)
-    vectors = np.zeros((4 * nOrders, 4 * nOrders), dtype=complex)
-    baseColumns = 4 * np.arange(nOrders)
+    vectors = xp.zeros((4 * nOrders, 4 * nOrders), dtype=complex)
+    baseColumns = 4 * xp.arange(nOrders)
+    orderIndices = xp.arange(nOrders)
     for localIndex in range(4):
         columns = baseColumns + localIndex
-        vectors[np.arange(nOrders), columns] = orderVectors[:, 0, localIndex]
-        vectors[nOrders + np.arange(nOrders), columns] = orderVectors[:, 1, localIndex]
-        vectors[2 * nOrders + np.arange(nOrders), columns] = orderVectors[:, 2, localIndex]
-        vectors[3 * nOrders + np.arange(nOrders), columns] = orderVectors[:, 3, localIndex]
-    vectors = _normalizeModes(vectors, _CPU_BACKEND)
-    qValues, vectors = _splitForwardBackward(qValues, vectors, 2 * nOrders, _CPU_BACKEND)
-    return qValues, vectors, tuple(systems.shape), eigTime
+        vectors[orderIndices, columns] = orderVectors[:, 0, localIndex]
+        vectors[nOrders + orderIndices, columns] = orderVectors[:, 1, localIndex]
+        vectors[2 * nOrders + orderIndices, columns] = orderVectors[:, 2, localIndex]
+        vectors[3 * nOrders + orderIndices, columns] = orderVectors[:, 3, localIndex]
+    vectors = normalizeModes(vectors, backend)
+    qValues, vectors = splitForwardBackward(qValues, vectors, 2 * nOrders, backend)
+    return qValues, vectors, tuple(int(value) for value in systems.shape), eigTime
 
 
-def _homogeneousOrderSystemMatrices(tensor: ComplexArray, kx: ComplexArray, ky: ComplexArray) -> ComplexArray:
-    exx, exy, exz = tensor[0]
-    eyx, eyy, eyz = tensor[1]
-    ezx, ezy, ezz = tensor[2]
-    if abs(ezz) < 1e-14:
+def homogeneousTensorLayerModesBatch(
+    tensor: ComplexArray,
+    harmonics: BatchedHarmonics,
+    backend: ArrayBackend,
+) -> tuple[object, object]:
+    nOrders = harmonics.count
+    systems = homogeneousOrderSystemMatricesBatchBackend(tensor, harmonics, backend)
+    orderQ, orderVectors = backend.eig(systems)
+
+    xp = backend.xp
+    torch = xp.torch
+    qValues = orderQ.reshape(harmonics.batchSize, -1)
+    vectors = xp.zeros((harmonics.batchSize, 4 * nOrders, 4 * nOrders), dtype=complex)
+    baseColumns = 4 * torch.arange(nOrders, dtype=torch.long, device=backend.device)
+    orderIndices = torch.arange(nOrders, dtype=torch.long, device=backend.device)
+    batchIndices = torch.arange(harmonics.batchSize, dtype=torch.long, device=backend.device)[:, None]
+    for localIndex in range(4):
+        columns = baseColumns + localIndex
+        vectors[batchIndices, orderIndices[None, :], columns[None, :]] = orderVectors[:, :, 0, localIndex]
+        vectors[batchIndices, nOrders + orderIndices[None, :], columns[None, :]] = orderVectors[:, :, 1, localIndex]
+        vectors[batchIndices, 2 * nOrders + orderIndices[None, :], columns[None, :]] = orderVectors[:, :, 2, localIndex]
+        vectors[batchIndices, 3 * nOrders + orderIndices[None, :], columns[None, :]] = orderVectors[:, :, 3, localIndex]
+    vectors = normalizeModes(vectors, backend)
+    return splitForwardBackward(qValues, vectors, 2 * nOrders, backend)
+
+
+def homogeneousOrderSystemMatricesBackend(
+    tensor: ComplexArray,
+    harmonics: Harmonics,
+    backend: ArrayBackend,
+) -> object:
+    xp = backend.xp
+    torch = xp.torch
+    tensorGpu = backend.asarray(tensor)
+    exx, exy, exz = tensorGpu[0]
+    eyx, eyy, eyz = tensorGpu[1]
+    ezx, ezy, ezz = tensorGpu[2]
+    if bool(torch.abs(ezz) < 1e-14):
         raise ValueError("epsilon_zz is near zero in a homogeneous anisotropic layer")
     eta = 1.0 / ezz
+    kx = backend.asarray(harmonics.kx)
+    ky = backend.asarray(harmonics.ky)
 
     dxEx = exx - exz * eta * ezx
     dxEy = exy - exz * eta * ezy
@@ -1526,7 +1792,7 @@ def _homogeneousOrderSystemMatrices(tensor: ComplexArray, kx: ComplexArray, ky: 
     dyHx = eyz * eta * ky
     dyHy = -eyz * eta * kx
 
-    systems = np.empty((kx.size, 4, 4), dtype=complex)
+    systems = xp.empty((harmonics.count, 4, 4), dtype=complex)
     systems[:, 0, 0] = -kx * eta * ezx
     systems[:, 0, 1] = -kx * eta * ezy
     systems[:, 0, 2] = kx * eta * ky
@@ -1546,13 +1812,29 @@ def _homogeneousOrderSystemMatrices(tensor: ComplexArray, kx: ComplexArray, ky: 
     return systems
 
 
-def _homogeneousOrderSystemMatrix(tensor: ComplexArray, kx: complex, ky: complex) -> ComplexArray:
-    exx, exy, exz = tensor[0]
-    eyx, eyy, eyz = tensor[1]
-    ezx, ezy, ezz = tensor[2]
-    if abs(ezz) < 1e-14:
+def homogeneousOrderSystemMatricesBatchBackend(
+    tensor: ComplexArray,
+    harmonics: BatchedHarmonics,
+    backend: ArrayBackend,
+) -> object:
+    xp = backend.xp
+    torch = xp.torch
+    tensorGpu = backend.asarray(tensor)
+    if tensorGpu.ndim == 2:
+        exx, exy, exz = tensorGpu[0]
+        eyx, eyy, eyz = tensorGpu[1]
+        ezx, ezy, ezz = tensorGpu[2]
+    elif tensorGpu.ndim == 3 and tensorGpu.shape[0] == harmonics.batchSize and tensorGpu.shape[1:] == (3, 3):
+        exx, exy, exz = (tensorGpu[:, 0, index][:, None] for index in range(3))
+        eyx, eyy, eyz = (tensorGpu[:, 1, index][:, None] for index in range(3))
+        ezx, ezy, ezz = (tensorGpu[:, 2, index][:, None] for index in range(3))
+    else:
+        raise ValueError("homogeneous tensor batch must be a (3, 3) tensor or a (batch, 3, 3) tensor array")
+    if bool(torch.any(torch.abs(ezz) < 1e-14)):
         raise ValueError("epsilon_zz is near zero in a homogeneous anisotropic layer")
     eta = 1.0 / ezz
+    kx = harmonics.kx
+    ky = harmonics.ky
 
     dxEx = exx - exz * eta * ezx
     dxEy = exy - exz * eta * ezy
@@ -1564,39 +1846,204 @@ def _homogeneousOrderSystemMatrix(tensor: ComplexArray, kx: complex, ky: complex
     dyHx = eyz * eta * ky
     dyHy = -eyz * eta * kx
 
-    return np.array(
-        [
-            [-kx * eta * ezx, -kx * eta * ezy, kx * eta * ky, 1.0 - kx * eta * kx],
-            [-ky * eta * ezx, -ky * eta * ezy, ky * eta * ky - 1.0, -ky * eta * kx],
-            [-kx * ky - dyEx, kx * kx - dyEy, -dyHx, -dyHy],
-            [dxEx - ky * ky, dxEy + ky * kx, dxHx, dxHy],
-        ],
-        dtype=complex,
-    )
+    systems = xp.empty((harmonics.batchSize, harmonics.count, 4, 4), dtype=complex)
+    systems[:, :, 0, 0] = -kx * eta * ezx
+    systems[:, :, 0, 1] = -kx * eta * ezy
+    systems[:, :, 0, 2] = kx * eta * ky
+    systems[:, :, 0, 3] = 1.0 - kx * eta * kx
+    systems[:, :, 1, 0] = -ky * eta * ezx
+    systems[:, :, 1, 1] = -ky * eta * ezy
+    systems[:, :, 1, 2] = ky * eta * ky - 1.0
+    systems[:, :, 1, 3] = -ky * eta * kx
+    systems[:, :, 2, 0] = -kx * ky - dyEx
+    systems[:, :, 2, 1] = kx * kx - dyEy
+    systems[:, :, 2, 2] = -dyHx
+    systems[:, :, 2, 3] = -dyHy
+    systems[:, :, 3, 0] = dxEx - ky * ky
+    systems[:, :, 3, 1] = dxEy + ky * kx
+    systems[:, :, 3, 2] = dxHx
+    systems[:, :, 3, 3] = dxHy
+    return systems
 
 
-def _splitForwardBackward(
+def splitForwardBackward(
     qValues: object,
     vectors: object,
     nForward: int,
-    backend: _ArrayBackend,
+    backend: ArrayBackend,
 ) -> tuple[object, object]:
-    fluxes = _modeFluxes(vectors, backend)
-    qNumpy = backend.toNumpy(qValues)
-    fluxNumpy = backend.toNumpy(fluxes)
-    forwardIndices = _forwardModeIndices(qNumpy, fluxNumpy, nForward)
-    forwardSet = set(int(index) for index in forwardIndices)
-    backwardIndices = np.array([index for index in range(qNumpy.size) if index not in forwardSet], dtype=int)
-    if backwardIndices.size != nForward:
+    if getattr(qValues, "ndim", 1) == 2:
+        return splitForwardBackwardBatch(qValues, vectors, nForward, backend)
+
+    fluxes = modeFluxes(vectors, backend)
+    indexTensor = splitForwardBackwardIndicesTorch(qValues, fluxes, nForward, backend)
+    return qValues[indexTensor], vectors[:, indexTensor]
+
+
+def splitForwardBackwardBatch(
+    qValues: object,
+    vectors: object,
+    nForward: int,
+    backend: ArrayBackend,
+) -> tuple[object, object]:
+    fluxes = modeFluxes(vectors, backend)
+    indexTensor = splitForwardBackwardIndicesBatchTorch(qValues, fluxes, nForward, backend)
+    torch = backend.xp.torch
+    gatheredVectors = torch.gather(
+        vectors,
+        2,
+        indexTensor[:, None, :].expand(-1, vectors.shape[1], -1),
+    )
+    return torch.gather(qValues, 1, indexTensor), gatheredVectors
+
+
+def splitForwardBackwardIndicesTorch(
+    qValues: object,
+    fluxes: object,
+    nForward: int,
+    backend: ArrayBackend,
+) -> object:
+    torch = backend.xp.torch
+    realFluxes = torch.real(fluxes)
+    scores = forwardModeScoresTorch(qValues, fluxes, backend)
+    order = torchLexsortRows(
+        (
+            torch.arange(qValues.shape[0], dtype=torch.float64, device=backend.device),
+            torch.real(qValues).to(dtype=torch.float64),
+            torch.imag(qValues).to(dtype=torch.float64),
+            realFluxes.to(dtype=torch.float64),
+            scores.to(dtype=torch.float64),
+        ),
+        backend,
+    )
+    forwardUnsorted = order[-nForward:]
+    selected = torch.zeros(qValues.shape[0], dtype=torch.bool, device=backend.device)
+    selected[forwardUnsorted] = True
+    allIndices = torch.arange(qValues.shape[0], dtype=torch.long, device=backend.device)
+    backwardUnsorted = allIndices[~selected]
+    if int(backwardUnsorted.numel()) != nForward:
         raise RuntimeError("anisotropic layer mode split did not produce equal forward/backward spaces")
+    return torch.cat(
+        [
+            sortModeIndicesTorch(forwardUnsorted, qValues, fluxes, forward=True, backend=backend),
+            sortModeIndicesTorch(backwardUnsorted, qValues, fluxes, forward=False, backend=backend),
+        ]
+    )
 
-    forwardIndices = _sortModes(forwardIndices, qNumpy, fluxNumpy, forward=True)
-    backwardIndices = _sortModes(backwardIndices, qNumpy, fluxNumpy, forward=False)
-    indices = np.concatenate([forwardIndices, backwardIndices])
-    return qValues[indices], vectors[:, indices]
+
+def splitForwardBackwardIndicesBatchTorch(
+    qValues: object,
+    fluxes: object,
+    nForward: int,
+    backend: ArrayBackend,
+) -> object:
+    torch = backend.xp.torch
+    realFluxes = torch.real(fluxes)
+    scores = forwardModeScoresTorch(qValues, fluxes, backend)
+    order = torchLexsortRows(
+        (
+            torch.arange(qValues.shape[1], dtype=torch.float64, device=backend.device)[None, :].expand(qValues.shape[0], -1),
+            torch.real(qValues).to(dtype=torch.float64),
+            torch.imag(qValues).to(dtype=torch.float64),
+            realFluxes.to(dtype=torch.float64),
+            scores.to(dtype=torch.float64),
+        ),
+        backend,
+    )
+    forwardUnsorted = order[:, -nForward:]
+    selected = torch.zeros(qValues.shape, dtype=torch.bool, device=backend.device)
+    selected.scatter_(1, forwardUnsorted, True)
+    allIndices = torch.arange(qValues.shape[1], dtype=torch.long, device=backend.device)[None, :].expand(qValues.shape[0], -1)
+    backwardUnsorted = allIndices[~selected].reshape(qValues.shape[0], -1)
+    if int(backwardUnsorted.shape[1]) != nForward:
+        raise RuntimeError("anisotropic layer mode split did not produce equal forward/backward spaces")
+    return torch.cat(
+        [
+            sortModeIndicesBatchTorch(forwardUnsorted, qValues, fluxes, forward=True, backend=backend),
+            sortModeIndicesBatchTorch(backwardUnsorted, qValues, fluxes, forward=False, backend=backend),
+        ],
+        dim=1,
+    )
 
 
-def _forwardModeIndices(qValues: ComplexArray, fluxes: ComplexArray, nForward: int) -> ComplexArray:
+def forwardModeScoresTorch(qValues: object, fluxes: object, backend: ArrayBackend) -> object:
+    torch = backend.xp.torch
+    realFluxes = torch.real(fluxes)
+    absFlux = torch.abs(realFluxes)
+    absImag = torch.abs(torch.imag(qValues))
+    if getattr(qValues, "ndim", 1) == 2:
+        fluxScale = torch.clamp(torch.amax(absFlux, dim=1, keepdim=True), min=1.0)
+        imagScale = torch.clamp(torch.amax(absImag, dim=1, keepdim=True), min=1.0)
+        realScale = torch.clamp(torch.amax(torch.abs(torch.real(qValues)), dim=1, keepdim=True), min=1.0)
+        rowMax = torch.amax(torch.abs(torch.where(absFlux <= 1e-9 * fluxScale, torch.imag(qValues) / imagScale, realFluxes / fluxScale)), dim=1, keepdim=True)
+    else:
+        fluxScale = torch.clamp(torch.amax(absFlux), min=1.0)
+        imagScale = torch.clamp(torch.amax(absImag), min=1.0)
+        realScale = torch.clamp(torch.amax(torch.abs(torch.real(qValues))), min=1.0)
+        rowMax = torch.amax(torch.abs(torch.where(absFlux <= 1e-9 * fluxScale, torch.imag(qValues) / imagScale, realFluxes / fluxScale)))
+
+    scores = realFluxes / fluxScale
+    scores = torch.where(absFlux <= 1e-9 * fluxScale, torch.imag(qValues) / imagScale, scores)
+    return torch.where(rowMax <= 1e-14, torch.real(qValues) / realScale, scores)
+
+
+def sortModeIndicesTorch(
+    indices: object,
+    qValues: object,
+    fluxes: object,
+    *,
+    forward: bool,
+    backend: ArrayBackend,
+) -> object:
+    torch = backend.xp.torch
+    realFluxes = torch.real(fluxes)
+    sign = -1.0 if forward else 1.0
+    return indices[
+        torchLexsortRows(
+            (
+                indices.to(dtype=torch.float64),
+                sign * torch.real(qValues[indices]).to(dtype=torch.float64),
+                sign * torch.imag(qValues[indices]).to(dtype=torch.float64),
+                sign * realFluxes[indices].to(dtype=torch.float64),
+            ),
+            backend,
+        )
+    ]
+
+
+def sortModeIndicesBatchTorch(
+    indices: object,
+    qValues: object,
+    fluxes: object,
+    *,
+    forward: bool,
+    backend: ArrayBackend,
+) -> object:
+    torch = backend.xp.torch
+    realFluxes = torch.real(fluxes)
+    sign = -1.0 if forward else 1.0
+    rows = torch.arange(indices.shape[0], dtype=torch.long, device=backend.device)[:, None]
+    order = torchLexsortRows(
+        (
+            indices.to(dtype=torch.float64),
+            sign * torch.real(torch.gather(qValues, 1, indices)).to(dtype=torch.float64),
+            sign * torch.imag(torch.gather(qValues, 1, indices)).to(dtype=torch.float64),
+            sign * torch.gather(realFluxes, 1, indices).to(dtype=torch.float64),
+        ),
+        backend,
+    )
+    return indices[rows, order]
+
+
+def torchLexsortRows(keys: Sequence[object], backend: ArrayBackend) -> object:
+    torch = backend.xp.torch
+    order = torch.argsort(keys[0], dim=-1, stable=True)
+    for key in keys[1:]:
+        order = torch.gather(order, -1, torch.argsort(torch.gather(key, -1, order), dim=-1, stable=True))
+    return order
+
+
+def forwardModeIndices(qValues: ComplexArray, fluxes: ComplexArray, nForward: int) -> ComplexArray:
     fluxScale = max(1.0, float(np.max(np.abs(fluxes))) if fluxes.size else 1.0)
     imagScale = max(1.0, float(np.max(np.abs(np.imag(qValues)))) if qValues.size else 1.0)
     fluxTolerance = 1e-9 * fluxScale
@@ -1613,8 +2060,16 @@ def _forwardModeIndices(qValues: ComplexArray, fluxes: ComplexArray, nForward: i
     return np.argsort(scores)[-nForward:]
 
 
-def _modeFluxes(vectors: object, backend: _ArrayBackend) -> object:
+def modeFluxes(vectors: object, backend: ArrayBackend) -> object:
     xp = backend.xp
+    if getattr(vectors, "ndim", 2) == 3:
+        nOrders = vectors.shape[1] // 4
+        ex = vectors[:, :nOrders, :]
+        ey = vectors[:, nOrders : 2 * nOrders, :]
+        hx = vectors[:, 2 * nOrders : 3 * nOrders, :]
+        hy = vectors[:, 3 * nOrders :, :]
+        return 0.5 * xp.real(xp.sum(ex * xp.conj(hy) - ey * xp.conj(hx), axis=1))
+
     nOrders = vectors.shape[0] // 4
     ex = vectors[:nOrders, :]
     ey = vectors[nOrders : 2 * nOrders, :]
@@ -1623,7 +2078,7 @@ def _modeFluxes(vectors: object, backend: _ArrayBackend) -> object:
     return 0.5 * xp.real(xp.sum(ex * xp.conj(hy) - ey * xp.conj(hx), axis=0))
 
 
-def _sortModes(indices: ComplexArray, qValues: ComplexArray, fluxes: ComplexArray, forward: bool) -> ComplexArray:
+def sortModes(indices: ComplexArray, qValues: ComplexArray, fluxes: ComplexArray, forward: bool) -> ComplexArray:
     sign = -1.0 if forward else 1.0
     return np.array(
         sorted(
@@ -1639,10 +2094,23 @@ def _sortModes(indices: ComplexArray, qValues: ComplexArray, fluxes: ComplexArra
     )
 
 
-def _normalizeModes(vectors: object, backend: _ArrayBackend) -> object:
+def normalizeModes(vectors: object, backend: ArrayBackend) -> object:
     xp = backend.xp
+    if getattr(vectors, "ndim", 2) == 3:
+        amplitudes = xp.max(xp.abs(vectors), axis=1)
+        fluxes = xp.abs(modeFluxes(vectors, backend))
+        fluxful = fluxes > 1e-12
+        scales = xp.where(fluxful, xp.sqrt(fluxes), amplitudes)
+        scales = xp.where(scales > 0, scales, 1.0)
+        normalized = vectors / scales[:, None, :]
+
+        pivotIndices = xp.argmax(xp.abs(normalized), axis=1)
+        pivotValues = xp.torch.gather(normalized, 1, pivotIndices[:, None, :]).squeeze(1)
+        phases = xp.where(xp.abs(pivotValues) > 0, pivotValues / xp.abs(pivotValues), 1.0 + 0.0j)
+        return normalized / phases[:, None, :]
+
     amplitudes = xp.max(xp.abs(vectors), axis=0)
-    fluxes = xp.abs(_modeFluxes(vectors, backend))
+    fluxes = xp.abs(modeFluxes(vectors, backend))
     fluxful = fluxes > 1e-12
     scales = xp.where(fluxful, xp.sqrt(fluxes), amplitudes)
     scales = xp.where(scales > 0, scales, 1.0)
@@ -1654,126 +2122,112 @@ def _normalizeModes(vectors: object, backend: _ArrayBackend) -> object:
     return normalized / phases
 
 
-def _propagationSMatrixBidirectional(forward: object, backward: object, backend: _ArrayBackend) -> _SMatrix:
-    zeroForward = backend.xp.zeros_like(forward)
-    return _SMatrix(
-        s11=backend.copy(zeroForward),
-        s12=backend.copy(backward),
-        s21=backend.copy(forward),
-        s22=backend.copy(zeroForward),
-        isPropagation=True,
-    )
-
-
-def _identitySMatrix(size: int, backend: _ArrayBackend) -> _SMatrix:
-    xp = backend.xp
-    zero = xp.zeros((size, size), dtype=complex)
-    identity = xp.eye(size, dtype=complex)
-    return _SMatrix(
-        s11=backend.copy(zero),
-        s12=backend.copy(identity),
-        s21=backend.copy(identity),
-        s22=backend.copy(zero),
-        isIdentity=True,
-    )
-
-
-def _interfaceSMatrix(
+def interfaceSMatrix(
     leftForward: object,
     leftBackward: object,
     rightForward: object,
     rightBackward: object,
-    backend: _ArrayBackend,
+    backend: ArrayBackend,
     *,
     homogeneousLeft: bool = False,
     homogeneousRight: bool = False,
     nOrders: int | None = None,
-) -> _SMatrix:
-    if homogeneousLeft and homogeneousRight and nOrders is not None and (not backend.isGpu or nOrders >= 180):
-        blockResult = _homogeneousInterfaceSMatrix(
+) -> SMatrix:
+    if nOrders is not None:
+        structured = structuredInterfaceSMatrix(
             leftForward,
             leftBackward,
             rightForward,
             rightBackward,
             nOrders,
             backend,
+            homogeneousLeft=homogeneousLeft,
+            homogeneousRight=homogeneousRight,
         )
-        if blockResult is not None:
-            return blockResult
+        if structured is not None:
+            return structured
 
     xp = backend.xp
-    size = leftForward.shape[1]
-    matrix = xp.concatenate([leftBackward, -rightForward], axis=1)
+    size = leftForward.shape[-1]
+    matrix = xp.concatenate([leftBackward, -rightForward], axis=-1)
     rhsLeft = -leftForward
     rhsRight = rightBackward
-    solved = _solveInterfaceBlocks(backend, matrix, rhsLeft, rhsRight)
-    return _SMatrix(
-        s11=solved[:size, :size],
-        s12=solved[:size, size:],
-        s21=solved[size:, :size],
-        s22=solved[size:, size:],
+    solved = solveInterfaceBlocks(backend, matrix, rhsLeft, rhsRight)
+    return SMatrix(
+        s11=solved[..., :size, :size],
+        s12=solved[..., :size, size:],
+        s21=solved[..., size:, :size],
+        s22=solved[..., size:, size:],
     )
 
 
-def _interfaceSMatrices(
+def interfaceSMatrices(
     regionForward: Sequence[object],
     regionBackward: Sequence[object],
     regionHomogeneous: Sequence[bool],
     nOrders: int,
-    backend: _ArrayBackend,
-) -> tuple[_SMatrix, ...]:
-    if not backend.isTorch:
-        return tuple(
-            _interfaceSMatrix(
-                regionForward[index],
-                regionBackward[index],
-                regionForward[index + 1],
-                regionBackward[index + 1],
-                backend,
-                homogeneousLeft=regionHomogeneous[index],
-                homogeneousRight=regionHomogeneous[index + 1],
-                nOrders=nOrders,
-            )
-            for index in range(len(regionForward) - 1)
-        )
-
+    backend: ArrayBackend,
+) -> tuple[SMatrix, ...]:
     xp = backend.xp
-    results: list[_SMatrix | None] = [None] * (len(regionForward) - 1)
+    batched = bool(regionForward and getattr(regionForward[0], "ndim", 2) == 3)
+    results: list[SMatrix | None] = [None] * (len(regionForward) - 1)
     batchedMatrices = []
     batchedRhs = []
     batchedIndices: list[int] = []
+    structuredWorks: list[PatternedHomogeneousInterfaceWork] = []
+    structuredIndices: list[int] = []
     for index in range(len(regionForward) - 1):
         homogeneousLeft = regionHomogeneous[index]
         homogeneousRight = regionHomogeneous[index + 1]
-        if homogeneousLeft and homogeneousRight and nOrders >= 180:
-            results[index] = _interfaceSMatrix(
+        if homogeneousLeft and homogeneousRight:
+            structured = homogeneousInterfaceSMatrix(
                 regionForward[index],
                 regionBackward[index],
                 regionForward[index + 1],
                 regionBackward[index + 1],
+                nOrders,
+                backend,
+            )
+            if structured is not None:
+                results[index] = structured
+                continue
+        elif homogeneousLeft != homogeneousRight and patternedHomogeneousInterfaceEnabled():
+            work = patternedHomogeneousInterfaceWork(
+                regionForward[index],
+                regionBackward[index],
+                regionForward[index + 1],
+                regionBackward[index + 1],
+                nOrders,
                 backend,
                 homogeneousLeft=homogeneousLeft,
-                homogeneousRight=homogeneousRight,
-                nOrders=nOrders,
             )
-            continue
+            if work is not None:
+                structuredWorks.append(work)
+                structuredIndices.append(index)
+                continue
 
-        batchedMatrices.append(xp.concatenate([regionBackward[index], -regionForward[index + 1]], axis=1))
-        batchedRhs.append(xp.concatenate([-regionForward[index], regionBackward[index + 1]], axis=1))
+        batchedMatrices.append(xp.concatenate([regionBackward[index], -regionForward[index + 1]], axis=-1))
+        batchedRhs.append(xp.concatenate([-regionForward[index], regionBackward[index + 1]], axis=-1))
         batchedIndices.append(index)
 
+    if structuredWorks:
+        solvedStructured = solvePatternedHomogeneousInterfaceWorks(structuredWorks, backend)
+        for regionIndex, result in zip(structuredIndices, solvedStructured):
+            results[regionIndex] = result
+
     if batchedMatrices:
-        matrixBatch = xp.stack(batchedMatrices, axis=0)
-        rhsBatch = xp.stack(batchedRhs, axis=0)
-        solvedBatch = _solveInterfaceBlocks(backend, matrixBatch, rhsBatch)
-        size = regionForward[0].shape[1]
+        stackAxis = 1 if batched else 0
+        matrixBatch = xp.stack(batchedMatrices, axis=stackAxis)
+        rhsBatch = xp.stack(batchedRhs, axis=stackAxis)
+        solvedBatch = solveInterfaceBlocks(backend, matrixBatch, rhsBatch)
+        size = regionForward[0].shape[-1]
         for batchIndex, regionIndex in enumerate(batchedIndices):
-            solved = solvedBatch[batchIndex]
-            results[regionIndex] = _SMatrix(
-                s11=solved[:size, :size],
-                s12=solved[:size, size:],
-                s21=solved[size:, :size],
-                s22=solved[size:, size:],
+            solved = solvedBatch[:, batchIndex] if batched else solvedBatch[batchIndex]
+            results[regionIndex] = SMatrix(
+                s11=solved[..., :size, :size],
+                s12=solved[..., :size, size:],
+                s21=solved[..., size:, :size],
+                s22=solved[..., size:, size:],
             )
 
     if any(result is None for result in results):
@@ -1781,22 +2235,313 @@ def _interfaceSMatrices(
     return tuple(result for result in results if result is not None)
 
 
-def _homogeneousInterfaceSMatrix(
+def interfaceConditionNumbers(
+    regionForward: Sequence[object],
+    regionBackward: Sequence[object],
+    backend: ArrayBackend,
+) -> tuple[float, ...]:
+    if len(regionForward) < 2:
+        return ()
+    torch = backend.xp.torch
+    matrices = [
+        torch.cat([regionBackward[index], -regionForward[index + 1]], dim=1)
+        for index in range(len(regionForward) - 1)
+    ]
+    if not matrices:
+        return ()
+    values = torch.linalg.cond(torch.stack(matrices, dim=0))
+    return tuple(float(value.detach().cpu().item()) for value in values)
+
+
+def structuredInterfaceSMatrix(
     leftForward: object,
     leftBackward: object,
     rightForward: object,
     rightBackward: object,
     nOrders: int,
-    backend: _ArrayBackend,
-) -> _SMatrix | None:
-    leftForwardArray = backend.toNumpy(leftForward)
-    leftBackwardArray = backend.toNumpy(leftBackward)
-    rightForwardArray = backend.toNumpy(rightForward)
-    rightBackwardArray = backend.toNumpy(rightBackward)
-    leftForwardOrders = _homogeneousColumnOrdersFromArray(leftForwardArray, nOrders)
-    leftBackwardOrders = _homogeneousColumnOrdersFromArray(leftBackwardArray, nOrders)
-    rightForwardOrders = _homogeneousColumnOrdersFromArray(rightForwardArray, nOrders)
-    rightBackwardOrders = _homogeneousColumnOrdersFromArray(rightBackwardArray, nOrders)
+    backend: ArrayBackend,
+    *,
+    homogeneousLeft: bool,
+    homogeneousRight: bool,
+) -> SMatrix | None:
+    if homogeneousLeft and homogeneousRight:
+        return homogeneousInterfaceSMatrix(
+            leftForward,
+            leftBackward,
+            rightForward,
+            rightBackward,
+            nOrders,
+            backend,
+        )
+    if homogeneousLeft == homogeneousRight or not patternedHomogeneousInterfaceEnabled():
+        return None
+    try:
+        return patternedHomogeneousInterfaceSMatrix(
+            leftForward,
+            leftBackward,
+            rightForward,
+            rightBackward,
+            nOrders,
+            backend,
+            homogeneousLeft=homogeneousLeft,
+        )
+    except RuntimeError:
+        return None
+
+
+def patternedHomogeneousInterfaceSMatrix(
+    leftForward: object,
+    leftBackward: object,
+    rightForward: object,
+    rightBackward: object,
+    nOrders: int,
+    backend: ArrayBackend,
+    *,
+    homogeneousLeft: bool,
+) -> SMatrix | None:
+    work = patternedHomogeneousInterfaceWork(
+        leftForward,
+        leftBackward,
+        rightForward,
+        rightBackward,
+        nOrders,
+        backend,
+        homogeneousLeft=homogeneousLeft,
+    )
+    if work is None:
+        return None
+    return solvePatternedHomogeneousInterfaceWorks([work], backend)[0]
+
+
+def patternedHomogeneousInterfaceWork(
+    leftForward: object,
+    leftBackward: object,
+    rightForward: object,
+    rightBackward: object,
+    nOrders: int,
+    backend: ArrayBackend,
+    *,
+    homogeneousLeft: bool,
+) -> PatternedHomogeneousInterfaceWork | None:
+    xp = backend.xp
+    size = int(leftForward.shape[-1])
+    rhs = xp.concatenate([-leftForward, rightBackward], axis=-1)
+
+    if homogeneousLeft:
+        factors = homogeneousBlockFactors(leftBackward, nOrders, backend)
+        if factors is None:
+            return None
+        columns, rowIndex, nullRows, leftInverse = factors
+        return PatternedHomogeneousInterfaceWork(
+            homogeneousLeft=True,
+            homogeneousMatrix=leftBackward,
+            patternedMatrix=rightForward,
+            reducedMatrix=-applyHomogeneousBlockRows(nullRows, rightForward, rowIndex),
+            reducedRhs=applyHomogeneousBlockRows(nullRows, rhs, rowIndex),
+            fullRhs=rhs,
+            columns=columns,
+            rowIndex=rowIndex,
+            leftInverse=leftInverse,
+            size=size,
+        )
+
+    factors = homogeneousBlockFactors(rightForward, nOrders, backend)
+    if factors is None:
+        return None
+    columns, rowIndex, nullRows, leftInverse = factors
+    return PatternedHomogeneousInterfaceWork(
+        homogeneousLeft=False,
+        homogeneousMatrix=rightForward,
+        patternedMatrix=leftBackward,
+        reducedMatrix=applyHomogeneousBlockRows(nullRows, leftBackward, rowIndex),
+        reducedRhs=applyHomogeneousBlockRows(nullRows, rhs, rowIndex),
+        fullRhs=rhs,
+        columns=columns,
+        rowIndex=rowIndex,
+        leftInverse=leftInverse,
+        size=size,
+    )
+
+
+def solvePatternedHomogeneousInterfaceWorks(
+    works: Sequence[PatternedHomogeneousInterfaceWork],
+    backend: ArrayBackend,
+) -> tuple[SMatrix, ...]:
+    if not works:
+        return ()
+    if len(works) == 1:
+        work = works[0]
+        patternedSolution = solveInterfaceBlocks(backend, work.reducedMatrix, work.reducedRhs)
+        return (finishPatternedHomogeneousInterface(work, patternedSolution, backend),)
+
+    xp = backend.xp
+    batched = getattr(works[0].reducedMatrix, "ndim", 2) == 3
+    sameShape = all(
+        work.reducedMatrix.shape == works[0].reducedMatrix.shape
+        and work.reducedRhs.shape == works[0].reducedRhs.shape
+        and not batched
+        for work in works
+    )
+    if not sameShape:
+        return tuple(
+            finishPatternedHomogeneousInterface(
+                work,
+                solveInterfaceBlocks(backend, work.reducedMatrix, work.reducedRhs),
+                backend,
+            )
+            for work in works
+        )
+
+    matrixBatch = xp.stack([work.reducedMatrix for work in works], axis=0)
+    rhsBatch = xp.stack([work.reducedRhs for work in works], axis=0)
+    solvedBatch = solveInterfaceBlocks(backend, matrixBatch, rhsBatch)
+    return tuple(
+        finishPatternedHomogeneousInterface(work, solvedBatch[index], backend)
+        for index, work in enumerate(works)
+    )
+
+
+def finishPatternedHomogeneousInterface(
+    work: PatternedHomogeneousInterfaceWork,
+    patternedSolution: object,
+    backend: ArrayBackend,
+) -> SMatrix:
+    xp = backend.xp
+    if work.homogeneousLeft:
+        residual = work.fullRhs + work.patternedMatrix @ patternedSolution
+        homogeneousSolution = homogeneousAmplitudesFromRows(
+            work.leftInverse,
+            residual,
+            work.columns,
+            work.rowIndex,
+            work.size,
+            backend,
+        )
+        solved = xp.concatenate([homogeneousSolution, patternedSolution], axis=-2)
+    else:
+        residual = work.patternedMatrix @ patternedSolution - work.fullRhs
+        homogeneousSolution = homogeneousAmplitudesFromRows(
+            work.leftInverse,
+            residual,
+            work.columns,
+            work.rowIndex,
+            work.size,
+            backend,
+        )
+        solved = xp.concatenate([patternedSolution, homogeneousSolution], axis=-2)
+
+    size = work.size
+    return SMatrix(
+        s11=solved[..., :size, :size],
+        s12=solved[..., :size, size:],
+        s21=solved[..., size:, :size],
+        s22=solved[..., size:, size:],
+    )
+
+
+def homogeneousBlockFactors(
+    matrix: object,
+    nOrders: int,
+    backend: ArrayBackend,
+) -> tuple[object, object, object, object] | None:
+    torch = backend.xp.torch
+    rowIndex = fieldRowsForOrderTorch(nOrders, backend)
+
+    if getattr(matrix, "ndim", 2) == 3:
+        assignments = homogeneousColumnOrdersBatchTorch(matrix, nOrders, backend)
+        if assignments is None:
+            return None
+        columns = columnsForOrdersBatchTorch(assignments, nOrders, backend)
+        if columns is None:
+            return None
+        batchSize = int(matrix.shape[0])
+        batchIndex = torch.arange(batchSize, dtype=torch.long, device=backend.device)[:, None, None, None]
+        blocks = matrix[batchIndex, rowIndex[None, :, :, None], columns[:, :, None, :]]
+    else:
+        assignments = homogeneousColumnOrdersTorch(matrix, nOrders, backend)
+        if assignments is None:
+            return None
+        columns = columnsForOrdersTorch(assignments, nOrders, backend)
+        if columns is None:
+            return None
+        blocks = matrix[rowIndex[:, :, None], columns[:, None, :]]
+
+    qMatrix, rMatrix = torch.linalg.qr(blocks, mode="complete")
+    nullRows = torch.conj(torch.transpose(qMatrix[..., :, 2:], -2, -1))
+    leftInverse = torch.linalg.solve(rMatrix[..., :2, :], torch.conj(torch.transpose(qMatrix[..., :, :2], -2, -1)))
+    return columns, rowIndex, nullRows, leftInverse
+
+
+def applyHomogeneousBlockRows(operator: object, matrix: object, rowIndex: object) -> object:
+    if getattr(matrix, "ndim", 2) == 3:
+        rows = matrix[:, rowIndex, :]
+        return (operator @ rows).reshape(matrix.shape[0], -1, matrix.shape[-1])
+    rows = matrix[rowIndex, :]
+    return (operator @ rows).reshape(-1, matrix.shape[-1])
+
+
+def homogeneousAmplitudesFromRows(
+    leftInverse: object,
+    values: object,
+    columns: object,
+    rowIndex: object,
+    size: int,
+    backend: ArrayBackend,
+) -> object:
+    xp = backend.xp
+    if getattr(values, "ndim", 2) == 3:
+        amplitudes = leftInverse @ values[:, rowIndex, :]
+        result = xp.zeros((values.shape[0], size, values.shape[-1]), dtype=complex)
+        flatColumns = columns.reshape(columns.shape[0], -1)
+        flatAmplitudes = amplitudes.reshape(values.shape[0], -1, values.shape[-1])
+        result.scatter_(1, flatColumns[:, :, None].expand(-1, -1, values.shape[-1]), flatAmplitudes)
+        return result
+
+    amplitudes = leftInverse @ values[rowIndex, :]
+    result = xp.zeros((size, values.shape[-1]), dtype=complex)
+    result[columns.reshape(-1), :] = amplitudes.reshape(-1, values.shape[-1])
+    return result
+
+
+def homogeneousInterfaceSMatrix(
+    leftForward: object,
+    leftBackward: object,
+    rightForward: object,
+    rightBackward: object,
+    nOrders: int,
+    backend: ArrayBackend,
+) -> SMatrix | None:
+    if getattr(leftForward, "ndim", 2) == 3:
+        return homogeneousInterfaceSMatrixBatchTorch(
+            leftForward,
+            leftBackward,
+            rightForward,
+            rightBackward,
+            nOrders,
+            backend,
+        )
+    return homogeneousInterfaceSMatrixTorch(
+        leftForward,
+        leftBackward,
+        rightForward,
+        rightBackward,
+        nOrders,
+        backend,
+    )
+
+
+def homogeneousInterfaceSMatrixBatchTorch(
+    leftForward: object,
+    leftBackward: object,
+    rightForward: object,
+    rightBackward: object,
+    nOrders: int,
+    backend: ArrayBackend,
+) -> SMatrix | None:
+    leftForwardOrders = homogeneousColumnOrdersBatchTorch(leftForward, nOrders, backend)
+    leftBackwardOrders = homogeneousColumnOrdersBatchTorch(leftBackward, nOrders, backend)
+    rightForwardOrders = homogeneousColumnOrdersBatchTorch(rightForward, nOrders, backend)
+    rightBackwardOrders = homogeneousColumnOrdersBatchTorch(rightBackward, nOrders, backend)
     if (
         leftForwardOrders is None
         or leftBackwardOrders is None
@@ -1805,268 +2550,228 @@ def _homogeneousInterfaceSMatrix(
     ):
         return None
 
-    size = leftForward.shape[1]
-    s11 = np.zeros((size, size), dtype=complex)
-    s12 = np.zeros((size, size), dtype=complex)
-    s21 = np.zeros((size, size), dtype=complex)
-    s22 = np.zeros((size, size), dtype=complex)
-
-    matrices = np.empty((nOrders, 4, 4), dtype=complex)
-    rightHandSides = np.empty((nOrders, 4, 4), dtype=complex)
-    columnGroups: list[tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray]] = []
-    for orderIndex in range(nOrders):
-        leftForwardColumns = _columnsForOrder(leftForwardOrders, orderIndex)
-        leftBackwardColumns = _columnsForOrder(leftBackwardOrders, orderIndex)
-        rightForwardColumns = _columnsForOrder(rightForwardOrders, orderIndex)
-        rightBackwardColumns = _columnsForOrder(rightBackwardOrders, orderIndex)
-        if (
-            leftForwardColumns.size != 2
-            or leftBackwardColumns.size != 2
-            or rightForwardColumns.size != 2
-            or rightBackwardColumns.size != 2
-        ):
-            return None
-
-        rows = _fieldRowsForOrder(nOrders, orderIndex)
-        matrices[orderIndex] = np.concatenate(
-            [
-                leftBackwardArray[rows[:, None], leftBackwardColumns],
-                -rightForwardArray[rows[:, None], rightForwardColumns],
-            ],
-            axis=1,
-        )
-        rightHandSides[orderIndex] = np.concatenate(
-            [
-                -leftForwardArray[rows[:, None], leftForwardColumns],
-                rightBackwardArray[rows[:, None], rightBackwardColumns],
-            ],
-            axis=1,
-        )
-        columnGroups.append((leftForwardColumns, leftBackwardColumns, rightForwardColumns, rightBackwardColumns))
-
-    try:
-        solvedBlocks = np.linalg.solve(matrices, rightHandSides)
-    except np.linalg.LinAlgError:
-        return None
-
-    for solved, (leftForwardColumns, leftBackwardColumns, rightForwardColumns, rightBackwardColumns) in zip(
-        solvedBlocks,
-        columnGroups,
+    xp = backend.xp
+    torch = xp.torch
+    batchSize = int(leftForward.shape[0])
+    size = int(leftForward.shape[-1])
+    rowIndex = fieldRowsForOrderTorch(nOrders, backend)
+    leftForwardColumns = columnsForOrdersBatchTorch(leftForwardOrders, nOrders, backend)
+    leftBackwardColumns = columnsForOrdersBatchTorch(leftBackwardOrders, nOrders, backend)
+    rightForwardColumns = columnsForOrdersBatchTorch(rightForwardOrders, nOrders, backend)
+    rightBackwardColumns = columnsForOrdersBatchTorch(rightBackwardOrders, nOrders, backend)
+    if (
+        leftForwardColumns is None
+        or leftBackwardColumns is None
+        or rightForwardColumns is None
+        or rightBackwardColumns is None
     ):
-        s11[leftBackwardColumns[:, None], leftForwardColumns] = solved[:2, :2]
-        s12[leftBackwardColumns[:, None], rightBackwardColumns] = solved[:2, 2:]
-        s21[rightForwardColumns[:, None], leftForwardColumns] = solved[2:, :2]
-        s22[rightForwardColumns[:, None], rightBackwardColumns] = solved[2:, 2:]
-
-    return _SMatrix(
-        s11=backend.asarray(s11),
-        s12=backend.asarray(s12),
-        s21=backend.asarray(s21),
-        s22=backend.asarray(s22),
-    )
-
-
-def _homogeneousColumnOrders(matrix: object, nOrders: int) -> ComplexArray | None:
-    return _homogeneousColumnOrdersFromArray(np.asarray(matrix), nOrders)
-
-
-def _homogeneousColumnOrdersFromArray(array: ComplexArray, nOrders: int) -> ComplexArray | None:
-    if array.shape[0] != 4 * nOrders:
         return None
-    assignments = np.full(array.shape[1], -1, dtype=int)
-    tolerance = 1e-10 * max(1.0, float(np.max(np.abs(array))) if array.size else 1.0)
-    for column in range(array.shape[1]):
-        activeRows = np.flatnonzero(np.abs(array[:, column]) > tolerance)
-        if activeRows.size == 0:
-            return None
-        orders = np.unique(activeRows % nOrders)
-        if orders.size != 1:
-            return None
-        assignments[column] = int(orders[0])
-    return assignments
+
+    batchIndex = torch.arange(batchSize, dtype=torch.long, device=backend.device)[:, None, None, None]
+    rows = rowIndex[None, :, :, None]
+    matrices = torch.cat(
+        [
+            leftBackward[batchIndex, rows, leftBackwardColumns[:, :, None, :]],
+            -rightForward[batchIndex, rows, rightForwardColumns[:, :, None, :]],
+        ],
+        dim=3,
+    )
+    rightHandSides = torch.cat(
+        [
+            -leftForward[batchIndex, rows, leftForwardColumns[:, :, None, :]],
+            rightBackward[batchIndex, rows, rightBackwardColumns[:, :, None, :]],
+        ],
+        dim=3,
+    )
+    try:
+        solvedBlocks = backend.solve(matrices, rightHandSides)
+    except RuntimeError:
+        return None
+
+    s11 = xp.zeros((batchSize, size, size), dtype=complex)
+    s12 = xp.zeros((batchSize, size, size), dtype=complex)
+    s21 = xp.zeros((batchSize, size, size), dtype=complex)
+    s22 = xp.zeros((batchSize, size, size), dtype=complex)
+
+    batchRows = torch.arange(batchSize, dtype=torch.long, device=backend.device)[:, None, None, None]
+    leftBackwardTarget = leftBackwardColumns[:, :, :, None]
+    leftForwardSource = leftForwardColumns[:, :, None, :]
+    rightForwardTarget = rightForwardColumns[:, :, :, None]
+    rightBackwardSource = rightBackwardColumns[:, :, None, :]
+    s11[batchRows, leftBackwardTarget, leftForwardSource] = solvedBlocks[:, :, :2, :2]
+    s12[batchRows, leftBackwardTarget, rightBackwardSource] = solvedBlocks[:, :, :2, 2:]
+    s21[batchRows, rightForwardTarget, leftForwardSource] = solvedBlocks[:, :, 2:, :2]
+    s22[batchRows, rightForwardTarget, rightBackwardSource] = solvedBlocks[:, :, 2:, 2:]
+
+    return SMatrix(s11=s11, s12=s12, s21=s21, s22=s22)
 
 
-def _columnsForOrder(assignments: ComplexArray, orderIndex: int) -> ComplexArray:
-    return np.flatnonzero(assignments == orderIndex)
-
-
-def _fieldRowsForOrder(nOrders: int, orderIndex: int) -> ComplexArray:
-    return np.array([orderIndex, nOrders + orderIndex, 2 * nOrders + orderIndex, 3 * nOrders + orderIndex])
-
-
-def _redhefferStar(left: _SMatrix, right: _SMatrix, backend: _ArrayBackend) -> _SMatrix:
-    if left.isIdentity:
-        return right
-    if right.isIdentity:
-        return left
-    if right.isPropagation:
-        forward = _matrixDiagonal(right.s21)
-        backward = _matrixDiagonal(right.s12)
-        return _SMatrix(
-            s11=left.s11,
-            s12=left.s12 * backward[None, :],
-            s21=forward[:, None] * left.s21,
-            s22=forward[:, None] * left.s22 * backward[None, :],
-        )
-    if left.isPropagation:
-        forward = _matrixDiagonal(left.s21)
-        backward = _matrixDiagonal(left.s12)
-        return _SMatrix(
-            s11=backward[:, None] * right.s11 * forward[None, :],
-            s12=backward[:, None] * right.s12,
-            s21=right.s21 * forward[None, :],
-            s22=right.s22,
-        )
+def homogeneousInterfaceSMatrixTorch(
+    leftForward: object,
+    leftBackward: object,
+    rightForward: object,
+    rightBackward: object,
+    nOrders: int,
+    backend: ArrayBackend,
+) -> SMatrix | None:
+    if getattr(leftForward, "ndim", 2) == 3:
+        return None
+    leftForwardOrders = homogeneousColumnOrdersTorch(leftForward, nOrders, backend)
+    leftBackwardOrders = homogeneousColumnOrdersTorch(leftBackward, nOrders, backend)
+    rightForwardOrders = homogeneousColumnOrdersTorch(rightForward, nOrders, backend)
+    rightBackwardOrders = homogeneousColumnOrdersTorch(rightBackward, nOrders, backend)
+    if (
+        leftForwardOrders is None
+        or leftBackwardOrders is None
+        or rightForwardOrders is None
+        or rightBackwardOrders is None
+    ):
+        return None
 
     xp = backend.xp
-    size = left.s11.shape[0]
-    identity = xp.eye(size, dtype=complex)
-    leftFactor = identity - right.s11 @ left.s22
-    rightFactor = identity - left.s22 @ right.s11
-    leftSolved = _solveFactoredBlocks(backend, leftFactor, right.s11, right.s12)
-    rightSolved = _solveFactoredBlocks(backend, rightFactor, left.s22, left.s21)
-    leftDenominator = leftSolved[:, :size]
-    leftTransmission = leftSolved[:, size:]
-    rightDenominator = rightSolved[:, :size]
-    rightTransmission = rightSolved[:, size:]
-    return _SMatrix(
-        s11=left.s11 + left.s12 @ leftDenominator @ left.s21,
-        s12=left.s12 @ leftTransmission,
-        s21=right.s21 @ rightTransmission,
-        s22=right.s22 + right.s21 @ rightDenominator @ right.s12,
+    torch = xp.torch
+    size = leftForward.shape[1]
+    rowIndex = fieldRowsForOrderTorch(nOrders, backend)
+    leftForwardColumns = columnsForOrdersTorch(leftForwardOrders, nOrders, backend)
+    leftBackwardColumns = columnsForOrdersTorch(leftBackwardOrders, nOrders, backend)
+    rightForwardColumns = columnsForOrdersTorch(rightForwardOrders, nOrders, backend)
+    rightBackwardColumns = columnsForOrdersTorch(rightBackwardOrders, nOrders, backend)
+    if (
+        leftForwardColumns is None
+        or leftBackwardColumns is None
+        or rightForwardColumns is None
+        or rightBackwardColumns is None
+    ):
+        return None
+
+    matrices = torch.cat(
+        [
+            leftBackward[rowIndex[:, :, None], leftBackwardColumns[:, None, :]],
+            -rightForward[rowIndex[:, :, None], rightForwardColumns[:, None, :]],
+        ],
+        dim=2,
     )
-
-
-def _matrixDiagonal(matrix: object) -> object:
-    return matrix.diagonal()
-
-
-def _solveFactored(backend: _ArrayBackend, matrix: object, rhs: object) -> object:
-    return backend.solveFactored(backend.factor(matrix), rhs)
-
-
-def _solveFactoredBlocks(backend: _ArrayBackend, matrix: object, *rhsBlocks: object) -> object:
-    if len(rhsBlocks) == 1:
-        return _solveFactored(backend, matrix, rhsBlocks[0])
-    rhs = backend.xp.concatenate(rhsBlocks, axis=1)
-    return backend.solveFactored(backend.factor(matrix), rhs)
-
-
-def _solveInterfaceBlocks(backend: _ArrayBackend, matrix: object, *rhsBlocks: object) -> object:
-    if len(rhsBlocks) == 1:
-        rhs = rhsBlocks[0]
-    else:
-        rhs = backend.xp.concatenate(rhsBlocks, axis=1)
-
-    method = _interfaceSolveMethod()
-    if method == "solve":
-        return backend.solve(matrix, rhs)
-    if method == "lu":
-        return backend.solveFactored(backend.factor(matrix), rhs)
-    raise ValueError("RCWA3D_INTERFACE_SOLVER must be 'lu' or 'solve'")
-
-
-def _interfaceSolveMethod() -> str:
-    return os.environ.get("RCWA3D_INTERFACE_SOLVER", "solve").strip().lower()
-
-
-def _cascadeMany(components: Sequence[_SMatrix], size: int, backend: _ArrayBackend) -> _SMatrix:
-    result = _identitySMatrix(size, backend)
-    for component in components:
-        result = _redhefferStar(result, component, backend)
-    return result
-
-
-def _reflectionTransmissionOnlySMatrix(
-    components: Sequence[_SMatrix],
-    size: int,
-    backend: _ArrayBackend,
-) -> _SMatrix:
-    reflection, transmission = _enhancedReflectionTransmission(components, size, backend)
-    zero = backend.xp.zeros_like(reflection)
-    return _SMatrix(
-        s11=reflection,
-        s12=backend.copy(zero),
-        s21=transmission,
-        s22=backend.copy(zero),
+    rightHandSides = torch.cat(
+        [
+            -leftForward[rowIndex[:, :, None], leftForwardColumns[:, None, :]],
+            rightBackward[rowIndex[:, :, None], rightBackwardColumns[:, None, :]],
+        ],
+        dim=2,
     )
+    try:
+        solvedBlocks = backend.solve(matrices, rightHandSides)
+    except RuntimeError:
+        return None
+
+    s11 = xp.zeros((size, size), dtype=complex)
+    s12 = xp.zeros((size, size), dtype=complex)
+    s21 = xp.zeros((size, size), dtype=complex)
+    s22 = xp.zeros((size, size), dtype=complex)
+    s11[leftBackwardColumns[:, :, None], leftForwardColumns[:, None, :]] = solvedBlocks[:, :2, :2]
+    s12[leftBackwardColumns[:, :, None], rightBackwardColumns[:, None, :]] = solvedBlocks[:, :2, 2:]
+    s21[rightForwardColumns[:, :, None], leftForwardColumns[:, None, :]] = solvedBlocks[:, 2:, :2]
+    s22[rightForwardColumns[:, :, None], rightBackwardColumns[:, None, :]] = solvedBlocks[:, 2:, 2:]
+
+    return SMatrix(s11=s11, s12=s12, s21=s21, s22=s22)
 
 
-def _enhancedReflectionTransmission(
-    components: Sequence[_SMatrix],
-    size: int,
-    backend: _ArrayBackend,
-) -> tuple[object, object]:
-    xp = backend.xp
-    identity = xp.eye(size, dtype=complex)
-    reflection = xp.zeros((size, size), dtype=complex)
-    transmission = backend.copy(identity)
-    for component in reversed(components):
-        if component.isIdentity:
-            continue
-        if component.isPropagation:
-            forward = _matrixDiagonal(component.s21)
-            backward = _matrixDiagonal(component.s12)
-            reflection = backward[:, None] * reflection * forward[None, :]
-            transmission = transmission * forward[None, :]
-            continue
-        internalReflection = _solveFactored(
-            backend,
-            identity - reflection @ component.s22,
-            reflection @ component.s21,
-        )
-        forward = component.s21 + component.s22 @ internalReflection
-        transmission = transmission @ forward
-        reflection = component.s11 + component.s12 @ internalReflection
-    return reflection, transmission
+def homogeneousColumnOrdersTorch(matrix: object, nOrders: int, backend: ArrayBackend) -> object | None:
+    if matrix.shape[0] != 4 * nOrders:
+        return None
+    torch = backend.xp.torch
+    magnitude = torch.abs(matrix)
+    maxMagnitude = torch.amax(magnitude) if matrix.numel() else torch.as_tensor(0.0, device=backend.device)
+    tolerance = 1e-10 * max(1.0, float(maxMagnitude.detach().cpu().item()))
+    active = magnitude > tolerance
+    if bool(torch.any(torch.sum(active, dim=0) == 0)):
+        return None
+
+    rowOrders = torch.arange(4 * nOrders, dtype=torch.long, device=backend.device) % nOrders
+    sentinelHigh = torch.full((4 * nOrders, 1), nOrders, dtype=torch.long, device=backend.device)
+    sentinelLow = torch.full((4 * nOrders, 1), -1, dtype=torch.long, device=backend.device)
+    minOrders = torch.amin(torch.where(active, rowOrders[:, None], sentinelHigh), dim=0)
+    maxOrders = torch.amax(torch.where(active, rowOrders[:, None], sentinelLow), dim=0)
+    if bool(torch.any(minOrders != maxOrders)):
+        return None
+    return minOrders
 
 
-def _prefixSMatrices(components: Sequence[_SMatrix], size: int, backend: _ArrayBackend) -> list[_SMatrix]:
-    prefixes = [_identitySMatrix(size, backend)]
-    current = prefixes[0]
-    for component in components:
-        current = _redhefferStar(current, component, backend)
-        prefixes.append(current)
-    return prefixes
+def homogeneousColumnOrdersBatchTorch(matrix: object, nOrders: int, backend: ArrayBackend) -> object | None:
+    if matrix.shape[1] != 4 * nOrders:
+        return None
+    torch = backend.xp.torch
+    magnitude = torch.abs(matrix)
+    maxMagnitude = torch.amax(magnitude) if matrix.numel() else torch.as_tensor(0.0, device=backend.device)
+    tolerance = 1e-10 * max(1.0, float(maxMagnitude.detach().cpu().item()))
+    active = magnitude > tolerance
+    if bool(torch.any(torch.sum(active, dim=1) == 0)):
+        return None
+
+    rowOrders = torch.arange(4 * nOrders, dtype=torch.long, device=backend.device) % nOrders
+    sentinelHigh = torch.full((1, 4 * nOrders, 1), nOrders, dtype=torch.long, device=backend.device)
+    sentinelLow = torch.full((1, 4 * nOrders, 1), -1, dtype=torch.long, device=backend.device)
+    minOrders = torch.amin(torch.where(active, rowOrders[None, :, None], sentinelHigh), dim=1)
+    maxOrders = torch.amax(torch.where(active, rowOrders[None, :, None], sentinelLow), dim=1)
+    if bool(torch.any(minOrders != maxOrders)):
+        return None
+    return minOrders
 
 
-def _suffixSMatrices(components: Sequence[_SMatrix], size: int, backend: _ArrayBackend) -> list[_SMatrix]:
-    suffixes = [_identitySMatrix(size, backend) for _ in range(len(components) + 1)]
-    current = _identitySMatrix(size, backend)
-    suffixes[len(components)] = current
-    for index in range(len(components) - 1, -1, -1):
-        current = _redhefferStar(components[index], current, backend)
-        suffixes[index] = current
-    return suffixes
+def columnsForOrdersTorch(assignments: object, nOrders: int, backend: ArrayBackend) -> object | None:
+    torch = backend.xp.torch
+    columns = torch.arange(assignments.shape[0], dtype=torch.long, device=backend.device)
+    orderIds = torch.arange(nOrders, dtype=torch.long, device=backend.device)
+    mask = assignments[None, :] == orderIds[:, None]
+    if bool(torch.any(torch.sum(mask, dim=1) != 2)):
+        return None
+    return columns.expand(nOrders, -1)[mask].reshape(nOrders, 2)
 
 
-def _incidentField(
-    harmonics: _Harmonics,
+def columnsForOrdersBatchTorch(assignments: object, nOrders: int, backend: ArrayBackend) -> object | None:
+    torch = backend.xp.torch
+    batchSize, nColumns = assignments.shape
+    columns = torch.arange(nColumns, dtype=torch.long, device=backend.device)
+    orderIds = torch.arange(nOrders, dtype=torch.long, device=backend.device)
+    mask = assignments[:, None, :] == orderIds[None, :, None]
+    if bool(torch.any(torch.sum(mask, dim=2) != 2)):
+        return None
+    return columns[None, None, :].expand(batchSize, nOrders, -1)[mask].reshape(batchSize, nOrders, 2)
+
+
+def fieldRowsForOrderTorch(nOrders: int, backend: ArrayBackend) -> object:
+    torch = backend.xp.torch
+    orders = torch.arange(nOrders, dtype=torch.long, device=backend.device)
+    offsets = torch.as_tensor([0, nOrders, 2 * nOrders, 3 * nOrders], dtype=torch.long, device=backend.device)
+    return orders[:, None] + offsets[None, :]
+
+
+def incidentField(
+    harmonics: Harmonics,
     eps: complex,
     sAmplitude: complex,
     pAmplitude: complex,
 ) -> ComplexArray:
     field = np.zeros(4 * harmonics.count, dtype=complex)
-    index = _zeroOrderIndex(harmonics)
+    index = zeroOrderIndex(harmonics)
 
-    sField, pField = _planeWaveFields(
+    sField, pField = planeWaveFields(
         harmonics.kx[index],
         harmonics.ky[index],
-        _forwardKz(eps - harmonics.kx[index] ** 2 - harmonics.ky[index] ** 2),
+        forwardKz(eps - harmonics.kx[index] ** 2 - harmonics.ky[index] ** 2),
         eps,
     )
-    _putOrderField(field, index, sAmplitude * sField + pAmplitude * pField)
+    putOrderField(field, index, sAmplitude * sField + pAmplitude * pField)
     return field
 
 
-def _homogeneousBasis(harmonics: _Harmonics, eps: complex, direction: int) -> ComplexArray:
+def homogeneousBasis(harmonics: Harmonics, eps: complex, direction: int) -> ComplexArray:
     if direction not in (-1, 1):
         raise ValueError("direction must be +1 or -1")
     nOrders = harmonics.count
     basis = np.zeros((4 * nOrders, 2 * nOrders), dtype=complex)
     kx = harmonics.kx
     ky = harmonics.ky
-    kz = _forwardKz(eps - kx**2 - ky**2)
+    kz = forwardKz(eps - kx**2 - ky**2)
     if direction < 0:
         kz = -kz
 
@@ -2104,8 +2809,64 @@ def _homogeneousBasis(harmonics: _Harmonics, eps: complex, direction: int) -> Co
     return basis
 
 
-def _orderResults(
-    harmonics: _Harmonics,
+def homogeneousBasisBatch(
+    harmonics: BatchedHarmonics,
+    eps: complex | ComplexArray,
+    direction: int,
+    backend: ArrayBackend,
+) -> object:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be +1 or -1")
+    torch = backend.xp.torch
+    nOrders = harmonics.count
+    basis = backend.xp.zeros((harmonics.batchSize, 4 * nOrders, 2 * nOrders), dtype=complex)
+    kx = harmonics.kx
+    ky = harmonics.ky
+    epsBatch = batchedScalarEpsilon(eps, harmonics, backend)
+    kz = forwardKzTorch(epsBatch - kx * kx - ky * ky, torch)
+    if direction < 0:
+        kz = -kz
+
+    transverse = torch.sqrt(kx * kx + ky * ky + 0j)
+    normal = torch.abs(transverse) < 1e-14
+    safeTransverse = torch.where(normal, torch.as_tensor(1.0 + 0.0j, dtype=kx.dtype, device=kx.device), transverse)
+    sx = torch.where(normal, torch.zeros((), dtype=kx.dtype, device=kx.device), -ky / safeTransverse)
+    sy = torch.where(normal, torch.ones((), dtype=kx.dtype, device=kx.device), kx / safeTransverse)
+
+    refractiveIndex = sqrtBranchBatchTorch(epsBatch, torch)
+    px = sy * kz / refractiveIndex
+    py = -sx * kz / refractiveIndex
+    pz = (sx * ky - sy * kx) / refractiveIndex
+    hsx = -kz * sy
+    hsy = kz * sx
+    hpx = ky * pz - kz * py
+    hpy = kz * px - kx * pz
+
+    orderIndices = torch.arange(nOrders, dtype=torch.long, device=backend.device)
+    batchIndices = torch.arange(harmonics.batchSize, dtype=torch.long, device=backend.device)[:, None]
+    sColumns = 2 * orderIndices
+    pColumns = sColumns + 1
+    basis[batchIndices, orderIndices[None, :], sColumns[None, :]] = sx
+    basis[batchIndices, nOrders + orderIndices[None, :], sColumns[None, :]] = sy
+    basis[batchIndices, 2 * nOrders + orderIndices[None, :], sColumns[None, :]] = hsx
+    basis[batchIndices, 3 * nOrders + orderIndices[None, :], sColumns[None, :]] = hsy
+    basis[batchIndices, orderIndices[None, :], pColumns[None, :]] = px
+    basis[batchIndices, nOrders + orderIndices[None, :], pColumns[None, :]] = py
+    basis[batchIndices, 2 * nOrders + orderIndices[None, :], pColumns[None, :]] = hpx
+    basis[batchIndices, 3 * nOrders + orderIndices[None, :], pColumns[None, :]] = hpy
+    return basis
+
+
+def sqrtBranchBatchTorch(value: object, torch: object) -> object:
+    root = torch.sqrt(value)
+    flip = (torch.imag(root) < -1e-14) | (
+        (torch.abs(torch.imag(root)) <= 1e-14) & (torch.real(root) < 0)
+    )
+    return torch.where(flip, -root, root)
+
+
+def orderResults(
+    harmonics: Harmonics,
     epsReflected: complex,
     epsTransmitted: complex,
     reflectedBasis: ComplexArray,
@@ -2114,10 +2875,10 @@ def _orderResults(
     tAmplitudes: ComplexArray,
     incidentFlux: float,
 ) -> Iterable[DiffractionOrder]:
-    kzReflectedForward = _forwardKz(epsReflected - harmonics.kx**2 - harmonics.ky**2)
-    kzTransmittedForward = _forwardKz(epsTransmitted - harmonics.kx**2 - harmonics.ky**2)
-    reflectedFluxes = _homogeneousOrderFluxes(reflectedBasis, rAmplitudes, harmonics.count)
-    transmittedFluxes = _homogeneousOrderFluxes(transmittedBasis, tAmplitudes, harmonics.count)
+    kzReflectedForward = forwardKz(epsReflected - harmonics.kx**2 - harmonics.ky**2)
+    kzTransmittedForward = forwardKz(epsTransmitted - harmonics.kx**2 - harmonics.ky**2)
+    reflectedFluxes = homogeneousOrderFluxes(reflectedBasis, rAmplitudes, harmonics.count)
+    transmittedFluxes = homogeneousOrderFluxes(transmittedBasis, tAmplitudes, harmonics.count)
     for index, (mx, my, kx, ky) in enumerate(zip(harmonics.mx, harmonics.my, harmonics.kx, harmonics.ky)):
         reflectedPower = -reflectedFluxes[index] / incidentFlux
         transmittedPower = transmittedFluxes[index] / incidentFlux
@@ -2130,12 +2891,12 @@ def _orderResults(
             kzTransmitted=kzTransmittedForward[index],
             reflectedPower=float(reflectedPower),
             transmittedPower=float(transmittedPower),
-            reflectedPropagating=_isPropagating(kzReflectedForward[index]),
-            transmittedPropagating=_isPropagating(kzTransmittedForward[index]),
+            reflectedPropagating=isPropagating(kzReflectedForward[index]),
+            transmittedPropagating=isPropagating(kzTransmittedForward[index]),
         )
 
 
-def _homogeneousOrderFluxes(basis: ComplexArray, amplitudes: ComplexArray, nOrders: int) -> ComplexArray:
+def homogeneousOrderFluxes(basis: ComplexArray, amplitudes: ComplexArray, nOrders: int) -> ComplexArray:
     orderIndices = np.arange(nOrders)
     sColumns = 2 * orderIndices
     pColumns = sColumns + 1
@@ -2158,21 +2919,79 @@ def _homogeneousOrderFluxes(basis: ComplexArray, amplitudes: ComplexArray, nOrde
     return 0.5 * np.real(ex * np.conj(hy) - ey * np.conj(hx))
 
 
-def _smatrixLayerSolutions(
+def homogeneousOrderFluxesBackend(
+    basis: object,
+    amplitudes: object,
+    nOrders: int,
+    backend: ArrayBackend,
+) -> object:
+    torch = backend.xp.torch
+    orderIndices = torch.arange(nOrders, dtype=torch.long, device=backend.device)
+    sColumns = 2 * orderIndices
+    pColumns = sColumns + 1
+
+    sAmplitudes = amplitudes[sColumns, :]
+    pAmplitudes = amplitudes[pColumns, :]
+    ex = basis[orderIndices, sColumns][:, None] * sAmplitudes + basis[orderIndices, pColumns][:, None] * pAmplitudes
+    ey = (
+        basis[nOrders + orderIndices, sColumns][:, None] * sAmplitudes
+        + basis[nOrders + orderIndices, pColumns][:, None] * pAmplitudes
+    )
+    hx = (
+        basis[2 * nOrders + orderIndices, sColumns][:, None] * sAmplitudes
+        + basis[2 * nOrders + orderIndices, pColumns][:, None] * pAmplitudes
+    )
+    hy = (
+        basis[3 * nOrders + orderIndices, sColumns][:, None] * sAmplitudes
+        + basis[3 * nOrders + orderIndices, pColumns][:, None] * pAmplitudes
+    )
+    return 0.5 * torch.real(ex * torch.conj(hy) - ey * torch.conj(hx))
+
+
+def homogeneousOrderFluxesBatchBackend(
+    basis: object,
+    amplitudes: object,
+    nOrders: int,
+    backend: ArrayBackend,
+) -> object:
+    torch = backend.xp.torch
+    orderIndices = torch.arange(nOrders, dtype=torch.long, device=backend.device)
+    sColumns = 2 * orderIndices
+    pColumns = sColumns + 1
+
+    sAmplitudes = amplitudes[:, sColumns, :]
+    pAmplitudes = amplitudes[:, pColumns, :]
+    ex = basis[:, orderIndices, sColumns][:, :, None] * sAmplitudes + basis[:, orderIndices, pColumns][:, :, None] * pAmplitudes
+    ey = (
+        basis[:, nOrders + orderIndices, sColumns][:, :, None] * sAmplitudes
+        + basis[:, nOrders + orderIndices, pColumns][:, :, None] * pAmplitudes
+    )
+    hx = (
+        basis[:, 2 * nOrders + orderIndices, sColumns][:, :, None] * sAmplitudes
+        + basis[:, 2 * nOrders + orderIndices, pColumns][:, :, None] * pAmplitudes
+    )
+    hy = (
+        basis[:, 3 * nOrders + orderIndices, sColumns][:, :, None] * sAmplitudes
+        + basis[:, 3 * nOrders + orderIndices, pColumns][:, :, None] * pAmplitudes
+    )
+    return 0.5 * torch.real(ex * torch.conj(hy) - ey * torch.conj(hx))
+
+
+def smatrixLayerSolutions(
     layers: Sequence[Layer | CompiledLayer],
     layerModes: Sequence[tuple[ComplexArray, ComplexArray]],
-    components: Sequence[_SMatrix],
+    components: Sequence[SMatrix],
     incidentAmplitudes: ComplexArray,
-    harmonics: _Harmonics,
+    harmonics: Harmonics,
     wavelength: float,
     period: tuple[float, float],
     orders: tuple[int, int],
-    backend: _ArrayBackend,
+    backend: ArrayBackend,
 ) -> tuple[LayerFieldSolution, ...]:
     xp = backend.xp
     nPorts = 2 * harmonics.count
-    prefix = _prefixSMatrices(components, nPorts, backend)
-    suffix = _suffixSMatrices(components, nPorts, backend)
+    prefix = prefixSMatrices(components, nPorts, backend)
+    suffix = suffixSMatrices(components, nPorts, backend)
     identity = xp.eye(nPorts, dtype=complex)
     layerSolutionList = []
     for layerIndex, (layer, (qValues, modeMatrix)) in enumerate(zip(layers, layerModes)):
@@ -2180,11 +2999,11 @@ def _smatrixLayerSolutions(
         leftNetwork = prefix[boundaryIndex]
         rightNetwork = suffix[boundaryIndex]
         rhs = rightNetwork.s11 @ (leftNetwork.s21 @ incidentAmplitudes)
-        backwardAtLeft = _solveFactored(backend, identity - rightNetwork.s11 @ leftNetwork.s22, rhs)
+        backwardAtLeft = solveFactored(backend, identity - rightNetwork.s11 @ leftNetwork.s22, rhs)
         forwardAtLeft = leftNetwork.s21 @ incidentAmplitudes + leftNetwork.s22 @ backwardAtLeft
         coefficients = xp.concatenate([forwardAtLeft, backwardAtLeft])
         layerSolutionList.append(
-            _layerSolution(
+            layerSolution(
                 layer,
                 backend.toNumpy(qValues),
                 backend.toNumpy(modeMatrix),
@@ -2198,28 +3017,39 @@ def _smatrixLayerSolutions(
     return tuple(layerSolutionList)
 
 
-def _incidentAmplitudeVector(prepared: PreparedStack, sAmplitude: complex, pAmplitude: complex) -> ComplexArray:
+def incidentAmplitudeVector(prepared: PreparedStack, sAmplitude: complex, pAmplitude: complex) -> ComplexArray:
     amplitudes = np.zeros(prepared.nPorts, dtype=complex)
     amplitudes[2 * prepared.zeroIndex] = sAmplitude
     amplitudes[2 * prepared.zeroIndex + 1] = pAmplitude
     return amplitudes
 
 
-def _incidentAmplitudes(
+def batchedIncidentAmplitudeVector(
+    prepared: PreparedBatchStack,
+    sAmplitude: complex,
+    pAmplitude: complex,
+) -> ComplexArray:
+    amplitudes = np.zeros(prepared.nPorts, dtype=complex)
+    amplitudes[2 * prepared.zeroIndex] = sAmplitude
+    amplitudes[2 * prepared.zeroIndex + 1] = pAmplitude
+    return amplitudes
+
+
+def incidentAmplitudes(
     prepared: PreparedStack,
     sAmplitude: complex,
     pAmplitude: complex,
-    backend: _ArrayBackend,
+    backend: ArrayBackend,
 ) -> object:
-    return backend.asarray(_incidentAmplitudeVector(prepared, sAmplitude, pAmplitude))
+    return backend.asarray(incidentAmplitudeVector(prepared, sAmplitude, pAmplitude))
 
 
-def _layerSolution(
+def layerSolution(
     layer: Layer | CompiledLayer,
     qValues: ComplexArray,
     modeMatrix: ComplexArray,
     coefficients: ComplexArray,
-    harmonics: _Harmonics,
+    harmonics: Harmonics,
     wavelength: float,
     period: tuple[float, float],
     orders: tuple[int, int],
@@ -2240,8 +3070,8 @@ def _layerSolution(
     )
 
 
-def _result(
-    harmonics: _Harmonics,
+def result(
+    harmonics: Harmonics,
     epsIncident: complex,
     epsTransmission: complex,
     reflectedBasis: ComplexArray,
@@ -2252,9 +3082,10 @@ def _result(
     solvedBy: str,
     layerSolutions: tuple[LayerFieldSolution, ...],
     layerEigTimings: tuple[LayerEigTiming, ...] = (),
+    stackTiming: StackTiming | None = None,
 ) -> RCWAResult:
-    orderResults = tuple(
-        _orderResults(
+    diffractionOrders = tuple(
+        orderResults(
             harmonics=harmonics,
             epsReflected=epsIncident,
             epsTransmitted=epsTransmission,
@@ -2265,8 +3096,8 @@ def _result(
             incidentFlux=incidentFlux,
         )
     )
-    reflection = float(sum(order.reflectedPower for order in orderResults))
-    transmission = float(sum(order.transmittedPower for order in orderResults))
+    reflection = float(sum(order.reflectedPower for order in diffractionOrders))
+    transmission = float(sum(order.transmittedPower for order in diffractionOrders))
 
     return RCWAResult(
         reflection=reflection,
@@ -2274,42 +3105,43 @@ def _result(
         conservation=reflection + transmission,
         rAmplitudes=rAmplitudes,
         tAmplitudes=tAmplitudes,
-        orders=orderResults,
+        orders=diffractionOrders,
         incidentFlux=float(incidentFlux),
         solvedBy=solvedBy,
         layerSolutions=layerSolutions,
         layerEigTimings=layerEigTimings,
+        stackTiming=stackTiming,
+        diagnostics=tuple(stackTiming.stabilityWarnings) if stackTiming is not None else (),
     )
 
 
-def _checkedIncidentFlux(field: ComplexArray) -> float:
-    incidentFlux = _flux(field)
+def checkedIncidentFlux(field: ComplexArray) -> float:
+    incidentFlux = flux(field)
     if not np.isfinite(incidentFlux) or abs(incidentFlux) < 1e-14:
         raise ValueError("incident field has near-zero real power flux")
     return incidentFlux
 
 
-def _zeroOrderIndex(harmonics: _Harmonics) -> int:
-    zeroIndices = np.where((harmonics.mx == 0) & (harmonics.my == 0))[0]
+def zeroOrderIndex(harmonics: Harmonics) -> int:
+    return zeroOrderIndexFromOrders(harmonics.mx, harmonics.my)
+
+
+def zeroOrderIndexFromOrders(mx: ComplexArray, my: ComplexArray) -> int:
+    zeroIndices = np.where((mx == 0) & (my == 0))[0]
     if zeroIndices.size != 1:
         raise RuntimeError("zero diffraction order was not found")
     return int(zeroIndices[0])
 
 
-def _validateInputs(wavelength: float, period: tuple[float, float], orders: int | tuple[int, int]) -> None:
+def validateInputs(wavelength: float, period: tuple[float, float], orders: int | tuple[int, int]) -> None:
     if wavelength <= 0:
         raise ValueError("wavelength must be positive")
     if period[0] <= 0 or period[1] <= 0:
         raise ValueError("period values must be positive")
-    normalizedOrders = _normalizeOrders(orders)
+    normalizedOrders = normalizeOrders(orders)
     if normalizedOrders[0] < 0 or normalizedOrders[1] < 0:
         raise ValueError("orders must be non-negative")
 
 
-def _requireSMatrixMethod(method: str) -> None:
-    if str(method).lower() != "smatrix":
-        raise ValueError("the anisotropic solver now supports only method='smatrix'")
-
-
-def _isPropagating(kz: complex) -> bool:
+def isPropagating(kz: complex) -> bool:
     return bool(abs(np.imag(kz)) < 1e-10 and np.real(kz) > 1e-12)

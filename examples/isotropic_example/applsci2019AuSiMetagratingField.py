@@ -24,6 +24,7 @@ TRUNCATION = "circular"
 BACKEND = "cuda"
 PRECOMPILE = False
 CACHE_MODES = False
+WORKERS = 1
 
 SPECTRUM_ORDER = 8
 FIELD_ORDER = 8
@@ -137,6 +138,7 @@ spectrumSimulation = rcwa.RCWASimulation(
     backend=BACKEND,
     precompile=PRECOMPILE,
     cacheModes=CACHE_MODES,
+    workers=WORKERS,
 )
 fieldSimulation = rcwa.RCWASimulation(
     period=period,
@@ -153,19 +155,22 @@ fieldSimulation = rcwa.RCWASimulation(
 backend = rcwa.resolveBackend(BACKEND)
 backend.synchronize()
 startTime = time.perf_counter()
-spectrum = spectrumSimulation.spectrum(wavelengths, polarizations=("TM",))
+spectrum = spectrumSimulation.spectrum(wavelengths, polarizations=("TM",), workers=WORKERS)
 reflection = spectrum["TM"]["reflection"]
 transmission = spectrum["TM"]["transmission"]
-absorptionSpectrum = 1.0 - reflection - transmission
+absorptionSpectrum = spectrum["TM"]["absorption"]
 result = fieldSimulation.solve(WAVELENGTH, polarization="TM", returnFields=True)
 backend.synchronize()
 elapsed = time.perf_counter() - startTime
 
-absorption = 1.0 - result.reflection - result.transmission
+absorption = result.absorption
 bestAbsorptionIndex = int(np.argmax(absorptionSpectrum))
 
 print("Appl. Sci. 2019 absorber: spectrum + Fig. 3(c) self-normalized magnetic field |H|")
-print(f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, cacheModes={CACHE_MODES}")
+print(
+    f"method={METHOD}, truncation={TRUNCATION}, backend={BACKEND}, precompile={PRECOMPILE}, "
+    f"cacheModes={CACHE_MODES}, workers={WORKERS}"
+)
 print(f"spectrum orders=({SPECTRUM_ORDER}, 0), field orders=({FIELD_ORDER}, 0)")
 print("geometry: analytic silicon strip pair in air + homogeneous gold film")
 print(f"lambda={WAVELENGTH:.4f} um, period1={PERIOD_1:.3f} um, period2={PERIOD_2:.3f} um")
@@ -173,6 +178,9 @@ print(f"epsilon air={EPS_AIR:.6g}, quartz={EPS_QUARTZ:.6g}")
 print(f"epsilon silicon={epsSi:.6g}, gold={epsAu:.6g}")
 print(f"elapsed={elapsed:.3f} s")
 print(f"R={result.reflection:.6f}, T={result.transmission:.6f}, A={absorption:.6f}, R+T={result.conservation:.6f}")
+print(f"energy error diagnostic={result.energyError}")
+for diagnostic in result.diagnostics:
+    print(f"diagnostic: {diagnostic}")
 print(f"spectrum peak A={absorptionSpectrum[bestAbsorptionIndex]:.6f} at lambda={wavelengths[bestAbsorptionIndex]:.4f} um")
 
 if SAVE_PLOTS:

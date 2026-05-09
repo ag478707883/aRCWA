@@ -21,6 +21,7 @@ from .solver import (
     LayerEigTiming,
     LayerFieldSolution,
     RCWAResult,
+    StackTiming,
 )
 from .analytic import AnalyticAnnulus, AnalyticDisk, AnalyticEllipse, AnalyticRectangle
 from .backend import ArrayBackend, resolveBackend
@@ -63,6 +64,7 @@ __all__ = [
     "PatternLayer",
     "RCWASimulation",
     "RCWAResult",
+    "StackTiming",
     "OrderSweepPoint",
     "OrderSweepReport",
     "SI1550",

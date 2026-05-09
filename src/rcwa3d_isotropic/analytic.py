@@ -12,26 +12,26 @@ from .fourier import epsilonConvolutionMatrix, epsilonConvolutionMatrixTorch
 ComplexArray = np.ndarray
 
 
-def _validatePeriod(period: tuple[float, float]) -> None:
+def validatePeriod(period: tuple[float, float]) -> None:
     if period[0] <= 0 or period[1] <= 0:
         raise ValueError("period values must be positive")
 
 
-def _sinc(value: ComplexArray) -> ComplexArray:
+def sinc(value: ComplexArray) -> ComplexArray:
     result = np.ones_like(value, dtype=complex)
     nonzero = np.abs(value) > 1e-14
     result[nonzero] = np.sin(value[nonzero]) / value[nonzero]
     return result
 
 
-def _sincTorch(value: Any, torch: Any) -> Any:
+def sincTorch(value: Any, torch: Any) -> Any:
     result = torch.ones_like(value, dtype=torch.complex128)
     valueComplex = value.to(torch.complex128)
     nonzero = torch.abs(valueComplex) > 1e-14
     return torch.where(nonzero, torch.sin(valueComplex) / valueComplex, result)
 
 
-def _besselRatio(argument: ComplexArray) -> ComplexArray:
+def besselRatio(argument: ComplexArray) -> ComplexArray:
     ratio = np.empty_like(argument, dtype=complex)
     small = np.abs(argument) < 1e-5
     x = argument[small]
@@ -40,7 +40,7 @@ def _besselRatio(argument: ComplexArray) -> ComplexArray:
     return ratio
 
 
-def _besselRatioTorch(argument: Any, torch: Any) -> Any:
+def besselRatioTorch(argument: Any, torch: Any) -> Any:
     argument = argument.to(torch.float64)
     ratio = torch.empty_like(argument, dtype=torch.complex128)
     seriesMask = torch.abs(argument) <= 8.0
@@ -59,17 +59,17 @@ def _besselRatioTorch(argument: Any, torch: Any) -> Any:
     return ratio
 
 
-def _validateFactorization(value: str) -> None:
+def validateFactorization(value: str) -> None:
     if value not in ("analytic", "jones"):
         raise ValueError("factorization must be 'analytic' or 'jones'")
 
 
-def _validateJonesResolution(value: int) -> None:
+def validateJonesResolution(value: int) -> None:
     if value < 8:
         raise ValueError("jonesResolution must be at least 8")
 
 
-def _phase(
+def phase(
     harmonics: object,
     period: tuple[float, float],
     center: tuple[float, float],
@@ -86,34 +86,34 @@ def _phase(
     return gx, gy, np.exp(-1j * (gx * center[0] + gy * center[1]))
 
 
-def _phaseTorch(
+def phaseTorch(
     harmonics: object,
     period: tuple[float, float],
     center: tuple[float, float],
     torch: Any,
     device: Any,
 ) -> tuple[Any, Any, Any]:
-    dmx = _asTorchReal(getattr(harmonics, "deltaMx"), torch, device)
-    dmy = _asTorchReal(getattr(harmonics, "deltaMy"), torch, device)
+    dmx = asTorchReal(getattr(harmonics, "deltaMx"), torch, device)
+    dmy = asTorchReal(getattr(harmonics, "deltaMy"), torch, device)
     pi = torch.as_tensor(np.pi, dtype=torch.float64, device=device)
     gx = 2 * pi * dmx / period[0]
     gy = 2 * pi * dmy / period[1]
     return gx, gy, torch.exp(-1j * (gx * center[0] + gy * center[1]))
 
 
-def _radialIndicator(argument: ComplexArray, fill: float, phase: ComplexArray) -> ComplexArray:
+def radialIndicator(argument: ComplexArray, fill: float, phase: ComplexArray) -> ComplexArray:
     coeff = np.empty_like(argument, dtype=complex)
     zero = np.abs(argument) < 1e-14
     coeff[zero] = fill
-    coeff[~zero] = fill * _besselRatio(argument[~zero])
+    coeff[~zero] = fill * besselRatio(argument[~zero])
     return coeff * phase
 
 
-def _radialIndicatorTorch(argument: Any, fill: float, phase: Any, torch: Any) -> Any:
-    return complex(fill) * _besselRatioTorch(argument, torch) * phase
+def radialIndicatorTorch(argument: Any, fill: float, phase: Any, torch: Any) -> Any:
+    return complex(fill) * besselRatioTorch(argument, torch) * phase
 
 
-def _rotatedComponents(
+def rotatedComponents(
     x: ComplexArray,
     y: ComplexArray,
     angle: float,
@@ -123,26 +123,26 @@ def _rotatedComponents(
     return cosine * x + sine * y, -sine * x + cosine * y
 
 
-def _rotatedComponentsTorch(x: Any, y: Any, angle: float, torch: Any, device: Any) -> tuple[Any, Any]:
+def rotatedComponentsTorch(x: Any, y: Any, angle: float, torch: Any, device: Any) -> tuple[Any, Any]:
     angleTensor = torch.as_tensor(float(angle), dtype=torch.float64, device=device)
     cosine = torch.cos(angleTensor)
     sine = torch.sin(angleTensor)
     return cosine * x + sine * y, -sine * x + cosine * y
 
 
-def _diskIndicator(
+def diskIndicator(
     harmonics: object,
     period: tuple[float, float],
     radius: float,
     center: tuple[float, float],
 ) -> ComplexArray:
-    gx, gy, phase = _phase(harmonics, period, center)
+    gx, gy, phaseFactor = phase(harmonics, period, center)
     gr = np.sqrt(gx * gx + gy * gy)
     fill = np.pi * radius * radius / (period[0] * period[1])
-    return _radialIndicator(gr * radius, fill, phase)
+    return radialIndicator(gr * radius, fill, phaseFactor)
 
 
-def _diskIndicatorTorch(
+def diskIndicatorTorch(
     harmonics: object,
     period: tuple[float, float],
     radius: float,
@@ -150,27 +150,27 @@ def _diskIndicatorTorch(
     torch: Any,
     device: Any,
 ) -> Any:
-    gx, gy, phase = _phaseTorch(harmonics, period, center, torch, device)
+    gx, gy, phaseFactor = phaseTorch(harmonics, period, center, torch, device)
     gr = torch.sqrt(gx * gx + gy * gy)
     fill = np.pi * radius * radius / (period[0] * period[1])
-    return _radialIndicatorTorch(gr * radius, fill, phase, torch)
+    return radialIndicatorTorch(gr * radius, fill, phaseFactor, torch)
 
 
-def _ellipseIndicator(
+def ellipseIndicator(
     harmonics: object,
     period: tuple[float, float],
     radii: tuple[float, float],
     center: tuple[float, float],
     angle: float,
 ) -> ComplexArray:
-    gx, gy, phase = _phase(harmonics, period, center)
-    gxLocal, gyLocal = _rotatedComponents(gx, gy, angle)
+    gx, gy, phaseFactor = phase(harmonics, period, center)
+    gxLocal, gyLocal = rotatedComponents(gx, gy, angle)
     argument = np.sqrt((gxLocal * radii[0]) ** 2 + (gyLocal * radii[1]) ** 2)
     fill = np.pi * radii[0] * radii[1] / (period[0] * period[1])
-    return _radialIndicator(argument, fill, phase)
+    return radialIndicator(argument, fill, phaseFactor)
 
 
-def _ellipseIndicatorTorch(
+def ellipseIndicatorTorch(
     harmonics: object,
     period: tuple[float, float],
     radii: tuple[float, float],
@@ -179,27 +179,27 @@ def _ellipseIndicatorTorch(
     torch: Any,
     device: Any,
 ) -> Any:
-    gx, gy, phase = _phaseTorch(harmonics, period, center, torch, device)
-    gxLocal, gyLocal = _rotatedComponentsTorch(gx, gy, angle, torch, device)
+    gx, gy, phaseFactor = phaseTorch(harmonics, period, center, torch, device)
+    gxLocal, gyLocal = rotatedComponentsTorch(gx, gy, angle, torch, device)
     argument = torch.sqrt((gxLocal * radii[0]) ** 2 + (gyLocal * radii[1]) ** 2)
     fill = np.pi * radii[0] * radii[1] / (period[0] * period[1])
-    return _radialIndicatorTorch(argument, fill, phase, torch)
+    return radialIndicatorTorch(argument, fill, phaseFactor, torch)
 
 
-def _rectangleIndicator(
+def rectangleIndicator(
     harmonics: object,
     period: tuple[float, float],
     size: tuple[float, float],
     center: tuple[float, float],
     angle: float,
 ) -> ComplexArray:
-    gx, gy, phase = _phase(harmonics, period, center)
-    gxLocal, gyLocal = _rotatedComponents(gx, gy, angle)
+    gx, gy, phaseFactor = phase(harmonics, period, center)
+    gxLocal, gyLocal = rotatedComponents(gx, gy, angle)
     fill = size[0] * size[1] / (period[0] * period[1])
-    return fill * _sinc(gxLocal * size[0] / 2) * _sinc(gyLocal * size[1] / 2) * phase
+    return fill * sinc(gxLocal * size[0] / 2) * sinc(gyLocal * size[1] / 2) * phaseFactor
 
 
-def _rectangleIndicatorTorch(
+def rectangleIndicatorTorch(
     harmonics: object,
     period: tuple[float, float],
     size: tuple[float, float],
@@ -208,15 +208,15 @@ def _rectangleIndicatorTorch(
     torch: Any,
     device: Any,
 ) -> Any:
-    gx, gy, phase = _phaseTorch(harmonics, period, center, torch, device)
-    gxLocal, gyLocal = _rotatedComponentsTorch(gx, gy, angle, torch, device)
+    gx, gy, phaseFactor = phaseTorch(harmonics, period, center, torch, device)
+    gxLocal, gyLocal = rotatedComponentsTorch(gx, gy, angle, torch, device)
     fill = size[0] * size[1] / (period[0] * period[1])
-    return complex(fill) * _sincTorch(gxLocal * size[0] / 2, torch) * _sincTorch(
+    return complex(fill) * sincTorch(gxLocal * size[0] / 2, torch) * sincTorch(
         gyLocal * size[1] / 2, torch
-    ) * phase
+    ) * phaseFactor
 
 
-def _twoMaterialConvolution(
+def twoMaterialConvolution(
     indicator: ComplexArray,
     size: int,
     background: complex,
@@ -225,7 +225,7 @@ def _twoMaterialConvolution(
     return complex(background) * np.eye(size, dtype=complex) + (complex(inclusion) - complex(background)) * indicator
 
 
-def _twoMaterialConvolutionTorch(
+def twoMaterialConvolutionTorch(
     indicator: Any,
     size: int,
     background: complex,
@@ -238,11 +238,11 @@ def _twoMaterialConvolutionTorch(
     ) * indicator
 
 
-def _inverse(value: complex) -> complex:
+def inverse(value: complex) -> complex:
     return 1.0 / complex(value)
 
 
-def _sampleCoordinates(
+def sampleCoordinates(
     period: tuple[float, float],
     center: tuple[float, float],
     samples: int,
@@ -256,7 +256,7 @@ def _sampleCoordinates(
     return xx, yy
 
 
-def _sampleCoordinatesTorch(
+def sampleCoordinatesTorch(
     period: tuple[float, float],
     center: tuple[float, float],
     samples: int,
@@ -276,19 +276,19 @@ def _sampleCoordinatesTorch(
     return xx, yy
 
 
-def _localCoordinates(
+def localCoordinates(
     period: tuple[float, float],
     center: tuple[float, float],
     angle: float,
     samples: int,
 ) -> tuple[ComplexArray, ComplexArray, float, float]:
-    xx, yy = _sampleCoordinates(period, center, samples)
+    xx, yy = sampleCoordinates(period, center, samples)
     cosine = float(np.cos(angle))
     sine = float(np.sin(angle))
     return cosine * xx + sine * yy, -sine * xx + cosine * yy, cosine, sine
 
 
-def _localCoordinatesTorch(
+def localCoordinatesTorch(
     period: tuple[float, float],
     center: tuple[float, float],
     angle: float,
@@ -296,14 +296,14 @@ def _localCoordinatesTorch(
     torch: Any,
     device: Any,
 ) -> tuple[Any, Any, Any, Any]:
-    xx, yy = _sampleCoordinatesTorch(period, center, samples, torch, device)
+    xx, yy = sampleCoordinatesTorch(period, center, samples, torch, device)
     angleTensor = torch.as_tensor(float(angle), dtype=torch.float64, device=device)
     cosine = torch.cos(angleTensor)
     sine = torch.sin(angleTensor)
     return cosine * xx + sine * yy, -sine * xx + cosine * yy, cosine, sine
 
 
-def _normalizeVectorField(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
+def normalizeVectorField(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
     length = np.sqrt(np.real(x) ** 2 + np.real(y) ** 2)
     safe = length > 1e-12
     return (
@@ -312,7 +312,7 @@ def _normalizeVectorField(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArra
     )
 
 
-def _normalizeVectorFieldTorch(x: Any, y: Any, torch: Any) -> tuple[Any, Any]:
+def normalizeVectorFieldTorch(x: Any, y: Any, torch: Any) -> tuple[Any, Any]:
     xReal = x.real if torch.is_complex(x) else x
     yReal = y.real if torch.is_complex(y) else y
     length = torch.sqrt(xReal * xReal + yReal * yReal)
@@ -322,7 +322,7 @@ def _normalizeVectorFieldTorch(x: Any, y: Any, torch: Any) -> tuple[Any, Any]:
     return normalX.to(torch.complex128), normalY.to(torch.complex128)
 
 
-def _rotateLocalVector(
+def rotateLocalVector(
     xLocal: ComplexArray,
     yLocal: ComplexArray,
     cosine: float,
@@ -331,11 +331,11 @@ def _rotateLocalVector(
     return cosine * xLocal - sine * yLocal, sine * xLocal + cosine * yLocal
 
 
-def _rotateLocalVectorTorch(xLocal: Any, yLocal: Any, cosine: Any, sine: Any) -> tuple[Any, Any]:
+def rotateLocalVectorTorch(xLocal: Any, yLocal: Any, cosine: Any, sine: Any) -> tuple[Any, Any]:
     return cosine * xLocal - sine * yLocal, sine * xLocal + cosine * yLocal
 
 
-def _normalVectorMatricesFromField(
+def normalVectorMatricesFromField(
     normalX: ComplexArray,
     normalY: ComplexArray,
     harmonics: object,
@@ -351,7 +351,7 @@ def _normalVectorMatricesFromField(
     )
 
 
-def _normalVectorMatricesFromFieldTorch(
+def normalVectorMatricesFromFieldTorch(
     normalX: Any,
     normalY: Any,
     harmonics: object,
@@ -368,7 +368,7 @@ def _normalVectorMatricesFromFieldTorch(
     )
 
 
-def _alignedRectangleInvariantAxes(
+def alignedRectangleInvariantAxes(
     period: tuple[float, float],
     size: tuple[float, float],
     angle: float,
@@ -389,7 +389,7 @@ def _alignedRectangleInvariantAxes(
     return tuple(axes)
 
 
-class _TwoMaterialMixin:
+class TwoMaterialMixin:
     background: complex
     inclusion: complex
 
@@ -402,7 +402,7 @@ class _TwoMaterialMixin:
         background: complex | None = None,
         inclusion: complex | None = None,
     ) -> ComplexArray:
-        return _twoMaterialConvolution(
+        return twoMaterialConvolution(
             self.indicatorMatrix(harmonics),
             getattr(harmonics, "count"),
             self.background if background is None else background,
@@ -410,11 +410,11 @@ class _TwoMaterialMixin:
         )
 
     def reciprocalConvolutionMatrix(self, harmonics: object) -> ComplexArray:
-        return self.convolutionMatrix(harmonics, _inverse(self.background), _inverse(self.inclusion))
+        return self.convolutionMatrix(harmonics, inverse(self.background), inverse(self.inclusion))
 
     def normalVectorMatrices(self, harmonics: object) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
         normalX, normalY = self.normalVectorField()
-        return _normalVectorMatricesFromField(normalX, normalY, harmonics)
+        return normalVectorMatricesFromField(normalX, normalY, harmonics)
 
     def convolutionMatrixTorch(
         self,
@@ -424,7 +424,7 @@ class _TwoMaterialMixin:
         background: complex | None = None,
         inclusion: complex | None = None,
     ) -> Any:
-        return _twoMaterialConvolutionTorch(
+        return twoMaterialConvolutionTorch(
             self.indicatorMatrixTorch(harmonics, torch, device),
             getattr(harmonics, "count"),
             self.background if background is None else background,
@@ -438,8 +438,8 @@ class _TwoMaterialMixin:
             harmonics,
             torch,
             device,
-            background=_inverse(self.background),
-            inclusion=_inverse(self.inclusion),
+            background=inverse(self.background),
+            inclusion=inverse(self.inclusion),
         )
 
     def normalVectorMatricesTorch(
@@ -449,44 +449,44 @@ class _TwoMaterialMixin:
         device: Any,
     ) -> tuple[Any, Any, Any, Any]:
         normalX, normalY = self.normalVectorFieldTorch(torch, device)
-        return _normalVectorMatricesFromFieldTorch(normalX, normalY, harmonics, torch, device)
+        return normalVectorMatricesFromFieldTorch(normalX, normalY, harmonics, torch, device)
 
 
-class _RadialNormalMixin:
+class RadialNormalMixin:
     period: tuple[float, float]
     center: tuple[float, float]
     jonesResolution: int
 
     def normalVectorField(self) -> tuple[ComplexArray, ComplexArray]:
-        xx, yy = _sampleCoordinates(self.period, self.center, self.jonesResolution)
+        xx, yy = sampleCoordinates(self.period, self.center, self.jonesResolution)
         radius = np.sqrt(xx * xx + yy * yy)
         safeRadius = np.where(radius > 1e-12, radius, 1.0)
         normalX = np.where(radius > 1e-12, xx / safeRadius, 1.0)
         normalY = np.where(radius > 1e-12, yy / safeRadius, 0.0)
-        return _normalizeVectorField(normalX, normalY)
+        return normalizeVectorField(normalX, normalY)
 
     def normalVectorFieldTorch(self, torch: Any, device: Any) -> tuple[Any, Any]:
-        xx, yy = _sampleCoordinatesTorch(self.period, self.center, self.jonesResolution, torch, device)
+        xx, yy = sampleCoordinatesTorch(self.period, self.center, self.jonesResolution, torch, device)
         radius = torch.sqrt(xx * xx + yy * yy)
         safeRadius = torch.where(radius > 1e-12, radius, torch.ones_like(radius))
         normalX = torch.where(radius > 1e-12, xx / safeRadius, torch.ones_like(radius))
         normalY = torch.where(radius > 1e-12, yy / safeRadius, torch.zeros_like(radius))
-        return _normalizeVectorFieldTorch(normalX, normalY, torch)
+        return normalizeVectorFieldTorch(normalX, normalY, torch)
 
 
-def _diskIndicators(
+def diskIndicators(
     harmonics: object,
     period: tuple[float, float],
     center: tuple[float, float],
     outerRadius: float,
     innerRadius: float = 0.0,
 ) -> tuple[ComplexArray, ComplexArray | None]:
-    outer = _diskIndicator(harmonics, period, outerRadius, center)
-    inner = _diskIndicator(harmonics, period, innerRadius, center) if innerRadius > 0 else None
+    outer = diskIndicator(harmonics, period, outerRadius, center)
+    inner = diskIndicator(harmonics, period, innerRadius, center) if innerRadius > 0 else None
     return outer, inner
 
 
-def _diskIndicatorsTorch(
+def diskIndicatorsTorch(
     harmonics: object,
     period: tuple[float, float],
     center: tuple[float, float],
@@ -495,16 +495,16 @@ def _diskIndicatorsTorch(
     torch: Any,
     device: Any,
 ) -> tuple[Any, Any | None]:
-    outer = _diskIndicatorTorch(harmonics, period, outerRadius, center, torch, device)
+    outer = diskIndicatorTorch(harmonics, period, outerRadius, center, torch, device)
     inner = (
-        _diskIndicatorTorch(harmonics, period, innerRadius, center, torch, device)
+        diskIndicatorTorch(harmonics, period, innerRadius, center, torch, device)
         if innerRadius > 0
         else None
     )
     return outer, inner
 
 
-def _asTorchReal(value: object, torch: Any, device: Any) -> Any:
+def asTorchReal(value: object, torch: Any, device: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.to(device=device, dtype=torch.float64)
     return torch.as_tensor(np.asarray(value), dtype=torch.float64, device=device)
@@ -523,7 +523,7 @@ class AnalyticComposite:
     terms: Sequence[AnalyticTerm]
 
     def __post_init__(self) -> None:
-        _validatePeriod(self.period)
+        validatePeriod(self.period)
         for term in self.terms:
             if not hasattr(term.shape, "indicatorMatrix"):
                 raise TypeError("AnalyticComposite terms require shapes with indicatorMatrix")
@@ -552,7 +552,7 @@ class AnalyticComposite:
 
 
 @dataclass(frozen=True)
-class AnalyticDisk(_RadialNormalMixin, _TwoMaterialMixin):
+class AnalyticDisk(RadialNormalMixin, TwoMaterialMixin):
     period: tuple[float, float]
     radius: float
     background: complex
@@ -562,21 +562,21 @@ class AnalyticDisk(_RadialNormalMixin, _TwoMaterialMixin):
     jonesResolution: int = 512
 
     def __post_init__(self) -> None:
-        _validatePeriod(self.period)
+        validatePeriod(self.period)
         if self.radius <= 0:
             raise ValueError("radius must be positive")
-        _validateFactorization(self.factorization)
-        _validateJonesResolution(self.jonesResolution)
+        validateFactorization(self.factorization)
+        validateJonesResolution(self.jonesResolution)
 
     def indicatorMatrix(self, harmonics: object) -> ComplexArray:
-        return _diskIndicator(harmonics, self.period, self.radius, self.center)
+        return diskIndicator(harmonics, self.period, self.radius, self.center)
 
     def indicatorMatrixTorch(self, harmonics: object, torch: Any, device: Any) -> Any:
-        return _diskIndicatorTorch(harmonics, self.period, self.radius, self.center, torch, device)
+        return diskIndicatorTorch(harmonics, self.period, self.radius, self.center, torch, device)
 
 
 @dataclass(frozen=True)
-class AnalyticEllipse(_TwoMaterialMixin):
+class AnalyticEllipse(TwoMaterialMixin):
     period: tuple[float, float]
     radii: tuple[float, float]
     background: complex
@@ -587,20 +587,20 @@ class AnalyticEllipse(_TwoMaterialMixin):
     jonesResolution: int = 512
 
     def __post_init__(self) -> None:
-        _validatePeriod(self.period)
+        validatePeriod(self.period)
         if self.radii[0] <= 0 or self.radii[1] <= 0:
             raise ValueError("ellipse radii must be positive")
-        _validateFactorization(self.factorization)
-        _validateJonesResolution(self.jonesResolution)
+        validateFactorization(self.factorization)
+        validateJonesResolution(self.jonesResolution)
 
     def indicatorMatrix(self, harmonics: object) -> ComplexArray:
-        return _ellipseIndicator(harmonics, self.period, self.radii, self.center, self.angle)
+        return ellipseIndicator(harmonics, self.period, self.radii, self.center, self.angle)
 
     def indicatorMatrixTorch(self, harmonics: object, torch: Any, device: Any) -> Any:
-        return _ellipseIndicatorTorch(harmonics, self.period, self.radii, self.center, self.angle, torch, device)
+        return ellipseIndicatorTorch(harmonics, self.period, self.radii, self.center, self.angle, torch, device)
 
     def normalVectorField(self) -> tuple[ComplexArray, ComplexArray]:
-        xLocal, yLocal, cosine, sine = _localCoordinates(
+        xLocal, yLocal, cosine, sine = localCoordinates(
             self.period,
             self.center,
             self.angle,
@@ -608,11 +608,11 @@ class AnalyticEllipse(_TwoMaterialMixin):
         )
         localX = xLocal / (self.radii[0] * self.radii[0])
         localY = yLocal / (self.radii[1] * self.radii[1])
-        normalX, normalY = _rotateLocalVector(localX, localY, cosine, sine)
-        return _normalizeVectorField(normalX, normalY)
+        normalX, normalY = rotateLocalVector(localX, localY, cosine, sine)
+        return normalizeVectorField(normalX, normalY)
 
     def normalVectorFieldTorch(self, torch: Any, device: Any) -> tuple[Any, Any]:
-        xLocal, yLocal, cosine, sine = _localCoordinatesTorch(
+        xLocal, yLocal, cosine, sine = localCoordinatesTorch(
             self.period,
             self.center,
             self.angle,
@@ -622,12 +622,12 @@ class AnalyticEllipse(_TwoMaterialMixin):
         )
         localX = xLocal / (self.radii[0] * self.radii[0])
         localY = yLocal / (self.radii[1] * self.radii[1])
-        normalX, normalY = _rotateLocalVectorTorch(localX, localY, cosine, sine)
-        return _normalizeVectorFieldTorch(normalX, normalY, torch)
+        normalX, normalY = rotateLocalVectorTorch(localX, localY, cosine, sine)
+        return normalizeVectorFieldTorch(normalX, normalY, torch)
 
 
 @dataclass(frozen=True)
-class AnalyticRectangle(_TwoMaterialMixin):
+class AnalyticRectangle(TwoMaterialMixin):
     period: tuple[float, float]
     size: tuple[float, float]
     background: complex
@@ -638,20 +638,20 @@ class AnalyticRectangle(_TwoMaterialMixin):
     jonesResolution: int = 512
 
     def __post_init__(self) -> None:
-        _validatePeriod(self.period)
+        validatePeriod(self.period)
         if self.size[0] <= 0 or self.size[1] <= 0:
             raise ValueError("rectangle size values must be positive")
-        _validateFactorization(self.factorization)
-        _validateJonesResolution(self.jonesResolution)
+        validateFactorization(self.factorization)
+        validateJonesResolution(self.jonesResolution)
 
     def indicatorMatrix(self, harmonics: object) -> ComplexArray:
-        return _rectangleIndicator(harmonics, self.period, self.size, self.center, self.angle)
+        return rectangleIndicator(harmonics, self.period, self.size, self.center, self.angle)
 
     def indicatorMatrixTorch(self, harmonics: object, torch: Any, device: Any) -> Any:
-        return _rectangleIndicatorTorch(harmonics, self.period, self.size, self.center, self.angle, torch, device)
+        return rectangleIndicatorTorch(harmonics, self.period, self.size, self.center, self.angle, torch, device)
 
     def normalVectorField(self) -> tuple[ComplexArray, ComplexArray]:
-        xLocal, yLocal, cosine, sine = _localCoordinates(
+        xLocal, yLocal, cosine, sine = localCoordinates(
             self.period,
             self.center,
             self.angle,
@@ -681,14 +681,14 @@ class AnalyticRectangle(_TwoMaterialMixin):
             useX = distanceX <= distanceY
             localX = np.where(useX, signX, 0.0)
             localY = np.where(useX, 0.0, signY)
-        normalX, normalY = _rotateLocalVector(localX, localY, cosine, sine)
-        return _normalizeVectorField(normalX, normalY)
+        normalX, normalY = rotateLocalVector(localX, localY, cosine, sine)
+        return normalizeVectorField(normalX, normalY)
 
     def invariantAxes(self) -> tuple[str, ...]:
-        return _alignedRectangleInvariantAxes(self.period, self.size, self.angle)
+        return alignedRectangleInvariantAxes(self.period, self.size, self.angle)
 
     def normalVectorFieldTorch(self, torch: Any, device: Any) -> tuple[Any, Any]:
-        xLocal, yLocal, cosine, sine = _localCoordinatesTorch(
+        xLocal, yLocal, cosine, sine = localCoordinatesTorch(
             self.period,
             self.center,
             self.angle,
@@ -720,12 +720,12 @@ class AnalyticRectangle(_TwoMaterialMixin):
             useX = distanceX <= distanceY
             localX = torch.where(useX, signX, torch.zeros_like(signX))
             localY = torch.where(useX, torch.zeros_like(signY), signY)
-        normalX, normalY = _rotateLocalVectorTorch(localX, localY, cosine, sine)
-        return _normalizeVectorFieldTorch(normalX, normalY, torch)
+        normalX, normalY = rotateLocalVectorTorch(localX, localY, cosine, sine)
+        return normalizeVectorFieldTorch(normalX, normalY, torch)
 
 
 @dataclass(frozen=True)
-class AnalyticAnnulus(_RadialNormalMixin):
+class AnalyticAnnulus(RadialNormalMixin):
     period: tuple[float, float]
     innerRadius: float
     outerRadius: float
@@ -737,18 +737,18 @@ class AnalyticAnnulus(_RadialNormalMixin):
     jonesResolution: int = 512
 
     def __post_init__(self) -> None:
-        _validatePeriod(self.period)
+        validatePeriod(self.period)
         if self.innerRadius < 0 or self.outerRadius <= 0 or self.innerRadius >= self.outerRadius:
             raise ValueError("annulus requires 0 <= innerRadius < outerRadius")
-        _validateFactorization(self.factorization)
-        _validateJonesResolution(self.jonesResolution)
+        validateFactorization(self.factorization)
+        validateJonesResolution(self.jonesResolution)
 
     def indicatorMatrix(self, harmonics: object) -> ComplexArray:
-        outer, inner = _diskIndicators(harmonics, self.period, self.center, self.outerRadius, self.innerRadius)
+        outer, inner = diskIndicators(harmonics, self.period, self.center, self.outerRadius, self.innerRadius)
         return outer if inner is None else outer - inner
 
     def indicatorMatrixTorch(self, harmonics: object, torch: Any, device: Any) -> Any:
-        outer, inner = _diskIndicatorsTorch(
+        outer, inner = diskIndicatorsTorch(
             harmonics,
             self.period,
             self.center,
@@ -761,7 +761,7 @@ class AnalyticAnnulus(_RadialNormalMixin):
 
     def convolutionMatrix(self, harmonics: object) -> ComplexArray:
         count = getattr(harmonics, "count")
-        outer, inner = _diskIndicators(harmonics, self.period, self.center, self.outerRadius, self.innerRadius)
+        outer, inner = diskIndicators(harmonics, self.period, self.center, self.outerRadius, self.innerRadius)
         matrix = complex(self.background) * np.eye(count, dtype=complex)
         matrix += (complex(self.ring) - complex(self.background)) * outer
         if inner is not None:
@@ -771,23 +771,23 @@ class AnalyticAnnulus(_RadialNormalMixin):
 
     def reciprocalConvolutionMatrix(self, harmonics: object) -> ComplexArray:
         count = getattr(harmonics, "count")
-        outer, inner = _diskIndicators(harmonics, self.period, self.center, self.outerRadius, self.innerRadius)
-        background = _inverse(self.background)
-        ring = _inverse(self.ring)
+        outer, inner = diskIndicators(harmonics, self.period, self.center, self.outerRadius, self.innerRadius)
+        background = inverse(self.background)
+        ring = inverse(self.ring)
         matrix = background * np.eye(count, dtype=complex)
         matrix += (ring - background) * outer
         if inner is not None:
             holeValue = self.background if self.hole is None else self.hole
-            matrix += (_inverse(holeValue) - ring) * inner
+            matrix += (inverse(holeValue) - ring) * inner
         return matrix
 
     def normalVectorMatrices(self, harmonics: object) -> tuple[ComplexArray, ComplexArray, ComplexArray, ComplexArray]:
         normalX, normalY = self.normalVectorField()
-        return _normalVectorMatricesFromField(normalX, normalY, harmonics)
+        return normalVectorMatricesFromField(normalX, normalY, harmonics)
 
     def convolutionMatrixTorch(self, harmonics: object, torch: Any, device: Any) -> Any:
         count = getattr(harmonics, "count")
-        outer, inner = _diskIndicatorsTorch(
+        outer, inner = diskIndicatorsTorch(
             harmonics,
             self.period,
             self.center,
@@ -805,7 +805,7 @@ class AnalyticAnnulus(_RadialNormalMixin):
 
     def reciprocalConvolutionMatrixTorch(self, harmonics: object, torch: Any, device: Any) -> Any:
         count = getattr(harmonics, "count")
-        outer, inner = _diskIndicatorsTorch(
+        outer, inner = diskIndicatorsTorch(
             harmonics,
             self.period,
             self.center,
@@ -814,13 +814,13 @@ class AnalyticAnnulus(_RadialNormalMixin):
             torch,
             device,
         )
-        background = _inverse(self.background)
-        ring = _inverse(self.ring)
+        background = inverse(self.background)
+        ring = inverse(self.ring)
         matrix = background * torch.eye(count, dtype=torch.complex128, device=device)
         matrix = matrix + (ring - background) * outer
         if inner is not None:
             holeValue = self.background if self.hole is None else self.hole
-            matrix = matrix + (_inverse(holeValue) - ring) * inner
+            matrix = matrix + (inverse(holeValue) - ring) * inner
         return matrix
 
     def normalVectorMatricesTorch(
@@ -830,4 +830,4 @@ class AnalyticAnnulus(_RadialNormalMixin):
         device: Any,
     ) -> tuple[Any, Any, Any, Any]:
         normalX, normalY = self.normalVectorFieldTorch(torch, device)
-        return _normalVectorMatricesFromFieldTorch(normalX, normalY, harmonics, torch, device)
+        return normalVectorMatricesFromFieldTorch(normalX, normalY, harmonics, torch, device)

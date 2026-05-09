@@ -5,16 +5,15 @@ from typing import Iterable, Literal
 
 import numpy as np
 
-from .analytic import AnalyticDisk, AnalyticRectangle
 from .solver import Layer
 
 
 ComplexArray = np.ndarray
 ShapeKind = Literal["circle", "ellipse", "rectangle"]
-FactorizationMode = Literal["auto", "standard", "normal-vector", "jones"]
+FactorizationMode = Literal["auto", "standard", "normal-vector"]
 
 
-def _asTensor(value: complex | float | ComplexArray) -> ComplexArray:
+def asTensor(value: complex | float | ComplexArray) -> ComplexArray:
     array = np.asarray(value, dtype=complex)
     if array.ndim == 0:
         return complex(array.item()) * np.eye(3, dtype=complex)
@@ -23,24 +22,12 @@ def _asTensor(value: complex | float | ComplexArray) -> ComplexArray:
     raise ValueError("material must be a scalar or a (3, 3) tensor")
 
 
-def _isTensorMaterial(value: complex | float | ComplexArray) -> bool:
+def isTensorMaterial(value: complex | float | ComplexArray) -> bool:
     array = np.asarray(value)
     return bool(array.shape == (3, 3))
 
 
-def _isScalarMaterial(value: complex | float | ComplexArray) -> bool:
-    return not _isTensorMaterial(value)
-
-
-def _analyticShapeFactorization(factorization: FactorizationMode) -> str:
-    if factorization in ("auto", "jones", "normal-vector"):
-        return "jones"
-    if factorization == "standard":
-        return "analytic"
-    raise ValueError("factorization must be 'auto', 'standard', 'normal-vector', or 'jones'")
-
-
-def _normalizeVectors(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
+def normalizeVectors(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
     length = np.sqrt(np.real(x) ** 2 + np.real(y) ** 2)
     safe = length > 1e-12
     return (
@@ -49,12 +36,12 @@ def _normalizeVectors(x: ComplexArray, y: ComplexArray) -> tuple[ComplexArray, C
     )
 
 
-def _scalarGrid(shape: tuple[int, int], value: complex | float) -> ComplexArray:
+def scalarGrid(shape: tuple[int, int], value: complex | float) -> ComplexArray:
     return np.full(shape, complex(value), dtype=complex)
 
 
-def _tensorGrid(shape: tuple[int, int], value: complex | float | ComplexArray) -> ComplexArray:
-    tensor = _asTensor(value)
+def tensorGrid(shape: tuple[int, int], value: complex | float | ComplexArray) -> ComplexArray:
+    tensor = asTensor(value)
     grid = np.zeros(shape + (3, 3), dtype=complex)
     grid[...] = tensor
     return grid
@@ -68,6 +55,7 @@ class SampledPattern:
     shape: tuple[int, int]
     background: complex | float | ComplexArray
     name: str = ""
+    supersample: int = 1
     epsilon: ComplexArray = field(init=False)
     normalField: ComplexArray | None = field(default=None, init=False)
 
@@ -76,10 +64,13 @@ class SampledPattern:
             raise ValueError("period values must be positive")
         if self.shape[0] <= 0 or self.shape[1] <= 0:
             raise ValueError("shape must be (ny, nx) with positive values")
-        if _isTensorMaterial(self.background):
-            self.epsilon = _tensorGrid(self.shape, self.background)
+        if int(self.supersample) < 1:
+            raise ValueError("supersample must be at least 1")
+        self.supersample = int(self.supersample)
+        if isTensorMaterial(self.background):
+            self.epsilon = tensorGrid(self.shape, self.background)
         else:
-            self.epsilon = _scalarGrid(self.shape, complex(self.background))
+            self.epsilon = scalarGrid(self.shape, complex(self.background))
 
     @property
     def nx(self) -> int:
@@ -90,10 +81,16 @@ class SampledPattern:
         return int(self.shape[0])
 
     def coordinates(self) -> tuple[ComplexArray, ComplexArray]:
+        return self.sampleCoordinates()
+
+    def sampleCoordinates(self, supersample: int | None = None) -> tuple[ComplexArray, ComplexArray]:
+        supersample = self.supersample if supersample is None else int(supersample)
+        if supersample < 1:
+            raise ValueError("supersample must be at least 1")
         periodX, periodY = self.period
-        yIndex, xIndex = np.mgrid[0 : self.ny, 0 : self.nx]
-        xx = (xIndex + 0.5) / self.nx * periodX - periodX / 2
-        yy = (yIndex + 0.5) / self.ny * periodY - periodY / 2
+        yIndex, xIndex = np.mgrid[0 : self.ny * supersample, 0 : self.nx * supersample]
+        xx = (xIndex + 0.5) / (self.nx * supersample) * periodX - periodX / 2
+        yy = (yIndex + 0.5) / (self.ny * supersample) * periodY - periodY / 2
         return xx, yy
 
     def fill(
@@ -105,17 +102,47 @@ class SampledPattern:
         if mask.shape != self.shape:
             raise ValueError(f"mask shape {mask.shape} does not match pattern shape {self.shape}")
 
-        materialIsTensor = _isTensorMaterial(material)
+        materialIsTensor = isTensorMaterial(material)
         if self.epsilon.ndim == 2 and materialIsTensor:
-            self.epsilon = _tensorGrid(self.shape, self.background)
+            self.epsilon = tensorGrid(self.shape, self.background)
 
         if self.epsilon.ndim == 4:
-            self.epsilon[mask] = _asTensor(material)
+            self.epsilon[mask] = asTensor(material)
         else:
             self.epsilon[mask] = complex(material)
 
         if normal is not None:
-            normalX, normalY = _normalizeVectors(normal[0], normal[1])
+            normalX, normalY = normalizeVectors(normal[0], normal[1])
+            self.normalField = np.zeros(self.shape + (2,), dtype=float)
+            self.normalField[..., 0] = normalX
+            self.normalField[..., 1] = normalY
+        return self
+
+    def fillFraction(
+        self,
+        fraction: ComplexArray,
+        material: complex | float | ComplexArray,
+        normal: tuple[ComplexArray, ComplexArray] | None = None,
+    ) -> "SampledPattern":
+        if fraction.shape != self.shape:
+            raise ValueError(f"fraction shape {fraction.shape} does not match pattern shape {self.shape}")
+        values = np.clip(np.asarray(fraction, dtype=float), 0.0, 1.0)
+
+        materialIsTensor = isTensorMaterial(material)
+        if self.epsilon.ndim == 2 and materialIsTensor:
+            self.epsilon = tensorGrid(self.shape, self.background)
+        if self.epsilon.ndim == 4:
+            materialTensor = asTensor(material)
+            self.epsilon = (1.0 - values[..., None, None]) * self.epsilon + values[..., None, None] * materialTensor
+        else:
+            self.epsilon = (1.0 - values) * self.epsilon + values * complex(material)
+
+        if normal is not None:
+            normalX, normalY = normalizeVectors(normal[0], normal[1])
+            if normalX.shape != self.shape:
+                normalX = blockAverage(normalX, self.shape).real
+                normalY = blockAverage(normalY, self.shape).real
+                normalX, normalY = normalizeVectors(normalX, normalY)
             self.normalField = np.zeros(self.shape + (2,), dtype=float)
             self.normalField[..., 0] = normalX
             self.normalField[..., 1] = normalY
@@ -127,14 +154,16 @@ class SampledPattern:
         material: complex | float | ComplexArray,
         center: tuple[float, float] = (0.0, 0.0),
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "SampledPattern":
         if radius < 0:
             raise ValueError("radius must be non-negative")
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         mask = x * x + y * y <= radius * radius
-        return self.fill(mask, material, normal=(x, y) if useNormal else None)
+        return self.fillSampled(mask, material, normal=(x, y) if useNormal else None, supersample=supersample)
 
     def ellipse(
         self,
@@ -143,10 +172,12 @@ class SampledPattern:
         center: tuple[float, float] = (0.0, 0.0),
         angle: float = 0.0,
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "SampledPattern":
         if radii[0] < 0 or radii[1] < 0:
             raise ValueError("ellipse radii must be non-negative")
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         c = np.cos(angle)
@@ -160,7 +191,7 @@ class SampledPattern:
         normalLocalY = yr / (ay * ay)
         normalX = c * normalLocalX - s * normalLocalY
         normalY = s * normalLocalX + c * normalLocalY
-        return self.fill(mask, material, normal=(normalX, normalY) if useNormal else None)
+        return self.fillSampled(mask, material, normal=(normalX, normalY) if useNormal else None, supersample=supersample)
 
     def rectangle(
         self,
@@ -169,10 +200,12 @@ class SampledPattern:
         center: tuple[float, float] = (0.0, 0.0),
         angle: float = 0.0,
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "SampledPattern":
         if size[0] < 0 or size[1] < 0:
             raise ValueError("rectangle size values must be non-negative")
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         c = np.cos(angle)
@@ -183,11 +216,24 @@ class SampledPattern:
         sy = max(float(size[1]), 1e-30)
         mask = (np.abs(xr) <= sx / 2) & (np.abs(yr) <= sy / 2)
 
-        localX = np.where(np.abs(xr) / sx >= np.abs(yr) / sy, np.sign(xr), 0.0)
-        localY = np.where(np.abs(xr) / sx >= np.abs(yr) / sy, 0.0, np.sign(yr))
+        tolerance = 1e-12 * max(1.0, self.period[0], self.period[1], sx, sy)
+        spansX = sx >= self.period[0] - tolerance
+        spansY = sy >= self.period[1] - tolerance
+        signX = np.where(xr >= 0.0, 1.0, -1.0)
+        signY = np.where(yr >= 0.0, 1.0, -1.0)
+        if spansY and not spansX:
+            localX = signX
+            localY = np.zeros_like(signY)
+        elif spansX and not spansY:
+            localX = np.zeros_like(signX)
+            localY = signY
+        else:
+            useX = np.abs(xr) / sx >= np.abs(yr) / sy
+            localX = np.where(useX, signX, 0.0)
+            localY = np.where(useX, 0.0, signY)
         normalX = c * localX - s * localY
         normalY = s * localX + c * localY
-        return self.fill(mask, material, normal=(normalX, normalY) if useNormal else None)
+        return self.fillSampled(mask, material, normal=(normalX, normalY) if useNormal else None, supersample=supersample)
 
     def annulus(
         self,
@@ -196,19 +242,26 @@ class SampledPattern:
         material: complex | float | ComplexArray,
         center: tuple[float, float] = (0.0, 0.0),
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "SampledPattern":
         if innerRadius < 0 or outerRadius < 0:
             raise ValueError("annulus radii must be non-negative")
         if outerRadius < innerRadius:
             raise ValueError("outerRadius must be greater than or equal to innerRadius")
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         radius = np.sqrt(x * x + y * y)
         mask = (radius >= innerRadius) & (radius <= outerRadius)
         safeRadius = np.where(radius > 1e-12, radius, 1.0)
         sign = np.where(np.abs(radius - innerRadius) < np.abs(radius - outerRadius), -1.0, 1.0)
-        return self.fill(mask, material, normal=(sign * x / safeRadius, sign * y / safeRadius) if useNormal else None)
+        return self.fillSampled(
+            mask,
+            material,
+            normal=(sign * x / safeRadius, sign * y / safeRadius) if useNormal else None,
+            supersample=supersample,
+        )
 
     def cross(
         self,
@@ -218,10 +271,12 @@ class SampledPattern:
         center: tuple[float, float] = (0.0, 0.0),
         angle: float = 0.0,
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "SampledPattern":
         if min(*armLengths, *armWidths) <= 0:
             raise ValueError("cross arm lengths and widths must be positive")
-        xx, yy = self.coordinates()
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
         x = xx - center[0]
         y = yy - center[1]
         c = np.cos(angle)
@@ -230,7 +285,7 @@ class SampledPattern:
         yr = -s * x + c * y
         horizontal = (np.abs(xr) <= armLengths[0] / 2) & (np.abs(yr) <= armWidths[0] / 2)
         vertical = (np.abs(xr) <= armWidths[1] / 2) & (np.abs(yr) <= armLengths[1] / 2)
-        return self.fill(horizontal | vertical, material, normal=(xr, yr) if useNormal else None)
+        return self.fillSampled(horizontal | vertical, material, normal=(xr, yr) if useNormal else None, supersample=supersample)
 
     def stripes(
         self,
@@ -257,14 +312,16 @@ class SampledPattern:
         vertices: Iterable[tuple[float, float]],
         material: complex | float | ComplexArray,
         useNormal: bool = True,
+        supersample: int | None = None,
     ) -> "SampledPattern":
         points = np.asarray(tuple(vertices), dtype=float)
         if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] < 3:
             raise ValueError("polygon vertices must be a sequence of at least three (x, y) points")
-        xx, yy = self.coordinates()
-        mask = _polygonMask(xx, yy, points)
-        normal = _polygonNormalField(xx, yy, points) if useNormal else None
-        return self.fill(mask, material, normal=normal)
+        supersample = self.supersample if supersample is None else int(supersample)
+        xx, yy = self.sampleCoordinates(supersample)
+        mask = polygonMask(xx, yy, points)
+        normal = polygonNormalField(xx, yy, points) if useNormal else None
+        return self.fillSampled(mask, material, normal=normal, supersample=supersample)
 
     def toLayer(
         self,
@@ -272,17 +329,37 @@ class SampledPattern:
         name: str | None = None,
         factorization: FactorizationMode = "auto",
     ) -> Layer:
-        normal = self.normalField if factorization in ("auto", "normal-vector", "jones") and self.epsilon.ndim == 2 else None
+        normal = self.normalField if factorization in ("auto", "normal-vector") and self.epsilon.ndim == 2 else None
         return Layer(
             thickness=thickness,
             epsilon=self.epsilon.copy(),
             normalField=None if normal is None else normal.copy(),
             factorization=factorization,
             name=name if name is not None else self.name,
+            sampleShape=self.shape,
         )
 
+    def fillSampled(
+        self,
+        mask: ComplexArray,
+        material: complex | float | ComplexArray,
+        *,
+        normal: tuple[ComplexArray, ComplexArray] | None,
+        supersample: int,
+    ) -> "SampledPattern":
+        if supersample == 1:
+            return self.fill(mask, material, normal=normal)
+        fraction = blockAverage(mask.astype(float), self.shape).real
+        averagedNormal = None
+        if normal is not None:
+            averagedNormal = (
+                blockAverage(np.asarray(normal[0]) * mask, self.shape).real,
+                blockAverage(np.asarray(normal[1]) * mask, self.shape).real,
+            )
+        return self.fillFraction(fraction, material, normal=averagedNormal)
 
-def _polygonMask(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> ComplexArray:
+
+def polygonMask(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> ComplexArray:
     x = xx
     y = yy
     inside = np.zeros(x.shape, dtype=bool)
@@ -295,7 +372,20 @@ def _polygonMask(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> Co
     return inside
 
 
-def _polygonNormalField(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
+def blockAverage(values: ComplexArray, shape: tuple[int, int]) -> ComplexArray:
+    array = np.asarray(values)
+    ny, nx = shape
+    if array.shape == shape:
+        return array
+    if array.ndim < 2 or array.shape[0] % ny != 0 or array.shape[1] % nx != 0:
+        raise ValueError(f"cannot block-average shape {array.shape} to {shape}")
+    sy = array.shape[0] // ny
+    sx = array.shape[1] // nx
+    trailing = array.shape[2:]
+    return array.reshape(ny, sy, nx, sx, *trailing).mean(axis=(1, 3))
+
+
+def polygonNormalField(xx: ComplexArray, yy: ComplexArray, points: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
     bestDistance = np.full(xx.shape, np.inf, dtype=float)
     bestX = np.ones(xx.shape, dtype=float)
     bestY = np.zeros(xx.shape, dtype=float)
@@ -317,35 +407,7 @@ def _polygonNormalField(xx: ComplexArray, yy: ComplexArray, points: ComplexArray
         bestDistance = np.where(update, distance, bestDistance)
         bestX = np.where(update, normalX, bestX)
         bestY = np.where(update, normalY, bestY)
-    return _normalizeVectors(bestX, bestY)
-
-
-def analyticCircularPostLayer(
-    period: tuple[float, float],
-    thickness: float,
-    background: complex | float,
-    post: complex | float,
-    radius: float,
-    *,
-    center: tuple[float, float] = (0.0, 0.0),
-    factorization: FactorizationMode = "auto",
-    jonesResolution: int = 512,
-    name: str = "analytic circular post",
-) -> Layer:
-    return Layer(
-        thickness=thickness,
-        epsilon=AnalyticDisk(
-            period=period,
-            radius=radius,
-            background=background,
-            inclusion=post,
-            center=center,
-            factorization=_analyticShapeFactorization(factorization),
-            jonesResolution=jonesResolution,
-        ),
-        factorization=factorization,
-        name=name,
-    )
+    return normalizeVectors(bestX, bestY)
 
 
 def circularPostLayer(
@@ -355,28 +417,20 @@ def circularPostLayer(
     post: complex | float | ComplexArray,
     radius: float,
     *,
-    shape: tuple[int, int] | None = None,
+    shape: tuple[int, int] | None = (128, 128),
     center: tuple[float, float] = (0.0, 0.0),
     factorization: FactorizationMode = "auto",
-    analytic: bool | None = None,
-    jonesResolution: int = 512,
     name: str = "circular post",
 ) -> Layer:
-    useAnalytic = (shape is None) if analytic is None else analytic
-    if useAnalytic and _isScalarMaterial(background) and _isScalarMaterial(post):
-        return analyticCircularPostLayer(
-            period,
-            thickness,
-            complex(background),
-            complex(post),
-            radius,
-            center=center,
-            factorization=factorization,
-            jonesResolution=jonesResolution,
-            name=name,
-        )
-    pattern = SampledPattern(period=period, shape=(128, 128) if shape is None else shape, background=background, name=name)
-    return pattern.circle(radius, post, center=center).toLayer(thickness, factorization=factorization)
+    return sampledPostLayer(
+        period=period,
+        thickness=thickness,
+        background=background,
+        shape=shape,
+        factorization=factorization,
+        name=name,
+        draw=lambda pattern: pattern.circle(radius, post, center=center),
+    )
 
 
 def ellipticalPostLayer(
@@ -387,42 +441,19 @@ def ellipticalPostLayer(
     radii: tuple[float, float],
     *,
     angle: float = 0.0,
-    shape: tuple[int, int] = (128, 128),
+    shape: tuple[int, int] | None = (128, 128),
     center: tuple[float, float] = (0.0, 0.0),
     factorization: FactorizationMode = "auto",
     name: str = "elliptical post",
 ) -> Layer:
-    pattern = SampledPattern(period=period, shape=shape, background=background, name=name)
-    return pattern.ellipse(radii, post, center=center, angle=angle).toLayer(thickness, factorization=factorization)
-
-
-def analyticRectangularPostLayer(
-    period: tuple[float, float],
-    thickness: float,
-    background: complex | float,
-    post: complex | float,
-    size: tuple[float, float],
-    *,
-    angle: float = 0.0,
-    center: tuple[float, float] = (0.0, 0.0),
-    factorization: FactorizationMode = "auto",
-    jonesResolution: int = 512,
-    name: str = "analytic rectangular post",
-) -> Layer:
-    return Layer(
+    return sampledPostLayer(
+        period=period,
         thickness=thickness,
-        epsilon=AnalyticRectangle(
-            period=period,
-            size=size,
-            background=background,
-            inclusion=post,
-            center=center,
-            angle=angle,
-            factorization=_analyticShapeFactorization(factorization),
-            jonesResolution=jonesResolution,
-        ),
+        background=background,
+        shape=shape,
         factorization=factorization,
         name=name,
+        draw=lambda pattern: pattern.ellipse(radii, post, center=center, angle=angle),
     )
 
 
@@ -434,29 +465,20 @@ def rectangularPostLayer(
     size: tuple[float, float],
     *,
     angle: float = 0.0,
-    shape: tuple[int, int] | None = None,
+    shape: tuple[int, int] | None = (128, 128),
     center: tuple[float, float] = (0.0, 0.0),
     factorization: FactorizationMode = "auto",
-    analytic: bool | None = None,
-    jonesResolution: int = 512,
     name: str = "rectangular post",
 ) -> Layer:
-    useAnalytic = (shape is None) if analytic is None else analytic
-    if useAnalytic and _isScalarMaterial(background) and _isScalarMaterial(post):
-        return analyticRectangularPostLayer(
-            period,
-            thickness,
-            complex(background),
-            complex(post),
-            size,
-            angle=angle,
-            center=center,
-            factorization=factorization,
-            jonesResolution=jonesResolution,
-            name=name,
-        )
-    pattern = SampledPattern(period=period, shape=(128, 128) if shape is None else shape, background=background, name=name)
-    return pattern.rectangle(size, post, center=center, angle=angle).toLayer(thickness, factorization=factorization)
+    return sampledPostLayer(
+        period=period,
+        thickness=thickness,
+        background=background,
+        shape=shape,
+        factorization=factorization,
+        name=name,
+        draw=lambda pattern: pattern.rectangle(size, post, center=center, angle=angle),
+    )
 
 
 def rectangularHollowPostLayer(
@@ -469,7 +491,7 @@ def rectangularHollowPostLayer(
     *,
     holeMaterial: complex | float | ComplexArray | None = None,
     angle: float = 0.0,
-    shape: tuple[int, int] = (128, 128),
+    shape: tuple[int, int] | None = (128, 128),
     center: tuple[float, float] = (0.0, 0.0),
     factorization: FactorizationMode = "auto",
     name: str = "rectangular hollow post",
@@ -478,7 +500,7 @@ def rectangularHollowPostLayer(
 
     if holeRadius < 0:
         raise ValueError("holeRadius must be non-negative")
-    pattern = SampledPattern(period=period, shape=shape, background=background, name=name)
+    pattern = SampledPattern(period=period, shape=sampleShape(shape), background=background, name=name)
     pattern.rectangle(size, post, center=center, angle=angle, useNormal=False)
     pattern.circle(
         holeRadius,
@@ -486,13 +508,13 @@ def rectangularHollowPostLayer(
         center=center,
         useNormal=False,
     )
-    if factorization in ("auto", "normal-vector", "jones") and pattern.epsilon.ndim == 2:
+    if factorization in ("auto", "normal-vector") and pattern.epsilon.ndim == 2:
         xx, yy = pattern.coordinates()
-        pattern.normalField = _rectangularHollowNormalField(xx, yy, size, holeRadius, center, angle)
+        pattern.normalField = rectangularHollowNormalField(xx, yy, size, holeRadius, center, angle)
     return pattern.toLayer(thickness, factorization=factorization)
 
 
-def _rectangularHollowNormalField(
+def rectangularHollowNormalField(
     xx: ComplexArray,
     yy: ComplexArray,
     size: tuple[float, float],
@@ -527,7 +549,7 @@ def _rectangularHollowNormalField(
     ny = np.where(useHoleNormal, holeNy, rectNy)
 
     normal = np.zeros(xx.shape + (2,), dtype=float)
-    normal[..., 0], normal[..., 1] = _normalizeVectors(nx, ny)
+    normal[..., 0], normal[..., 1] = normalizeVectors(nx, ny)
     return normal
 
 
@@ -538,12 +560,19 @@ def polygonPostLayer(
     post: complex | float | ComplexArray,
     vertices: Iterable[tuple[float, float]],
     *,
-    shape: tuple[int, int] = (128, 128),
+    shape: tuple[int, int] | None = (128, 128),
     factorization: FactorizationMode = "auto",
     name: str = "polygon post",
 ) -> Layer:
-    pattern = SampledPattern(period=period, shape=shape, background=background, name=name)
-    return pattern.polygon(vertices, post).toLayer(thickness, factorization=factorization)
+    return sampledPostLayer(
+        period=period,
+        thickness=thickness,
+        background=background,
+        shape=shape,
+        factorization=factorization,
+        name=name,
+        draw=lambda pattern: pattern.polygon(vertices, post),
+    )
 
 
 def slicedTaperStack(
@@ -557,7 +586,7 @@ def slicedTaperStack(
     kind: ShapeKind = "rectangle",
     slices: int = 20,
     angle: float = 0.0,
-    shape: tuple[int, int] | None = None,
+    shape: tuple[int, int] = (128, 128),
     factorization: FactorizationMode = "auto",
     name: str = "taper",
 ) -> list[Layer]:
@@ -572,7 +601,7 @@ def slicedTaperStack(
     dz = height / slices
     for index in range(slices):
         fraction = (index + 0.5) / slices
-        size = _lerpSize(bottomSize, topSize, fraction)
+        size = lerpSize(bottomSize, topSize, fraction)
         layerName = f"{name} {index + 1}/{slices}"
         if kind == "circle":
             layers.append(
@@ -594,7 +623,7 @@ def slicedTaperStack(
                     dz,
                     background,
                     post,
-                    _pairSize(size),
+                    pairSize(size),
                     angle=angle,
                     shape=shape,
                     factorization=factorization,
@@ -608,7 +637,7 @@ def slicedTaperStack(
                     dz,
                     background,
                     post,
-                    _pairSize(size),
+                    pairSize(size),
                     angle=angle,
                     shape=shape,
                     factorization=factorization,
@@ -630,20 +659,43 @@ def stack(*layers: Layer | Iterable[Layer]) -> list[Layer]:
     return result
 
 
-def _lerpSize(
+def lerpSize(
     bottom: float | tuple[float, float],
     top: float | tuple[float, float],
     fraction: float,
 ) -> float | tuple[float, float]:
     if isinstance(bottom, tuple) or isinstance(top, tuple):
-        b = _pairSize(bottom)
-        t = _pairSize(top)
+        b = pairSize(bottom)
+        t = pairSize(top)
         return (b[0] + (t[0] - b[0]) * fraction, b[1] + (t[1] - b[1]) * fraction)
     return float(bottom) + (float(top) - float(bottom)) * fraction
 
 
-def _pairSize(value: float | tuple[float, float]) -> tuple[float, float]:
+def pairSize(value: float | tuple[float, float]) -> tuple[float, float]:
     if isinstance(value, tuple):
         return (float(value[0]), float(value[1]))
     scalar = float(value)
     return (scalar, scalar)
+
+
+def sampledPostLayer(
+    *,
+    period: tuple[float, float],
+    thickness: float,
+    background: complex | float | ComplexArray,
+    shape: tuple[int, int] | None,
+    factorization: FactorizationMode,
+    name: str,
+    draw,
+) -> Layer:
+    pattern = SampledPattern(period=period, shape=sampleShape(shape), background=background, name=name)
+    draw(pattern)
+    return pattern.toLayer(thickness, factorization=factorization)
+
+
+def sampleShape(shape: tuple[int, int] | None) -> tuple[int, int]:
+    if shape is None:
+        return (128, 128)
+    if len(shape) != 2:
+        raise ValueError("shape must be a two-item tuple")
+    return (int(shape[0]), int(shape[1]))

@@ -122,7 +122,7 @@ def sweepOrders(
     if method != "smatrix":
         raise ValueError("sweepOrders supports only method='smatrix'")
 
-    sequence = _orderSequence(orderSequence, maxOrder)
+    sequence = makeOrderSequence(orderSequence, maxOrder)
     previousResult: RCWAResult | None = None
     previousField: np.ndarray | None = None
     points: list[OrderSweepPoint] = []
@@ -148,7 +148,7 @@ def sweepOrders(
             returnFields=fieldComponent is not None,
         )
         fieldMap = (
-            _sampleField(
+            sampleField(
                 result,
                 component=fieldComponent,
                 plane=fieldPlane,
@@ -163,7 +163,7 @@ def sweepOrders(
             if fieldComponent is not None
             else None
         )
-        fieldDelta, fieldRelativeDelta = _fieldDifference(fieldMap, previousField)
+        fieldDelta, fieldRelativeDelta = fieldDifference(fieldMap, previousField)
         points.append(
             OrderSweepPoint(
                 orders=normalized,
@@ -197,7 +197,7 @@ def sweepOrders(
     )
 
 
-def _orderSequence(orderSequence: Iterable[OrderSpec] | None, maxOrder: int | None) -> tuple[OrderSpec, ...]:
+def makeOrderSequence(orderSequence: Iterable[OrderSpec] | None, maxOrder: int | None) -> tuple[OrderSpec, ...]:
     if orderSequence is not None:
         sequence = tuple(orderSequence)
     elif maxOrder is not None:
@@ -211,7 +211,7 @@ def _orderSequence(orderSequence: Iterable[OrderSpec] | None, maxOrder: int | No
     return sequence
 
 
-def _sampleField(
+def sampleField(
     result: RCWAResult,
     *,
     component: str | None,
@@ -230,11 +230,11 @@ def _sampleField(
     if normalized == "xy":
         if z is None:
             z = 0.5 * result.layerSolutions[layerIndex].thickness
-        _x, _y, values = fieldSliceXy(result, layerIndex=layerIndex, z=z, component=component, shape=shape)
+        x, y, values = fieldSliceXy(result, layerIndex=layerIndex, z=z, component=component, shape=shape)
     elif normalized == "xz":
-        _x, _z, values = fieldSliceXz(result, layerIndex=layerIndex, y=y, component=component, shape=shape)
+        x, z, values = fieldSliceXz(result, layerIndex=layerIndex, y=y, component=component, shape=shape)
     elif normalized in ("stack-xz", "stack"):
-        _x, _z, values = stackFieldSliceXz(
+        x, z, values = stackFieldSliceXz(
             result,
             y=y,
             xSpan=xSpan,
@@ -248,7 +248,7 @@ def _sampleField(
     return np.asarray(values)
 
 
-def _fieldDifference(
+def fieldDifference(
     current: np.ndarray | None,
     previous: np.ndarray | None,
 ) -> tuple[float | None, float | None]:

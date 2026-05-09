@@ -54,12 +54,6 @@ def putOrderField(target: ComplexArray, orderIndex: int, values: ComplexArray) -
     target[3 * nOrders + orderIndex] = values[3]
 
 
-def singleOrderVector(nOrders: int, orderIndex: int, values: ComplexArray) -> ComplexArray:
-    vector = np.zeros(4 * nOrders, dtype=complex)
-    putOrderField(vector, orderIndex, values)
-    return vector
-
-
 def flux(field: ComplexArray) -> float:
     """Real z-directed Poynting flux for tangential Fourier coefficients."""
 
