@@ -547,6 +547,20 @@ class SolverPathTests(unittest.TestCase):
         residual = matrix @ eigenvectors - eigenvectors * eigenvalues[np.newaxis, :]
         self.assertLess(np.linalg.norm(residual), 1e-8 * max(1.0, np.linalg.norm(matrix)))
 
+        previous = os.environ.get("RCWA3D_CHECK_CUDA_EIG_FINITE")
+        try:
+            os.environ["RCWA3D_CHECK_CUDA_EIG_FINITE"] = "1"
+            checkedEigenvalues, checkedEigenvectors = backend.eig(backend.asarray(matrix))
+            checkedEigenvalues = backend.toNumpy(checkedEigenvalues)
+            checkedEigenvectors = backend.toNumpy(checkedEigenvectors)
+            checkedResidual = matrix @ checkedEigenvectors - checkedEigenvectors * checkedEigenvalues[np.newaxis, :]
+            self.assertLess(np.linalg.norm(checkedResidual), 1e-8 * max(1.0, np.linalg.norm(matrix)))
+        finally:
+            if previous is None:
+                os.environ.pop("RCWA3D_CHECK_CUDA_EIG_FINITE", None)
+            else:
+                os.environ["RCWA3D_CHECK_CUDA_EIG_FINITE"] = previous
+
         for alias in (None, "auto", "gpu", "torch", "torch-cuda"):
             with self.subTest(alias=alias):
                 resolved = resolveAnisotropicBackend(alias)
@@ -611,6 +625,44 @@ class SolverPathTests(unittest.TestCase):
                 backend.toNumpy(getattr(dense, name)),
                 rtol=1e-10,
                 atol=1e-11,
+            )
+
+    @unittest.skipUnless(torchCudaAvailable(), "requires torch CUDA")
+    def testAnisotropicHomogeneousInterfaceSolveFailurePropagates(self) -> None:
+        harmonics = anisotropic_solver.makeHarmonics(
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            orders=(1, 1),
+            epsIncident=1.0,
+            theta=0.0,
+            phi=0.0,
+            truncation="circular",
+        )
+        backend = resolveAnisotropicBackend("cuda")
+        leftForward = backend.asarray(anisotropic_solver.homogeneousBasis(harmonics, 1.0, direction=1))
+        leftBackward = backend.asarray(anisotropic_solver.homogeneousBasis(harmonics, 1.0, direction=-1))
+        rightForward = backend.asarray(anisotropic_solver.homogeneousBasis(harmonics, 2.25, direction=1))
+        rightBackward = backend.asarray(anisotropic_solver.homogeneousBasis(harmonics, 2.25, direction=-1))
+
+        class FailingSolveBackend:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+                self.xp = wrapped.xp
+                self.device = wrapped.device
+                self.floatDtype = wrapped.floatDtype
+                self.complexDtype = wrapped.complexDtype
+
+            def solve(self, matrix, rhs):
+                raise RuntimeError("forced homogeneous interface solve failure")
+
+        with self.assertRaisesRegex(RuntimeError, "forced homogeneous interface solve failure"):
+            anisotropic_solver.homogeneousInterfaceSMatrix(
+                leftForward,
+                leftBackward,
+                rightForward,
+                rightBackward,
+                harmonics.count,
+                FailingSolveBackend(backend),
             )
 
     @unittest.skipUnless(torchCudaAvailable(), "requires torch CUDA")
@@ -710,6 +762,73 @@ class SolverPathTests(unittest.TestCase):
         self.assertAlmostEqual(anisotropicResult.reflection, isotropicResult.reflection, places=12)
         self.assertAlmostEqual(anisotropicResult.transmission, isotropicResult.transmission, places=12)
         self.assertAlmostEqual(anisotropicResult.conservation, 1.0, places=12)
+
+    @unittest.skipUnless(torchCudaAvailable(), "requires torch CUDA")
+    def testAnisotropicMuIdentityMatchesExistingHomogeneousTensorPath(self) -> None:
+        epsilon = anisotropic.xzTensor(2.2, 2.1, 2.4, 0.08, 0.03)
+        common = dict(
+            wavelength=1.03,
+            period=(0.9, 0.8),
+            orders=(1, 1),
+            truncation="circular",
+            theta=np.deg2rad(7.0),
+            phi=np.deg2rad(18.0),
+            pAmplitude=1.0,
+            sAmplitude=0.3,
+            profile=True,
+        )
+
+        legacy = solveAnisotropic(layers=[anisotropic.Layer(thickness=0.12, epsilon=epsilon)], **common)
+        explicitMu = solveAnisotropic(
+            layers=[anisotropic.Layer(thickness=0.12, epsilon=epsilon, mu=np.eye(3, dtype=complex))],
+            **common,
+        )
+
+        self.assertAlmostEqual(explicitMu.reflection, legacy.reflection, places=11)
+        self.assertAlmostEqual(explicitMu.transmission, legacy.transmission, places=11)
+        np.testing.assert_allclose(explicitMu.rAmplitudes, legacy.rAmplitudes, rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(explicitMu.tAmplitudes, legacy.tAmplitudes, rtol=1e-10, atol=1e-10)
+
+    @unittest.skipUnless(torchCudaAvailable(), "requires torch CUDA")
+    def testAnisotropicHomogeneousMagneticLayerChangesImpedanceAndConservesPower(self) -> None:
+        common = dict(
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            orders=(0, 0),
+            epsIncident=1.0,
+            epsTransmission=1.0,
+            sAmplitude=1.0,
+            pAmplitude=0.0,
+        )
+        empty = solveAnisotropic(layers=[anisotropic.Layer(thickness=0.23, epsilon=1.0)], **common)
+        magnetic = solveAnisotropic(
+            layers=[anisotropic.Layer(thickness=0.23, epsilon=1.0, mu=4.0 * np.eye(3, dtype=complex))],
+            **common,
+        )
+
+        self.assertGreater(magnetic.reflection, empty.reflection + 1e-4)
+        self.assertAlmostEqual(magnetic.conservation, 1.0, places=10)
+        self.assertAlmostEqual(empty.conservation, 1.0, places=10)
+
+    def testAnisotropicConstitutiveInputRejectsUnimplementedBiAnisotropicCoupling(self) -> None:
+        layer = anisotropic.homogeneousLayer(
+            0.1,
+            anisotropic.constitutiveTensors(
+                2.25 * np.eye(3, dtype=complex),
+                mu=np.eye(3, dtype=complex),
+                chi=0.01 * np.eye(3, dtype=complex),
+            ),
+        )
+        with self.assertRaisesRegex(NotImplementedError, "magnetoelectric chi/xi"):
+            compileAnisotropicLayersForTest([layer], orders=(0, 0))
+
+    def testAnisotropicPatternedNonIdentityMuIsExplicitlyUnsupported(self) -> None:
+        epsilon = np.ones((8, 8), dtype=complex)
+        epsilon[2:6, 2:6] = 2.25
+        layer = anisotropic.Layer(thickness=0.04, epsilon=epsilon, mu=1.1 * np.eye(3, dtype=complex))
+
+        with self.assertRaisesRegex(NotImplementedError, "patterned non-identity mu"):
+            compileAnisotropicLayersForTest([layer], orders=(1, 1))
 
     def testAnisotropicDynamicMaterialCallbacksMustReturnTensor(self) -> None:
         valid = anisotropic.homogeneousLayer(
@@ -1065,6 +1184,114 @@ class SolverPathTests(unittest.TestCase):
         )
         compiled = compileAnisotropicLayersForTest([layer], orders=(1, 1), truncation="circular")
         self.assertEqual(compiled[0].tensorData.factorization, "z-li")
+
+    def testAnisotropicAnalyticRectangleConvolutionMatchesSampledLimit(self) -> None:
+        period = (1.0, 0.8)
+        size = (0.34, 0.22)
+        center = (0.11, -0.07)
+        angle = np.deg2rad(17.0)
+        background = 1.0
+        post = 3.2
+
+        harmonics = anisotropic_solver.makeHarmonics(
+            wavelength=1.0,
+            period=period,
+            orders=(2, 2),
+            epsIncident=1.0,
+            theta=0.0,
+            phi=0.0,
+            truncation="rectangular",
+        )
+        analyticLayer = anisotropic.rectangularPostLayer(
+            period=period,
+            thickness=0.08,
+            background=background,
+            post=post,
+            size=size,
+            center=center,
+            angle=angle,
+            factorization="standard",
+            analytic=True,
+        )
+        sampledLayer = anisotropic.rectangularPostLayer(
+            period=period,
+            thickness=0.08,
+            background=background,
+            post=post,
+            size=size,
+            center=center,
+            angle=angle,
+            shape=(420, 500),
+            factorization="standard",
+        )
+
+        analyticMatrix = anisotropic_solver.tensorConvolutionData(
+            analyticLayer.epsilon,
+            harmonics,
+            factorization="standard",
+        ).components[0][0]
+        sampledMatrix = anisotropic_solver.tensorConvolutionData(
+            sampledLayer.epsilon,
+            harmonics,
+            factorization="standard",
+        ).components[0][0]
+
+        self.assertIsNone(anisotropic_solver.sampleShapeFromEpsilon(analyticLayer.epsilon))
+        np.testing.assert_allclose(sampledMatrix, analyticMatrix, rtol=1.5e-2, atol=1.5e-2)
+
+    def testAnisotropicAnalyticNormalVectorLiPathIsAvailableForScalarPosts(self) -> None:
+        layer = anisotropic.rectangularPostLayer(
+            period=(1.0, 1.0),
+            thickness=0.08,
+            background=1.0,
+            post=2.25,
+            size=(0.36, 0.28),
+            factorization="auto",
+            analytic=True,
+            normalVectorResolution=48,
+        )
+        compiled = compileAnisotropicLayersForTest([layer], orders=(1, 1), truncation="circular")
+        self.assertEqual(compiled[0].tensorData.factorization, "analytic-normal-vector-li")
+        self.assertIsNone(compiled[0].sampleShape)
+
+        result = solveAnisotropic(
+            layers=compiled,
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            orders=(1, 1),
+            truncation="circular",
+        )
+        self.assertTrue(np.isfinite(result.reflection))
+        self.assertTrue(np.isfinite(result.transmission))
+
+    def testAnisotropicAnalyticDiskAndEllipseLayersCompile(self) -> None:
+        layers = [
+            anisotropic.circularPostLayer(
+                period=(1.0, 1.0),
+                thickness=0.05,
+                background=1.0,
+                post=2.25,
+                radius=0.18,
+                analytic=True,
+                normalVectorResolution=40,
+            ),
+            anisotropic.ellipticalPostLayer(
+                period=(1.0, 0.9),
+                thickness=0.05,
+                background=1.0,
+                post=2.4,
+                radii=(0.21, 0.12),
+                angle=np.deg2rad(23.0),
+                analytic=True,
+                normalVectorResolution=40,
+            ),
+        ]
+
+        for layer in layers:
+            with self.subTest(layer=layer.name):
+                compiled = compileAnisotropicLayersForTest([layer], orders=(1, 1), truncation="circular")
+                self.assertEqual(compiled[0].tensorData.factorization, "analytic-normal-vector-li")
+                self.assertIsNone(compiled[0].sampleShape)
 
     def testIsotropicAdvancedPathsAreIndependentAndReusable(self) -> None:
         layer = isotropic.rectangularHollowPostLayer(
@@ -1997,7 +2224,7 @@ class SolverPathTests(unittest.TestCase):
         np.testing.assert_allclose(mixed["TE"]["absorptivity"], fast["TE"]["absorptivity"], rtol=0.0, atol=1e-7)
 
     @unittest.skipUnless(torchCudaAvailable(), "requires torch CUDA")
-    def testAnisotropicMixedSpectrumFallsBackToComplex128OnBatchFailure(self) -> None:
+    def testAnisotropicMixedSpectrumPropagatesBatchFailure(self) -> None:
         layer = anisotropic.rectangularPostLayer(
             period=(1.0, 1.0),
             thickness=0.05,
@@ -2016,14 +2243,6 @@ class SolverPathTests(unittest.TestCase):
             cacheModes=False,
         )
         wavelengths = np.array([0.96, 1.04])
-        reference = anisotropic.RCWASimulation(**common, precision="complex128").spectrum(
-            wavelengths,
-            theta=np.deg2rad(5.0),
-            phi=np.deg2rad(7.0),
-            polarizations=("TE",),
-            bidirectional=False,
-            workers=1,
-        )
 
         original = anisotropic_simulation.RCWASimulation.prepareSpectrumBatchPowers
 
@@ -2034,23 +2253,58 @@ class SolverPathTests(unittest.TestCase):
 
         try:
             anisotropic_simulation.RCWASimulation.prepareSpectrumBatchPowers = failMixedBatch
-            mixed = anisotropic.RCWASimulation(**common, precision="mixed").spectrum(
-                wavelengths,
-                theta=np.deg2rad(5.0),
-                phi=np.deg2rad(7.0),
-                polarizations=("TE",),
-                bidirectional=False,
-                workers=1,
-            )
+            with self.assertRaisesRegex(RuntimeError, "forced mixed batch failure"):
+                anisotropic.RCWASimulation(**common, precision="mixed").spectrum(
+                    wavelengths,
+                    theta=np.deg2rad(5.0),
+                    phi=np.deg2rad(7.0),
+                    polarizations=("TE",),
+                    bidirectional=False,
+                    workers=1,
+                )
         finally:
             anisotropic_simulation.RCWASimulation.prepareSpectrumBatchPowers = original
 
-        np.testing.assert_allclose(
-            mixed["TE"]["absorptivity"],
-            reference["TE"]["absorptivity"],
-            rtol=1e-10,
-            atol=1e-10,
+    @unittest.skipUnless(torchCudaAvailable(), "requires torch CUDA")
+    def testAnisotropicBatchedSpectrumRejectsNonFinitePowers(self) -> None:
+        layer = anisotropic.rectangularPostLayer(
+            period=(1.0, 1.0),
+            thickness=0.05,
+            background=1.0,
+            post=2.2,
+            size=(0.30, 0.25),
+            shape=(18, 18),
+            factorization="standard",
         )
+        common = dict(
+            period=(1.0, 1.0),
+            layers=[layer],
+            orders=(1, 1),
+            truncation="circular",
+            workers=1,
+            cacheModes=False,
+        )
+        wavelengths = np.array([0.96, 1.04])
+
+        original = anisotropic_simulation.RCWASimulation.prepareSpectrumBatchPowers
+
+        def nonFiniteBatch(self, wavelengths, *args, **kwargs):
+            values = np.asarray(wavelengths, dtype=float)
+            return {label: (np.full(values.shape, np.nan), np.zeros(values.shape)) for label in kwargs["excitations"]}
+
+        try:
+            anisotropic_simulation.RCWASimulation.prepareSpectrumBatchPowers = nonFiniteBatch
+            with self.assertRaisesRegex(FloatingPointError, "non-finite powers"):
+                anisotropic.RCWASimulation(**common, precision="mixed").spectrum(
+                    wavelengths,
+                    theta=np.deg2rad(5.0),
+                    phi=np.deg2rad(7.0),
+                    polarizations=("TE",),
+                    bidirectional=False,
+                    workers=1,
+                )
+        finally:
+            anisotropic_simulation.RCWASimulation.prepareSpectrumBatchPowers = original
 
     def testSpectrumWorkersMatchSerialSpectrum(self) -> None:
         simulation = anisotropic.RCWASimulation(

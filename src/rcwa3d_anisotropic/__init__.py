@@ -2,8 +2,13 @@
 
 from .backend import ArrayBackend, resolveBackend
 from .builder import LayerStack, PatternLayer
+from .analytic import AnalyticDisk, AnalyticEllipse, AnalyticRectangle
+from .constitutive import ConstitutiveTensors, constitutiveTensors, magneticLayer
 from .geometry import (
     SampledPattern,
+    analyticCircularPostLayer,
+    analyticEllipticalPostLayer,
+    analyticRectangularPostLayer,
     circularPostLayer,
     ellipticalPostLayer,
     polygonPostLayer,
@@ -33,7 +38,11 @@ from .solver import (
 
 __all__ = [
     "AnisotropicRCWA",
+    "AnalyticDisk",
+    "AnalyticEllipse",
+    "AnalyticRectangle",
     "ArrayBackend",
+    "ConstitutiveTensors",
     "DiffractionOrder",
     "Layer",
     "LayerEigTiming",
@@ -47,11 +56,16 @@ __all__ = [
     "PatternLayer",
     "Project",
     "SampledPattern",
+    "analyticCircularPostLayer",
+    "analyticEllipticalPostLayer",
+    "analyticRectangularPostLayer",
     "buildSimulation",
     "circularPostLayer",
+    "constitutiveTensors",
     "ellipticalPostLayer",
     "gyrotropicXzTensor",
     "homogeneousLayer",
+    "magneticLayer",
     "polygonPostLayer",
     "reciprocalXzTensor",
     "rectangularHollowPostLayer",

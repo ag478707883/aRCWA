@@ -5,6 +5,7 @@ from typing import Iterable, Literal
 
 import numpy as np
 
+from .analytic import AnalyticDisk, AnalyticEllipse, AnalyticRectangle, scalarMaterial
 from .solver import Layer
 
 
@@ -421,7 +422,21 @@ def circularPostLayer(
     center: tuple[float, float] = (0.0, 0.0),
     factorization: FactorizationMode = "auto",
     name: str = "circular post",
+    analytic: bool = False,
+    normalVectorResolution: int = 512,
 ) -> Layer:
+    if analytic:
+        return analyticCircularPostLayer(
+            period=period,
+            thickness=thickness,
+            background=background,
+            post=post,
+            radius=radius,
+            center=center,
+            factorization=factorization,
+            name=name,
+            normalVectorResolution=normalVectorResolution,
+        )
     return sampledPostLayer(
         period=period,
         thickness=thickness,
@@ -430,6 +445,34 @@ def circularPostLayer(
         factorization=factorization,
         name=name,
         draw=lambda pattern: pattern.circle(radius, post, center=center),
+    )
+
+
+def analyticCircularPostLayer(
+    period: tuple[float, float],
+    thickness: float,
+    background: complex | float | ComplexArray,
+    post: complex | float | ComplexArray,
+    radius: float,
+    *,
+    center: tuple[float, float] = (0.0, 0.0),
+    factorization: FactorizationMode = "auto",
+    name: str = "analytic circular post",
+    normalVectorResolution: int = 512,
+) -> Layer:
+    return Layer(
+        thickness=thickness,
+        epsilon=AnalyticDisk(
+            period=period,
+            radius=radius,
+            background=scalarMaterial(background),
+            inclusion=scalarMaterial(post),
+            center=center,
+            factorization="normal-vector" if factorization in ("auto", "normal-vector") else "analytic",
+            jonesResolution=normalVectorResolution,
+        ),
+        factorization=factorization,
+        name=name,
     )
 
 
@@ -445,7 +488,22 @@ def ellipticalPostLayer(
     center: tuple[float, float] = (0.0, 0.0),
     factorization: FactorizationMode = "auto",
     name: str = "elliptical post",
+    analytic: bool = False,
+    normalVectorResolution: int = 512,
 ) -> Layer:
+    if analytic:
+        return analyticEllipticalPostLayer(
+            period=period,
+            thickness=thickness,
+            background=background,
+            post=post,
+            radii=radii,
+            angle=angle,
+            center=center,
+            factorization=factorization,
+            name=name,
+            normalVectorResolution=normalVectorResolution,
+        )
     return sampledPostLayer(
         period=period,
         thickness=thickness,
@@ -454,6 +512,36 @@ def ellipticalPostLayer(
         factorization=factorization,
         name=name,
         draw=lambda pattern: pattern.ellipse(radii, post, center=center, angle=angle),
+    )
+
+
+def analyticEllipticalPostLayer(
+    period: tuple[float, float],
+    thickness: float,
+    background: complex | float | ComplexArray,
+    post: complex | float | ComplexArray,
+    radii: tuple[float, float],
+    *,
+    angle: float = 0.0,
+    center: tuple[float, float] = (0.0, 0.0),
+    factorization: FactorizationMode = "auto",
+    name: str = "analytic elliptical post",
+    normalVectorResolution: int = 512,
+) -> Layer:
+    return Layer(
+        thickness=thickness,
+        epsilon=AnalyticEllipse(
+            period=period,
+            radii=radii,
+            background=scalarMaterial(background),
+            inclusion=scalarMaterial(post),
+            center=center,
+            angle=angle,
+            factorization="normal-vector" if factorization in ("auto", "normal-vector") else "analytic",
+            jonesResolution=normalVectorResolution,
+        ),
+        factorization=factorization,
+        name=name,
     )
 
 
@@ -469,7 +557,22 @@ def rectangularPostLayer(
     center: tuple[float, float] = (0.0, 0.0),
     factorization: FactorizationMode = "auto",
     name: str = "rectangular post",
+    analytic: bool = False,
+    normalVectorResolution: int = 512,
 ) -> Layer:
+    if analytic:
+        return analyticRectangularPostLayer(
+            period=period,
+            thickness=thickness,
+            background=background,
+            post=post,
+            size=size,
+            angle=angle,
+            center=center,
+            factorization=factorization,
+            name=name,
+            normalVectorResolution=normalVectorResolution,
+        )
     return sampledPostLayer(
         period=period,
         thickness=thickness,
@@ -478,6 +581,36 @@ def rectangularPostLayer(
         factorization=factorization,
         name=name,
         draw=lambda pattern: pattern.rectangle(size, post, center=center, angle=angle),
+    )
+
+
+def analyticRectangularPostLayer(
+    period: tuple[float, float],
+    thickness: float,
+    background: complex | float | ComplexArray,
+    post: complex | float | ComplexArray,
+    size: tuple[float, float],
+    *,
+    angle: float = 0.0,
+    center: tuple[float, float] = (0.0, 0.0),
+    factorization: FactorizationMode = "auto",
+    name: str = "analytic rectangular post",
+    normalVectorResolution: int = 512,
+) -> Layer:
+    return Layer(
+        thickness=thickness,
+        epsilon=AnalyticRectangle(
+            period=period,
+            size=size,
+            background=scalarMaterial(background),
+            inclusion=scalarMaterial(post),
+            center=center,
+            angle=angle,
+            factorization="normal-vector" if factorization in ("auto", "normal-vector") else "analytic",
+            jonesResolution=normalVectorResolution,
+        ),
+        factorization=factorization,
+        name=name,
     )
 
 

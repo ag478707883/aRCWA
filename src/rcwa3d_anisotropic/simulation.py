@@ -11,6 +11,7 @@ import warnings
 import numpy as np
 
 from .backend import resolveBackend
+from .constitutive import splitConstitutiveInput
 from .factorization import constantTensor
 from .solver import (
     BatchedHomogeneousLayer,
@@ -35,7 +36,7 @@ from .fourier import normalizeOrders
 
 
 ComplexArray = np.ndarray
-EpsilonSource = Union[ComplexArray, complex, Callable[[float], ComplexArray]]
+TensorSource = Union[ComplexArray, complex, Callable[[float], ComplexArray]]
 LayerInput = Any
 Polarization = Union[Literal["TE", "TM", "s", "p"], tuple[complex, complex]]
 ExcitationMap = Mapping[str, tuple[complex, complex]]
@@ -47,42 +48,65 @@ class LayerSpec:
     """A homogeneous layer whose material may depend on wavelength."""
 
     thickness: float
-    epsilon: EpsilonSource
+    epsilon: TensorSource
     name: str = ""
+    mu: TensorSource | None = None
+    chi: TensorSource | None = None
+    xi: TensorSource | None = None
+
+    def __post_init__(self) -> None:
+        epsilon, mu, chi, xi = splitConstitutiveInput(self.epsilon, self.mu, self.chi, self.xi)
+        object.__setattr__(self, "epsilon", epsilon)
+        object.__setattr__(self, "mu", mu)
+        object.__setattr__(self, "chi", chi)
+        object.__setattr__(self, "xi", xi)
 
     @property
     def isStatic(self) -> bool:
-        return not callable(self.epsilon)
+        return not any(callable(value) for value in (self.epsilon, self.mu, self.chi, self.xi))
 
     def at(self, wavelength: float) -> Layer:
-        epsilon = (
-            materialTensor(self.epsilon(wavelength), name=self.name)
-            if callable(self.epsilon)
-            else self.epsilon
-        )
-        return Layer(thickness=self.thickness, epsilon=epsilon, name=self.name)
+        epsilon = materialTensorAt(self.epsilon, wavelength, name=self.name, tensorName="permittivity")
+        mu = materialTensorAt(self.mu, wavelength, name=self.name, tensorName="permeability") if self.mu is not None else None
+        chi = materialTensorAt(self.chi, wavelength, name=self.name, tensorName="magnetoelectric chi") if self.chi is not None else None
+        xi = materialTensorAt(self.xi, wavelength, name=self.name, tensorName="magnetoelectric xi") if self.xi is not None else None
+        return Layer(thickness=self.thickness, epsilon=epsilon, name=self.name, mu=mu, chi=chi, xi=xi)
 
 
-def homogeneousLayer(thickness: float, epsilon: EpsilonSource, name: str = "") -> Layer | LayerSpec:
+def homogeneousLayer(
+    thickness: float,
+    epsilon: TensorSource,
+    name: str = "",
+    *,
+    mu: TensorSource | None = None,
+    chi: TensorSource | None = None,
+    xi: TensorSource | None = None,
+) -> Layer | LayerSpec:
     """Return a static or wavelength-dependent homogeneous layer.
 
     Wavelength-dependent material callbacks are user supplied and must return
-    one ``(3, 3)`` relative-permittivity tensor for the requested wavelength.
-    Isotropic dispersive materials should return ``epsilon * np.eye(3)``.
+    one ``(3, 3)`` tensor for the requested wavelength.  Isotropic dispersive
+    materials should return ``value * np.eye(3)``.
     """
 
-    if callable(epsilon):
-        return LayerSpec(thickness=thickness, epsilon=epsilon, name=name)
-    return Layer(thickness=thickness, epsilon=epsilon, name=name)
+    if any(callable(value) for value in (epsilon, mu, chi, xi)):
+        return LayerSpec(thickness=thickness, epsilon=epsilon, name=name, mu=mu, chi=chi, xi=xi)
+    return Layer(thickness=thickness, epsilon=epsilon, name=name, mu=mu, chi=chi, xi=xi)
 
 
-def materialTensor(value: object, *, name: str = "") -> ComplexArray:
+def materialTensorAt(value: TensorSource, wavelength: float, *, name: str = "", tensorName: str = "material") -> object:
+    if not callable(value):
+        return value
+    return materialTensor(value(wavelength), name=name, tensorName=tensorName)
+
+
+def materialTensor(value: object, *, name: str = "", tensorName: str = "permittivity") -> ComplexArray:
     tensor = np.asarray(value, dtype=complex)
     if tensor.shape != (3, 3):
         label = f" for {name!r}" if name else ""
         raise ValueError(
-            f"wavelength-dependent material{label} must return a (3, 3) permittivity tensor; "
-            "wrap isotropic values as epsilon * np.eye(3, dtype=complex)"
+            f"wavelength-dependent material{label} must return a (3, 3) {tensorName} tensor; "
+            "wrap isotropic values as value * np.eye(3, dtype=complex)"
         )
     return tensor
 
@@ -499,26 +523,6 @@ class RCWASimulation:
             chunkSize = max(1, chunkSize // 2)
         forward = {label: np.empty(wavelengths.shape, dtype=float) for label in excitations}
         backward = {label: np.empty(wavelengths.shape, dtype=float) for label in excitations}
-        fallbackSimulation: RCWASimulation | None = None
-
-        def fallback() -> RCWASimulation:
-            nonlocal fallbackSimulation
-            if fallbackSimulation is None:
-                fallbackSimulation = self.complex128FallbackSimulation()
-            return fallbackSimulation
-
-        def fillFallbackPoint(index: int, wavelength: float) -> None:
-            point = fallback().spectrumPoint(
-                float(wavelength),
-                theta=theta,
-                phi=phi,
-                excitations=excitations,
-                bidirectional=bidirectional,
-                usePreparedCache=False,
-            )
-            for label, (forwardValue, backwardValue) in point.items():
-                forward[label][index] = forwardValue
-                backward[label][index] = backwardValue
 
         for start in range(0, wavelengths.size, chunkSize):
             stop = min(start + chunkSize, wavelengths.size)
@@ -526,80 +530,59 @@ class RCWASimulation:
             layers = self.batchedLayers(chunk)
             if layers is None:
                 return None
-            try:
-                if combineBidirectionalAngles:
-                    combinedChunk = np.concatenate([chunk, chunk])
-                    combinedLayers = repeatBatchedLayersForAngles(layers, 2)
-                    angleBatch = np.concatenate(
-                        [
-                            np.full(chunk.shape, float(theta), dtype=float),
-                            np.full(chunk.shape, -float(theta), dtype=float),
-                        ]
-                    )
-                    phiBatch = np.full(combinedChunk.shape, float(phi), dtype=float)
-                    combinedPowers = self.prepareSpectrumBatchPowers(
-                        combinedChunk,
-                        layers=combinedLayers,
-                        theta=angleBatch,
-                        phi=phiBatch,
-                        excitations=excitations,
-                    )
-                    width = chunk.size
-                    for label, (reflection, transmission) in combinedPowers.items():
-                        absorptivity = 1.0 - reflection - transmission
-                        forward[label][start:stop] = absorptivity[:width]
-                        backward[label][start:stop] = absorptivity[width:]
-                else:
-                    forwardPowers = self.prepareSpectrumBatchPowers(
+
+            if combineBidirectionalAngles:
+                combinedChunk = np.concatenate([chunk, chunk])
+                combinedLayers = repeatBatchedLayersForAngles(layers, 2)
+                angleBatch = np.concatenate(
+                    [
+                        np.full(chunk.shape, float(theta), dtype=float),
+                        np.full(chunk.shape, -float(theta), dtype=float),
+                    ]
+                )
+                phiBatch = np.full(combinedChunk.shape, float(phi), dtype=float)
+                combinedPowers = self.prepareSpectrumBatchPowers(
+                    combinedChunk,
+                    layers=combinedLayers,
+                    theta=angleBatch,
+                    phi=phiBatch,
+                    excitations=excitations,
+                )
+                width = chunk.size
+                for label, (reflection, transmission) in combinedPowers.items():
+                    absorptivity = 1.0 - reflection - transmission
+                    forward[label][start:stop] = absorptivity[:width]
+                    backward[label][start:stop] = absorptivity[width:]
+            else:
+                forwardPowers = self.prepareSpectrumBatchPowers(
+                    chunk,
+                    layers=layers,
+                    theta=theta,
+                    phi=phi,
+                    excitations=excitations,
+                )
+                for label, (reflection, transmission) in forwardPowers.items():
+                    forward[label][start:stop] = 1.0 - reflection - transmission
+                if bidirectional:
+                    backwardPowers = self.prepareSpectrumBatchPowers(
                         chunk,
                         layers=layers,
-                        theta=theta,
+                        theta=-theta,
                         phi=phi,
                         excitations=excitations,
                     )
-                    for label, (reflection, transmission) in forwardPowers.items():
-                        forward[label][start:stop] = 1.0 - reflection - transmission
-                    if bidirectional:
-                        backwardPowers = self.prepareSpectrumBatchPowers(
-                            chunk,
-                            layers=layers,
-                            theta=-theta,
-                            phi=phi,
-                            excitations=excitations,
-                        )
-                        for label, (reflection, transmission) in backwardPowers.items():
-                            backward[label][start:stop] = 1.0 - reflection - transmission
-            except (RuntimeError, ValueError, FloatingPointError):
-                if self.precision != "mixed":
-                    raise
-                for offset, wavelength in enumerate(chunk):
-                    fillFallbackPoint(start + offset, float(wavelength))
-                continue
+                    for label, (reflection, transmission) in backwardPowers.items():
+                        backward[label][start:stop] = 1.0 - reflection - transmission
 
-            if self.precision == "mixed":
-                invalid = invalidSpectrumMask(forward, backward, start, stop, tuple(excitations), bidirectional)
-                if np.any(invalid):
-                    for offset, wavelength in enumerate(chunk):
-                        if invalid[offset]:
-                            fillFallbackPoint(start + offset, float(wavelength))
+            invalid = invalidSpectrumMask(forward, backward, start, stop, tuple(excitations), bidirectional)
+            if np.any(invalid):
+                badWavelengths = ", ".join(f"{float(value):.12g}" for value in chunk[invalid])
+                raise FloatingPointError(
+                    "anisotropic batched spectrum produced non-finite powers "
+                    f"for wavelength(s): {badWavelengths}"
+                )
 
         return {"forward": forward, "backward": backward}
-
-    def complex128FallbackSimulation(self) -> "RCWASimulation":
-        return RCWASimulation(
-            period=self.period,
-            layers=self.layers,
-            orders=self.orders,
-            truncation=self.truncation,
-            backend=self.backend,
-            precision="complex128",
-            epsIncident=self.epsIncident,
-            epsTransmission=self.epsTransmission,
-            precompile=self.precompile,
-            workers=self.workers,
-            cacheModes=self.cacheModes,
-            cacheSize=self.cacheSize,
-        )
 
     def prepareSpectrumBatchPowers(
         self,
@@ -672,14 +655,12 @@ class RCWASimulation:
         matrixSize = (4 if hasFullLayer else 2) * nOrders
         bytesPerPoint = max(1, matrixSize * matrixSize * 16 * 12)
         budget = 512 * 1024 * 1024
-        try:
-            import torch
+        import torch
 
-            if torch.cuda.is_available():
-                freeBytes, totalBytes = torch.cuda.mem_get_info()
-                budget = max(budget, int(0.20 * freeBytes))
-        except Exception:
-            pass
+        if not torch.cuda.is_available():
+            raise RuntimeError("anisotropic CUDA batched spectrum requires torch.cuda to be available")
+        freeBytes, totalBytes = torch.cuda.mem_get_info()
+        budget = max(budget, int(0.20 * freeBytes))
         return max(1, min(64, budget // bytesPerPoint))
 
     def batchedLayers(
@@ -960,12 +941,20 @@ class RCWASimulation:
         if isinstance(layer, CompiledLayer):
             return layer
         if isinstance(layer, Layer):
-            if layer.normalField is None and constantTensor(layer.epsilon) is not None:
+            if (
+                layer.normalField is None
+                and constantTensor(layer.epsilon) is not None
+                and (layer.mu is None or constantTensor(layer.mu) is not None)
+            ):
                 return layer
             return compileLayers([layer], orders=self.orders, truncation=self.truncation)[0]
         if isinstance(layer, LayerSpec) and layer.isStatic:
             staticLayer = layer.at(1.0)
-            if staticLayer.normalField is None and constantTensor(staticLayer.epsilon) is not None:
+            if (
+                staticLayer.normalField is None
+                and constantTensor(staticLayer.epsilon) is not None
+                and (staticLayer.mu is None or constantTensor(staticLayer.mu) is not None)
+            ):
                 return staticLayer
             return compileLayers([staticLayer], orders=self.orders, truncation=self.truncation)[0]
         return layer
@@ -1099,15 +1088,17 @@ def reducedCacheLayerKey(
 
 def layerCacheKey(layer: Layer | CompiledLayer) -> tuple[object, ...]:
     if isinstance(layer, CompiledLayer):
-        return ("compiled", id(layer))
+        return ("compiled", id(layer), complexArrayCacheKey(layer.mu) if getattr(layer, "mu", None) is not None else None)
 
     if layer.normalField is None:
         tensor = constantTensor(layer.epsilon)
-        if tensor is not None:
+        muTensor = identityTensor() if getattr(layer, "mu", None) is None else constantTensor(layer.mu)
+        if tensor is not None and muTensor is not None:
             return (
                 "homogeneous",
                 float(layer.thickness),
                 complexArrayCacheKey(tensor),
+                complexArrayCacheKey(muTensor),
                 getattr(layer, "factorization", "auto"),
             )
     return ("layer", id(layer))
@@ -1116,6 +1107,10 @@ def layerCacheKey(layer: Layer | CompiledLayer) -> tuple[object, ...]:
 def complexArrayCacheKey(value: ComplexArray) -> tuple[tuple[int, ...], tuple[complex, ...]]:
     array = np.asarray(value, dtype=complex)
     return tuple(int(size) for size in array.shape), tuple(complex(item) for item in array.reshape(-1))
+
+
+def identityTensor() -> ComplexArray:
+    return np.eye(3, dtype=complex)
 
 
 def spectrumParallelPlan(
@@ -1176,6 +1171,7 @@ def sameStaticBatchLayer(layers: Sequence[Layer | CompiledLayer]) -> bool:
 
 def batchedHomogeneousLayer(layers: Sequence[Layer | CompiledLayer]) -> BatchedHomogeneousLayer | None:
     tensors: list[ComplexArray] = []
+    mus: list[ComplexArray] = []
     firstThickness = float(layers[0].thickness)
     firstName = getattr(layers[0], "name", "")
     for layer in layers:
@@ -1183,17 +1179,22 @@ def batchedHomogeneousLayer(layers: Sequence[Layer | CompiledLayer]) -> BatchedH
             return None
         if isinstance(layer, CompiledLayer):
             tensor = layer.tensorData.constantTensor
+            muTensor = layer.mu
         elif getattr(layer, "normalField", None) is None:
             tensor = constantTensor(layer.epsilon)
+            muTensor = identityTensor() if layer.mu is None else constantTensor(layer.mu)
         else:
             return None
-        if tensor is None:
+        if tensor is None or muTensor is None:
             return None
         tensors.append(np.asarray(tensor, dtype=complex))
+        mus.append(np.asarray(muTensor, dtype=complex))
+    muStack = np.stack(mus, axis=0)
     return BatchedHomogeneousLayer(
         thickness=firstThickness,
         tensors=np.stack(tensors, axis=0),
         name=str(firstName),
+        mus=None if isBatchedIdentityTensor(muStack) else muStack,
     )
 
 
@@ -1209,6 +1210,11 @@ def repeatBatchedLayersForAngles(
                     thickness=layer.thickness,
                     tensors=np.concatenate([np.asarray(layer.tensors, dtype=complex)] * repeats, axis=0),
                     name=layer.name,
+                    mus=(
+                        None
+                        if layer.mus is None
+                        else np.concatenate([np.asarray(layer.mus, dtype=complex)] * repeats, axis=0)
+                    ),
                 )
             )
         else:
@@ -1257,13 +1263,33 @@ def isSimpleBatchLayer(layer: Layer | CompiledLayer) -> bool:
         tensor = layer.tensorData.constantTensor
         if tensor is None:
             return False
+        muTensor = identityTensor() if layer.mu is None else layer.mu
     elif getattr(layer, "normalField", None) is None:
         tensor = constantTensor(layer.epsilon)
         if tensor is None:
             return False
+        muTensor = identityTensor() if layer.mu is None else constantTensor(layer.mu)
     else:
+        return False
+    if muTensor is None or not isIdentityTensor(muTensor):
         return False
     diagonal = np.diag(np.asarray(tensor, dtype=complex))
     offDiagonal = tensor - np.diag(diagonal)
     scale = max(1.0, float(np.max(np.abs(tensor))) if tensor.size else 1.0)
     return bool(np.max(np.abs(offDiagonal)) <= 1e-14 * scale and np.max(np.abs(diagonal - diagonal[0])) <= 1e-14 * scale)
+
+
+def isIdentityTensor(tensor: ComplexArray) -> bool:
+    array = np.asarray(tensor, dtype=complex)
+    if array.shape != (3, 3):
+        return False
+    scale = max(1.0, float(np.max(np.abs(array))) if array.size else 1.0)
+    return bool(np.max(np.abs(array - np.eye(3, dtype=complex))) <= 1e-14 * scale)
+
+
+def isBatchedIdentityTensor(tensors: ComplexArray) -> bool:
+    array = np.asarray(tensors, dtype=complex)
+    if array.ndim != 3 or array.shape[-2:] != (3, 3):
+        return False
+    scale = max(1.0, float(np.max(np.abs(array))) if array.size else 1.0)
+    return bool(np.max(np.abs(array - np.eye(3, dtype=complex)[None, :, :])) <= 1e-14 * scale)

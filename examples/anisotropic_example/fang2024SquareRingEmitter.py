@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -19,13 +20,14 @@ import rcwa3d_anisotropic as rcwa
 
 
 # Runtime knobs. Increase ORDER/GRID/POINTS for convergence studies.
-ORDER = 15
+ORDER = 7
 TRUNCATION = "circular"
 BACKEND = "cuda"
+PRECISION = os.environ.get("RCWA3D_ANISOTROPIC_PRECISION", "complex128")
 FACTORIZATION = "auto"
-GRID = 128
+GRID = 512
 WORKERS = 1
-POINTS = 201
+POINTS = 501
 SHOW = True
 
 # Fang et al. 2024, Near-infrared multi-band small-angle TE-polarization
@@ -153,6 +155,7 @@ def make_config() -> rcwa.SimulationConfig:
         orders=ORDER,
         truncation=TRUNCATION,
         backend=BACKEND,
+        precision=PRECISION,
         epsIncident=1.0,
         epsTransmission=SI_INDEX**2,
         precompile=True,
@@ -220,7 +223,7 @@ def main() -> None:
     print(
         "RCWA "
         f"order={ORDER}, grid={GRID}, points={POINTS}, truncation={TRUNCATION}, "
-        f"factorization={FACTORIZATION}, backend={BACKEND}, workers={WORKERS}"
+        f"factorization={FACTORIZATION}, backend={BACKEND}, precision={PRECISION}, workers={WORKERS}"
     )
     print(
         "Fang 2024 geometry: "

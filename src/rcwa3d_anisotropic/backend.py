@@ -27,7 +27,7 @@ class ArrayBackend:
 
     def eig(self, matrix: Any) -> tuple[Any, Any]:
         eigenvalues, eigenvectors = self.xp.linalg.eig(matrix)
-        if not finiteTorchEigResult(self.xp.torch, eigenvalues, eigenvectors):
+        if shouldCheckTorchEigFinite() and not finiteTorchEigResult(self.xp.torch, eigenvalues, eigenvectors):
             raise RuntimeError("CUDA eigensolve returned non-finite values for anisotropic layer matrix")
         if shouldValidateTorchEigResidual() and not acceptableTorchEigResult(
             self.xp.torch,
@@ -248,6 +248,10 @@ def acceptableTorchEigResult(torch: Any, matrix: Any, eigenvalues: Any, eigenvec
 
 def finiteTorchEigResult(torch: Any, eigenvalues: Any, eigenvectors: Any) -> bool:
     return bool(torch.all(torch.isfinite(eigenvalues)) and torch.all(torch.isfinite(eigenvectors)))
+
+
+def shouldCheckTorchEigFinite() -> bool:
+    return os.environ.get("RCWA3D_CHECK_CUDA_EIG_FINITE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def shouldValidateTorchEigResidual() -> bool:

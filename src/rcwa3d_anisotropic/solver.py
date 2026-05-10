@@ -607,6 +607,8 @@ def compileLayers(
     )
     compiledLayers = []
     for layer in layers:
+        validateHomogeneousMuSupport(layer)
+        muTensor = None if getattr(layer, "mu", None) is None else constantTensor(getattr(layer, "mu"))
         compiledLayers.append(
             CompiledLayer(
                 thickness=layer.thickness,
@@ -622,6 +624,7 @@ def compileLayers(
                 factorization=getattr(layer, "factorization", "auto"),
                 name=layer.name,
                 sampleShape=getattr(layer, "sampleShape", sampleShapeFromEpsilon(layer.epsilon)),
+                mu=muTensor,
             )
         )
     return tuple(compiledLayers)
@@ -779,6 +782,15 @@ def validateBatchedCompiledLayers(
     ]
     if invalidHomogeneous:
         raise ValueError("batched homogeneous layer tensors must have shape (batch, 3, 3)")
+    invalidMu = [
+        layer
+        for layer in layers
+        if isinstance(layer, BatchedHomogeneousLayer)
+        and layer.mus is not None
+        and np.asarray(layer.mus).shape != (harmonics.batchSize, 3, 3)
+    ]
+    if invalidMu:
+        raise ValueError("batched homogeneous layer mu tensors must have shape (batch, 3, 3)")
 
 
 def makeFastPathPlan(
@@ -815,11 +827,11 @@ def homogeneousEquivalentLayer(layer: Layer | CompiledLayer) -> Layer:
         tensor = layer.tensorData.constantTensor
         if tensor is None:
             raise RuntimeError("compiled layer is not homogeneous")
-        return Layer(thickness=layer.thickness, epsilon=tensor, name=layer.name)
-    tensor = constantTensor(getattr(layer, "epsilon"))
+        return Layer(thickness=layer.thickness, epsilon=tensor, mu=layer.mu, name=layer.name)
+    tensor, muTensor = constantLayerTensors(layer)
     if tensor is None:
         raise RuntimeError("layer is not homogeneous")
-    return Layer(thickness=layer.thickness, epsilon=tensor, name=getattr(layer, "name", ""))
+    return Layer(thickness=layer.thickness, epsilon=tensor, mu=muTensor, name=getattr(layer, "name", ""))
 
 
 def sliceCompiledLayer(layer: CompiledLayer, plan: AutomaticFastPathPlan) -> CompiledLayer:
@@ -845,6 +857,7 @@ def sliceCompiledLayer(layer: CompiledLayer, plan: AutomaticFastPathPlan) -> Com
         factorization=layer.factorization,
         name=layer.name,
         sampleShape=layer.sampleShape,
+        mu=layer.mu,
     )
 
 
@@ -924,6 +937,10 @@ def layerInvariantAlong(axis: str, layer: Layer | CompiledLayer, harmonics: Harm
 
 
 def rawLayerInvariantAlong(axis: str, layer: Layer) -> bool:
+    if getattr(layer, "mu", None) is not None:
+        muTensor = constantTensor(getattr(layer, "mu"))
+        if muTensor is None and not epsilonInvariantAlong(axis, getattr(layer, "mu")):
+            return False
     epsilon = getattr(layer, "epsilon")
     if constantTensor(epsilon) is not None:
         return True
@@ -935,7 +952,11 @@ def rawLayerInvariantAlong(axis: str, layer: Layer) -> bool:
 
 def epsilonInvariantAlong(axis: str, epsilon: TensorLike) -> bool:
     if isinstance(epsilon, Mapping):
-        return all(arrayInvariantAlong(axis, np.asarray(value)) for value in epsilon.values())
+        return all(epsilonInvariantAlong(axis, value) for value in epsilon.values())
+    if hasattr(epsilon, "invariantAxes"):
+        return axis in epsilon.invariantAxes()
+    if hasattr(epsilon, "convolutionMatrix"):
+        return False
     if np.isscalar(epsilon):
         return True
     array = np.asarray(epsilon)
@@ -963,6 +984,8 @@ def compiledLayerInvariantAlong(axis: str, layer: CompiledLayer, harmonics: Harm
         return False
     if layer.tensorData.constantTensor is not None:
         return True
+    if layer.mu is not None and not isIdentityTensor(layer.mu):
+        return False
     if axis == "y":
         uncoupled = harmonics.my[:, None] != harmonics.my[None, :]
     elif axis == "x":
@@ -1001,22 +1024,25 @@ def layerModesBatch(
 ) -> tuple[object, object]:
     if isinstance(layer, BatchedHomogeneousLayer):
         tensors = np.asarray(layer.tensors, dtype=complex)
-        if isBatchedScalarTensor(tensors):
+        mus = None if layer.mus is None else np.asarray(layer.mus, dtype=complex)
+        if mus is None and isBatchedScalarTensor(tensors):
             return homogeneousScalarLayerModesBatch(tensors[:, 0, 0], harmonics, backend)
-        return homogeneousTensorLayerModesBatch(tensors, harmonics, backend)
+        return homogeneousTensorLayerModesBatch(tensors, harmonics, backend, mu=mus)
 
+    validateHomogeneousMuSupport(layer)
     if not isinstance(layer, CompiledLayer) and getattr(layer, "normalField", None) is None:
-        tensor = constantTensor(getattr(layer, "epsilon"))
+        tensor, muTensor = constantLayerTensors(layer)
         if tensor is not None:
-            if isScalarTensor(tensor):
+            if isIdentityTensor(muTensor) and isScalarTensor(tensor):
                 return homogeneousScalarLayerModesBatch(tensor[0, 0], harmonics, backend)
-            return homogeneousTensorLayerModesBatch(tensor, harmonics, backend)
+            return homogeneousTensorLayerModesBatch(tensor, harmonics, backend, mu=muTensor)
 
     factorized = layerTensorData(layer, batchedReferenceHarmonics(harmonics))
     if factorized.constantTensor is not None:
-        if isScalarTensor(factorized.constantTensor):
+        muTensor = constantCompiledMuTensor(layer)
+        if isIdentityTensor(muTensor) and isScalarTensor(factorized.constantTensor):
             return homogeneousScalarLayerModesBatch(factorized.constantTensor[0, 0], harmonics, backend)
-        return homogeneousTensorLayerModesBatch(factorized.constantTensor, harmonics, backend)
+        return homogeneousTensorLayerModesBatch(factorized.constantTensor, harmonics, backend, mu=muTensor)
     if hasNoLongitudinalCoupling(factorized):
         return transverseBlockLayerModesBatch(factorized, harmonics, backend)
     system = liFactorizedSystemMatrixBatchBackend(factorized, harmonics, backend)
@@ -1040,16 +1066,39 @@ def layerModeCacheKey(layer: Layer | CompiledLayer) -> tuple[object, ...] | None
     if isinstance(layer, BatchedHomogeneousLayer):
         return None
     if isinstance(layer, CompiledLayer):
-        return ("compiled", id(layer.tensorData), layer.orders, layer.truncation)
+        return ("compiled", id(layer.tensorData), layer.orders, layer.truncation, complexArrayCacheKey(layer.mu) if layer.mu is not None else None)
     if getattr(layer, "normalField", None) is None:
-        tensor = constantTensor(getattr(layer, "epsilon"))
+        tensor, muTensor = constantLayerTensors(layer)
         if tensor is not None:
             return (
                 "homogeneous",
                 complexArrayCacheKey(tensor),
+                complexArrayCacheKey(muTensor),
                 getattr(layer, "factorization", "auto"),
             )
     return None
+
+
+def validateHomogeneousMuSupport(layer: object) -> None:
+    validateNoMagnetoelectric(layer)
+    mu = getattr(layer, "mu", None)
+    if mu is None:
+        return
+    muTensor = constantTensor(mu)
+    if muTensor is None:
+        raise NotImplementedError(
+            "sampled or analytic mu tensors require the full Li 2003 electric-magnetic "
+            "Fourier factorization; use a homogeneous constant mu tensor for now"
+        )
+    if isinstance(layer, CompiledLayer):
+        epsilonTensor = layer.tensorData.constantTensor
+    else:
+        epsilonTensor = constantTensor(getattr(layer, "epsilon"))
+    if epsilonTensor is None and not isIdentityTensor(muTensor):
+        raise NotImplementedError(
+            "patterned non-identity mu tensors require the full Li 2003 electric-magnetic "
+            "Fourier factorization; only homogeneous epsilon/mu layers are implemented"
+        )
 
 
 def complexArrayCacheKey(value: ComplexArray) -> tuple[tuple[int, ...], tuple[complex, ...]]:
@@ -1066,10 +1115,11 @@ def layerModesWithTiming(
     collectTiming: bool,
 ) -> tuple[tuple[object, object], LayerEigTiming | None]:
     totalStart = startTimedOperation(backend) if collectTiming else None
+    validateHomogeneousMuSupport(layer)
     if not isinstance(layer, CompiledLayer) and getattr(layer, "normalField", None) is None:
-        tensor = constantTensor(getattr(layer, "epsilon"))
+        tensor, muTensor = constantLayerTensors(layer)
         if tensor is not None:
-            if isScalarTensor(tensor):
+            if isIdentityTensor(muTensor) and isScalarTensor(tensor):
                 qValues, vectors, matrixShape, eigTime = homogeneousScalarLayerModes(
                     tensor[0, 0],
                     harmonics,
@@ -1080,6 +1130,7 @@ def layerModesWithTiming(
                     tensor,
                     harmonics,
                     backend,
+                    mu=muTensor,
                     collectTiming=collectTiming,
                 )
             modes = (qValues, vectors)
@@ -1099,7 +1150,8 @@ def layerModesWithTiming(
     factorized = layerTensorData(layer, harmonics)
     factorizationTime = time.perf_counter() - factorizationStart if factorizationStart is not None else 0.0
     if factorized.constantTensor is not None:
-        if isScalarTensor(factorized.constantTensor):
+        muTensor = constantCompiledMuTensor(layer)
+        if isIdentityTensor(muTensor) and isScalarTensor(factorized.constantTensor):
             qValues, vectors, matrixShape, eigTime = homogeneousScalarLayerModes(
                 factorized.constantTensor[0, 0],
                 harmonics,
@@ -1110,6 +1162,7 @@ def layerModesWithTiming(
                 factorized.constantTensor,
                 harmonics,
                 backend,
+                mu=muTensor,
                 collectTiming=collectTiming,
             )
         modes = (qValues, vectors)
@@ -1616,10 +1669,59 @@ def isHomogeneousLayer(layer: Layer | CompiledLayer) -> bool:
     if isinstance(layer, BatchedHomogeneousLayer):
         return True
     if isinstance(layer, CompiledLayer):
-        return layer.tensorData.constantTensor is not None
+        return layer.tensorData.constantTensor is not None and (layer.mu is None or constantTensor(layer.mu) is not None)
     if getattr(layer, "normalField", None) is not None:
         return False
-    return constantTensor(getattr(layer, "epsilon")) is not None
+    epsilonTensor, muTensor = constantLayerTensors(layer)
+    if epsilonTensor is None:
+        return False
+    return muTensor is not None
+
+
+def constantLayerTensors(layer: object) -> tuple[ComplexArray | None, ComplexArray | None]:
+    validateNoMagnetoelectric(layer)
+    epsilonTensor = constantTensor(getattr(layer, "epsilon"))
+    if epsilonTensor is None:
+        return None, None
+    mu = getattr(layer, "mu", None)
+    if mu is None:
+        return epsilonTensor, identityTensor()
+    muTensor = constantTensor(mu)
+    if muTensor is None:
+        raise NotImplementedError(
+            "sampled or analytic mu tensors require the full Li 2003 electric-magnetic "
+            "Fourier factorization; use a homogeneous constant mu tensor for now"
+        )
+    return epsilonTensor, muTensor
+
+
+def constantCompiledMuTensor(layer: object) -> ComplexArray:
+    mu = getattr(layer, "mu", None)
+    if mu is None:
+        return identityTensor()
+    return np.asarray(mu, dtype=complex)
+
+
+def identityTensor() -> ComplexArray:
+    return np.eye(3, dtype=complex)
+
+
+def isIdentityTensor(tensor: ComplexArray | None) -> bool:
+    if tensor is None:
+        return False
+    array = np.asarray(tensor, dtype=complex)
+    if array.shape != (3, 3):
+        return False
+    scale = max(1.0, float(np.max(np.abs(array))) if array.size else 1.0)
+    return bool(np.max(np.abs(array - np.eye(3, dtype=complex))) <= 1e-14 * scale)
+
+
+def validateNoMagnetoelectric(layer: object) -> None:
+    if getattr(layer, "chi", None) is not None or getattr(layer, "xi", None) is not None:
+        raise NotImplementedError(
+            "magnetoelectric chi/xi coupling requires the coupled bi-anisotropic "
+            "Fourier formulation; this solver currently implements chi=xi=0"
+        )
 
 
 def isScalarTensor(tensor: ComplexArray) -> bool:
@@ -1700,12 +1802,14 @@ def homogeneousTensorLayerModesMeasured(
     harmonics: Harmonics,
     backend: ArrayBackend,
     *,
+    mu: ComplexArray | None = None,
     collectTiming: bool,
 ) -> tuple[object, object, tuple[int, ...], float]:
     return homogeneousTensorLayerModesBackend(
         tensor,
         harmonics,
         backend,
+        mu=mu,
         collectTiming=collectTiming,
     )
 
@@ -1715,10 +1819,11 @@ def homogeneousTensorLayerModesBackend(
     harmonics: Harmonics,
     backend: ArrayBackend,
     *,
+    mu: ComplexArray | None = None,
     collectTiming: bool,
 ) -> tuple[object, object, tuple[int, ...], float]:
     nOrders = harmonics.count
-    systems = homogeneousOrderSystemMatricesBackend(tensor, harmonics, backend)
+    systems = homogeneousOrderSystemMatricesBackend(tensor, harmonics, backend, mu=mu)
     start = startTimedOperation(backend) if collectTiming else None
     orderQ, orderVectors = backend.eig(systems)
     eigTime = finishTimedOperation(backend, start) if start is not None else 0.0
@@ -1743,9 +1848,11 @@ def homogeneousTensorLayerModesBatch(
     tensor: ComplexArray,
     harmonics: BatchedHarmonics,
     backend: ArrayBackend,
+    *,
+    mu: ComplexArray | None = None,
 ) -> tuple[object, object]:
     nOrders = harmonics.count
-    systems = homogeneousOrderSystemMatricesBatchBackend(tensor, harmonics, backend)
+    systems = homogeneousOrderSystemMatricesBatchBackend(tensor, harmonics, backend, mu=mu)
     orderQ, orderVectors = backend.eig(systems)
 
     xp = backend.xp
@@ -1769,16 +1876,25 @@ def homogeneousOrderSystemMatricesBackend(
     tensor: ComplexArray,
     harmonics: Harmonics,
     backend: ArrayBackend,
+    *,
+    mu: ComplexArray | None = None,
 ) -> object:
     xp = backend.xp
     torch = xp.torch
     tensorGpu = backend.asarray(tensor)
+    muGpu = backend.asarray(identityTensor() if mu is None else mu)
     exx, exy, exz = tensorGpu[0]
     eyx, eyy, eyz = tensorGpu[1]
     ezx, ezy, ezz = tensorGpu[2]
+    mxx, mxy, mxz = muGpu[0]
+    myx, myy, myz = muGpu[1]
+    mzx, mzy, mzz = muGpu[2]
     if bool(torch.abs(ezz) < 1e-14):
         raise ValueError("epsilon_zz is near zero in a homogeneous anisotropic layer")
+    if bool(torch.abs(mzz) < 1e-14):
+        raise ValueError("mu_zz is near zero in a homogeneous magnetic anisotropic layer")
     eta = 1.0 / ezz
+    nu = 1.0 / mzz
     kx = backend.asarray(harmonics.kx)
     ky = backend.asarray(harmonics.ky)
 
@@ -1792,23 +1908,33 @@ def homogeneousOrderSystemMatricesBackend(
     dyHx = eyz * eta * ky
     dyHy = -eyz * eta * kx
 
+    bxEx = -mxz * nu * ky
+    bxEy = mxz * nu * kx
+    bxHx = mxx - mxz * nu * mzx
+    bxHy = mxy - mxz * nu * mzy
+
+    byEx = -myz * nu * ky
+    byEy = myz * nu * kx
+    byHx = myx - myz * nu * mzx
+    byHy = myy - myz * nu * mzy
+
     systems = xp.empty((harmonics.count, 4, 4), dtype=complex)
-    systems[:, 0, 0] = -kx * eta * ezx
-    systems[:, 0, 1] = -kx * eta * ezy
-    systems[:, 0, 2] = kx * eta * ky
-    systems[:, 0, 3] = 1.0 - kx * eta * kx
-    systems[:, 1, 0] = -ky * eta * ezx
-    systems[:, 1, 1] = -ky * eta * ezy
-    systems[:, 1, 2] = ky * eta * ky - 1.0
-    systems[:, 1, 3] = -ky * eta * kx
-    systems[:, 2, 0] = -kx * ky - dyEx
-    systems[:, 2, 1] = kx * kx - dyEy
-    systems[:, 2, 2] = -dyHx
-    systems[:, 2, 3] = -dyHy
-    systems[:, 3, 0] = dxEx - ky * ky
-    systems[:, 3, 1] = dxEy + ky * kx
-    systems[:, 3, 2] = dxHx
-    systems[:, 3, 3] = dxHy
+    systems[:, 0, 0] = -kx * eta * ezx + byEx
+    systems[:, 0, 1] = -kx * eta * ezy + byEy
+    systems[:, 0, 2] = kx * eta * ky + byHx
+    systems[:, 0, 3] = -kx * eta * kx + byHy
+    systems[:, 1, 0] = -ky * eta * ezx - bxEx
+    systems[:, 1, 1] = -ky * eta * ezy - bxEy
+    systems[:, 1, 2] = ky * eta * ky - bxHx
+    systems[:, 1, 3] = -ky * eta * kx - bxHy
+    systems[:, 2, 0] = -kx * nu * ky - dyEx
+    systems[:, 2, 1] = kx * nu * kx - dyEy
+    systems[:, 2, 2] = -kx * nu * mzx - dyHx
+    systems[:, 2, 3] = -kx * nu * mzy - dyHy
+    systems[:, 3, 0] = dxEx - ky * nu * ky
+    systems[:, 3, 1] = dxEy + ky * nu * kx
+    systems[:, 3, 2] = dxHx - ky * nu * mzx
+    systems[:, 3, 3] = dxHy - ky * nu * mzy
     return systems
 
 
@@ -1816,10 +1942,13 @@ def homogeneousOrderSystemMatricesBatchBackend(
     tensor: ComplexArray,
     harmonics: BatchedHarmonics,
     backend: ArrayBackend,
+    *,
+    mu: ComplexArray | None = None,
 ) -> object:
     xp = backend.xp
     torch = xp.torch
     tensorGpu = backend.asarray(tensor)
+    muGpu = backend.asarray(identityTensor() if mu is None else mu)
     if tensorGpu.ndim == 2:
         exx, exy, exz = tensorGpu[0]
         eyx, eyy, eyz = tensorGpu[1]
@@ -1830,9 +1959,22 @@ def homogeneousOrderSystemMatricesBatchBackend(
         ezx, ezy, ezz = (tensorGpu[:, 2, index][:, None] for index in range(3))
     else:
         raise ValueError("homogeneous tensor batch must be a (3, 3) tensor or a (batch, 3, 3) tensor array")
+    if muGpu.ndim == 2:
+        mxx, mxy, mxz = muGpu[0]
+        myx, myy, myz = muGpu[1]
+        mzx, mzy, mzz = muGpu[2]
+    elif muGpu.ndim == 3 and muGpu.shape[0] == harmonics.batchSize and muGpu.shape[1:] == (3, 3):
+        mxx, mxy, mxz = (muGpu[:, 0, index][:, None] for index in range(3))
+        myx, myy, myz = (muGpu[:, 1, index][:, None] for index in range(3))
+        mzx, mzy, mzz = (muGpu[:, 2, index][:, None] for index in range(3))
+    else:
+        raise ValueError("homogeneous mu batch must be a (3, 3) tensor or a (batch, 3, 3) tensor array")
     if bool(torch.any(torch.abs(ezz) < 1e-14)):
         raise ValueError("epsilon_zz is near zero in a homogeneous anisotropic layer")
+    if bool(torch.any(torch.abs(mzz) < 1e-14)):
+        raise ValueError("mu_zz is near zero in a homogeneous magnetic anisotropic layer")
     eta = 1.0 / ezz
+    nu = 1.0 / mzz
     kx = harmonics.kx
     ky = harmonics.ky
 
@@ -1846,23 +1988,33 @@ def homogeneousOrderSystemMatricesBatchBackend(
     dyHx = eyz * eta * ky
     dyHy = -eyz * eta * kx
 
+    bxEx = -mxz * nu * ky
+    bxEy = mxz * nu * kx
+    bxHx = mxx - mxz * nu * mzx
+    bxHy = mxy - mxz * nu * mzy
+
+    byEx = -myz * nu * ky
+    byEy = myz * nu * kx
+    byHx = myx - myz * nu * mzx
+    byHy = myy - myz * nu * mzy
+
     systems = xp.empty((harmonics.batchSize, harmonics.count, 4, 4), dtype=complex)
-    systems[:, :, 0, 0] = -kx * eta * ezx
-    systems[:, :, 0, 1] = -kx * eta * ezy
-    systems[:, :, 0, 2] = kx * eta * ky
-    systems[:, :, 0, 3] = 1.0 - kx * eta * kx
-    systems[:, :, 1, 0] = -ky * eta * ezx
-    systems[:, :, 1, 1] = -ky * eta * ezy
-    systems[:, :, 1, 2] = ky * eta * ky - 1.0
-    systems[:, :, 1, 3] = -ky * eta * kx
-    systems[:, :, 2, 0] = -kx * ky - dyEx
-    systems[:, :, 2, 1] = kx * kx - dyEy
-    systems[:, :, 2, 2] = -dyHx
-    systems[:, :, 2, 3] = -dyHy
-    systems[:, :, 3, 0] = dxEx - ky * ky
-    systems[:, :, 3, 1] = dxEy + ky * kx
-    systems[:, :, 3, 2] = dxHx
-    systems[:, :, 3, 3] = dxHy
+    systems[:, :, 0, 0] = -kx * eta * ezx + byEx
+    systems[:, :, 0, 1] = -kx * eta * ezy + byEy
+    systems[:, :, 0, 2] = kx * eta * ky + byHx
+    systems[:, :, 0, 3] = -kx * eta * kx + byHy
+    systems[:, :, 1, 0] = -ky * eta * ezx - bxEx
+    systems[:, :, 1, 1] = -ky * eta * ezy - bxEy
+    systems[:, :, 1, 2] = ky * eta * ky - bxHx
+    systems[:, :, 1, 3] = -ky * eta * kx - bxHy
+    systems[:, :, 2, 0] = -kx * nu * ky - dyEx
+    systems[:, :, 2, 1] = kx * nu * kx - dyEy
+    systems[:, :, 2, 2] = -kx * nu * mzx - dyHx
+    systems[:, :, 2, 3] = -kx * nu * mzy - dyHy
+    systems[:, :, 3, 0] = dxEx - ky * nu * ky
+    systems[:, :, 3, 1] = dxEy + ky * nu * kx
+    systems[:, :, 3, 2] = dxHx - ky * nu * mzx
+    systems[:, :, 3, 3] = dxHy - ky * nu * mzy
     return systems
 
 
@@ -2191,7 +2343,11 @@ def interfaceSMatrices(
             if structured is not None:
                 results[index] = structured
                 continue
-        elif homogeneousLeft != homogeneousRight and patternedHomogeneousInterfaceEnabled():
+        elif (
+            homogeneousLeft != homogeneousRight
+            and not batched
+            and patternedHomogeneousInterfaceEnabled()
+        ):
             work = patternedHomogeneousInterfaceWork(
                 regionForward[index],
                 regionBackward[index],
@@ -2275,18 +2431,15 @@ def structuredInterfaceSMatrix(
         )
     if homogeneousLeft == homogeneousRight or not patternedHomogeneousInterfaceEnabled():
         return None
-    try:
-        return patternedHomogeneousInterfaceSMatrix(
-            leftForward,
-            leftBackward,
-            rightForward,
-            rightBackward,
-            nOrders,
-            backend,
-            homogeneousLeft=homogeneousLeft,
-        )
-    except RuntimeError:
-        return None
+    return patternedHomogeneousInterfaceSMatrix(
+        leftForward,
+        leftBackward,
+        rightForward,
+        rightBackward,
+        nOrders,
+        backend,
+        homogeneousLeft=homogeneousLeft,
+    )
 
 
 def patternedHomogeneousInterfaceSMatrix(
@@ -2379,25 +2532,44 @@ def solvePatternedHomogeneousInterfaceWorks(
     sameShape = all(
         work.reducedMatrix.shape == works[0].reducedMatrix.shape
         and work.reducedRhs.shape == works[0].reducedRhs.shape
-        and not batched
         for work in works
     )
-    if not sameShape:
+    if sameShape:
+        matrixBatch = xp.stack([work.reducedMatrix for work in works], axis=1 if batched else 0)
+        rhsBatch = xp.stack([work.reducedRhs for work in works], axis=1 if batched else 0)
+        solvedBatch = solveInterfaceBlocks(backend, matrixBatch, rhsBatch)
         return tuple(
             finishPatternedHomogeneousInterface(
                 work,
-                solveInterfaceBlocks(backend, work.reducedMatrix, work.reducedRhs),
+                solvedBatch[:, index] if batched else solvedBatch[index],
                 backend,
             )
-            for work in works
+            for index, work in enumerate(works)
         )
 
-    matrixBatch = xp.stack([work.reducedMatrix for work in works], axis=0)
-    rhsBatch = xp.stack([work.reducedRhs for work in works], axis=0)
-    solvedBatch = solveInterfaceBlocks(backend, matrixBatch, rhsBatch)
+    groups: dict[tuple[tuple[int, ...], tuple[int, ...]], list[tuple[int, PatternedHomogeneousInterfaceWork]]] = {}
+    for index, work in enumerate(works):
+        key = (tuple(int(value) for value in work.reducedMatrix.shape), tuple(int(value) for value in work.reducedRhs.shape))
+        groups.setdefault(key, []).append((index, work))
+    results: list[SMatrix | None] = [None] * len(works)
+    for group in groups.values():
+        if len(group) == 1:
+            index, work = group[0]
+            solution = solveInterfaceBlocks(backend, work.reducedMatrix, work.reducedRhs)
+            results[index] = finishPatternedHomogeneousInterface(work, solution, backend)
+            continue
+        groupWorks = [work for ignored, work in group]
+        groupBatched = getattr(groupWorks[0].reducedMatrix, "ndim", 2) == 3
+        matrixBatch = xp.stack([work.reducedMatrix for work in groupWorks], axis=1 if groupBatched else 0)
+        rhsBatch = xp.stack([work.reducedRhs for work in groupWorks], axis=1 if groupBatched else 0)
+        solvedBatch = solveInterfaceBlocks(backend, matrixBatch, rhsBatch)
+        for groupIndex, (resultIndex, work) in enumerate(group):
+            solution = solvedBatch[:, groupIndex] if groupBatched else solvedBatch[groupIndex]
+            results[resultIndex] = finishPatternedHomogeneousInterface(work, solution, backend)
+    if any(result is None for result in results):
+        raise RuntimeError("patterned-homogeneous interface batching did not fill every result")
     return tuple(
-        finishPatternedHomogeneousInterface(work, solvedBatch[index], backend)
-        for index, work in enumerate(works)
+        result for result in results if result is not None
     )
 
 
@@ -2583,10 +2755,7 @@ def homogeneousInterfaceSMatrixBatchTorch(
         ],
         dim=3,
     )
-    try:
-        solvedBlocks = backend.solve(matrices, rightHandSides)
-    except RuntimeError:
-        return None
+    solvedBlocks = backend.solve(matrices, rightHandSides)
 
     s11 = xp.zeros((batchSize, size, size), dtype=complex)
     s12 = xp.zeros((batchSize, size, size), dtype=complex)
@@ -2658,10 +2827,7 @@ def homogeneousInterfaceSMatrixTorch(
         ],
         dim=2,
     )
-    try:
-        solvedBlocks = backend.solve(matrices, rightHandSides)
-    except RuntimeError:
-        return None
+    solvedBlocks = backend.solve(matrices, rightHandSides)
 
     s11 = xp.zeros((size, size), dtype=complex)
     s12 = xp.zeros((size, size), dtype=complex)
@@ -2680,8 +2846,8 @@ def homogeneousColumnOrdersTorch(matrix: object, nOrders: int, backend: ArrayBac
         return None
     torch = backend.xp.torch
     magnitude = torch.abs(matrix)
-    maxMagnitude = torch.amax(magnitude) if matrix.numel() else torch.as_tensor(0.0, device=backend.device)
-    tolerance = 1e-10 * max(1.0, float(maxMagnitude.detach().cpu().item()))
+    maxMagnitude = torch.amax(magnitude) if matrix.numel() else torch.as_tensor(0.0, dtype=backend.floatDtype, device=backend.device)
+    tolerance = 1e-10 * torch.clamp(maxMagnitude, min=1.0)
     active = magnitude > tolerance
     if bool(torch.any(torch.sum(active, dim=0) == 0)):
         return None
@@ -2701,8 +2867,8 @@ def homogeneousColumnOrdersBatchTorch(matrix: object, nOrders: int, backend: Arr
         return None
     torch = backend.xp.torch
     magnitude = torch.abs(matrix)
-    maxMagnitude = torch.amax(magnitude) if matrix.numel() else torch.as_tensor(0.0, device=backend.device)
-    tolerance = 1e-10 * max(1.0, float(maxMagnitude.detach().cpu().item()))
+    maxMagnitude = torch.amax(magnitude) if matrix.numel() else torch.as_tensor(0.0, dtype=backend.floatDtype, device=backend.device)
+    tolerance = 1e-10 * torch.clamp(maxMagnitude, min=1.0)
     active = magnitude > tolerance
     if bool(torch.any(torch.sum(active, dim=1) == 0)):
         return None

@@ -3,9 +3,9 @@
 RCWA-3D 是一个面向学习、验证和二次开发的三维 RCWA / Fourier Modal Method 实现。项目把各向同性标量介质和各向异性张量介质分成两个包：
 
 - `rcwa3d_isotropic`：各向同性、非磁性、标量介电常数 RCWA。公共求解路径固定为 CUDA + PyTorch + S-matrix。
-- `rcwa3d_anisotropic`：各向异性介电张量 RCWA，支持常量张量、采样张量场、常见 xz/zx 磁光耦合张量，同样使用 CUDA S-matrix 作为生产路径。
+- `rcwa3d_anisotropic`：各向异性张量 RCWA，支持常量/采样介电张量、均匀层常数磁导率张量、常见 xz/zx 磁光耦合介电张量，同样使用 CUDA S-matrix 作为生产路径。
 
-项目当前重点是数值稳定性、可读性和可扩展性。默认不提供静默 CPU fallback：如果 CUDA 不可用，求解器会直接报错，避免同一脚本在不同机器上走到不同数值路径。
+项目当前重点是数值稳定性、可读性和可扩展性。默认不提供静默 fallback：如果 CUDA 不可用、GPU 线性代数失败、谱扫描批量路径失败，或结果出现 NaN/Inf，求解器会直接报错，不会自动改走 CPU、逐点重算或 complex128 重算来掩盖底层问题。
 
 ## 功能概览
 
@@ -19,7 +19,8 @@ RCWA-3D 是一个面向学习、验证和二次开发的三维 RCWA / Fourier Mo
 - 均匀层、二维采样标量层、解析几何层、三维分片几何层。
 - 各向同性解析圆、椭圆、矩形、环形等 Fourier 卷积。
 - 采样标量边界的 normal-vector Li / Jones 类因子化。
-- 各向异性常量 `(3, 3)` 张量、采样 `(ny, nx, 3, 3)` 张量场、xz/zx 磁光耦合张量。
+- 各向异性常量 `(3, 3)` 介电张量、采样 `(ny, nx, 3, 3)` 介电张量场、xz/zx 磁光耦合介电张量。
+- 均匀层常数 `(3, 3)` 磁导率张量 `mu`，并提供 `ConstitutiveTensors(epsilon, mu, chi, xi)` 数据模型。
 - 稳定 S-matrix / Redheffer 星积级联。
 - 自动齐次层快速路径和一维结构降维路径。
 - 反射、透射、衍射级次功率和能量守恒检查。
@@ -29,7 +30,7 @@ RCWA-3D 是一个面向学习、验证和二次开发的三维 RCWA / Fourier Mo
 
 当前限制：
 
-- 暂未实现完整磁性材料与双各向异性 `epsilon/mu/xi/chi` 体系。
+- 均匀层常数 `mu` 已实现；图案化非单位 `mu`、磁电耦合 `chi/xi` 与完整双各向异性 Fourier factorization 尚未实现。
 - 公共求解路径只保留稳定的 `method="smatrix"`；`etm/global/expm` 等旧方法不会作为生产入口暴露。
 - 高对比二值结构仍需要做收敛性扫描：逐步增加 `orders`、采样网格、分片数和因子化策略。
 - 各向同性公共 API 已经转向 `RCWASimulation`；旧式 `rcwa3d_isotropic.compileLayers/solveStack` 不再作为公共接口使用。
@@ -533,9 +534,26 @@ eps = rcwa.gyrotropicXzTensor(
 - `PatternLayer`
 - `LayerStack`
 
+标准标量形状也支持解析 Fourier 几何：
+
+```python
+layer = rcwa.rectangularPostLayer(
+    period=(8.274, 8.274),
+    thickness=3.149,
+    background=1.0,
+    post=3.48**2,
+    size=(2.914, 2.914),
+    analytic=True,
+    factorization="auto",
+)
+```
+
+解析路径直接使用矩形的 sinc 系数、圆/椭圆的 Bessel 系数生成卷积矩阵，不再先采样到 `GRID x GRID` 网格。这是 S4 这类 RCWA 软件常用的几何设计思路：简单标准形状走解析 Fourier 系数，复杂任意图形才退回采样。`factorization="auto"` 下，解析标量形状会继续使用 normal-vector Li 因子化；设置 `analytic=False` 可回到旧采样路径做收敛对照。
+
 `factorization="auto"` 是推荐路径：
 
 - 采样标量形状有 normal field 时使用 normal-vector Li。
+- 解析标量形状使用解析 Fourier 系数和 analytic normal-vector Li。
 - 采样张量形状和齐次张量层使用 z-normal tensor Li。
 - `factorization="standard"` 可用于对照，保留直接采样卷积路径。
 
@@ -546,6 +564,7 @@ eps = rcwa.gyrotropicXzTensor(
 ```text
 epsilon.shape == (3, 3)
 epsilon.shape == (ny, nx, 3, 3)
+mu.shape == (3, 3)                  # 仅均匀层常数 mu
 ```
 
 也可接受 component mapping，例如：
@@ -559,6 +578,26 @@ epsilon.shape == (ny, nx, 3, 3)
     "zx": eps_zx,
 }
 ```
+
+对于均匀磁性各向异性层，可直接传入 `mu`，或用 `constitutiveTensors(...)` 把
+`epsilon/mu/chi/xi` 写在同一个材料对象中：
+
+```python
+layer = rcwa.Layer(
+    thickness=0.12,
+    epsilon=epsilon_tensor,
+    mu=mu_tensor,
+)
+
+layer = rcwa.homogeneousLayer(
+    0.12,
+    rcwa.constitutiveTensors(epsilon_tensor, mu=mu_tensor),
+)
+```
+
+当前只实现 `D = epsilon E`、`B = mu H` 且 `chi = xi = 0` 的均匀层
+`epsilon/mu` 本征问题。若对图案化层传入非单位 `mu`，或传入 `chi/xi`，
+代码会明确报错，而不是静默退化成错误的非磁性算法。
 
 对于 xz/zx 耦合，求解器先用连续法向位移消去 `Ez`：
 
@@ -581,6 +620,16 @@ D_y = ([eyx] - [eyz][ezz]^-1[ezx]) Ex
     + [eyz][ezz]^-1 Ky Hx - [eyz][ezz]^-1 Kx Hy
 ```
 
+均匀常数 `mu` 层还会用 `Bz = Kx Ey - Ky Ex` 消去 `Hz`：
+
+```text
+Hz = mu_zz^-1 (Bz - mu_zx Hx - mu_zy Hy)
+```
+
+随后用 `Bx/By` 和 `Dx/Dy` 组成同一个 `[Ex, Ey, Hx, Hy]` 的 `4 x 4`
+Berreman 型一阶系统。`mu = I` 时，矩阵逐项退化为旧的非磁性各向异性实现；
+测试集中保留了这个回归检查。
+
 这些块组成完整 `4N x 4N` 一阶矩阵。由于 xz/zx 耦合会产生 electric-electric 和 magnetic-magnetic blocks，各向异性系统不能像标量各向同性那样只求 `P Q`，而是直接求完整一阶系统。
 
 模态按 z 向 Poynting flux 和 evanescent 衰减方向分成 forward/backward 子空间。传播因子：
@@ -597,6 +646,45 @@ P_backward = exp(-i q_backward k0 d)
 - 全部有限层齐次时，只解零级 `4 x 4` 子空间，再嵌回完整级次数组。
 - 一维结构只保留耦合 Fourier 线。
 - 真正二维结构继续走通用 S-matrix RCWA。
+
+## 参考文献与算法依据
+
+本项目的算法说明应能追溯到公开文献或公开实现。GitHub 实现只能作为工程交叉参考；核心矩阵方程、因子化和能量归一化应优先以论文为依据。
+
+| 代码步骤 | 主要文件 | 依据 |
+| --- | --- | --- |
+| Floquet 谐波、`Kx/Ky` 枚举、Fourier 卷积矩阵 | `fourier.py` | Moharam 和 Gaylord 的 RCWA 基本形式；S4/grcwa/torcwa 的公开实现也采用 Fourier 谐波空间 |
+| 解析矩形/圆/椭圆 Fourier 几何系数 | `rcwa3d_anisotropic/analytic.py`, `geometry.py` | 标准 Fourier transform：矩形为 sinc 系数，圆/椭圆为 Bessel `2 J1(x) / x` 系数；S4 的层状周期结构软件设计也鼓励标准图元用解析 Fourier 系数 |
+| 标量 RCWA 的 `P/Q` 块矩阵和层模本征问题 | `rcwa3d_isotropic/solver.py` | Moharam 和 Gaylord 的 RCWA；Moharam 等人的稳定矩阵实现 |
+| Fourier factorization、`[epsilon]` 与 `[1/epsilon]^-1` 的选择 | `factorization.py` | Li 的 Fourier factorization 规则；Lalanne/Morris 与 Li 的收敛性分析 |
+| normal-vector Li 因子化 | `factorization.py` | Popov/Neviere 的 fast Fourier factorization 思路；Götz 等人的 normal-vector RCWA |
+| 均匀各向异性 `epsilon/mu` 层的 `4 x 4` 模式系统 | `rcwa3d_anisotropic/solver.py` | Berreman 的各向异性分层介质 `4 x 4` 形式；Li 2003 的任意 `epsilon/mu` 张量 crossed-grating FMM 在均匀层极限下的电磁张量一阶系统 |
+| 图案各向异性介电层的 `4N x 4N` 一阶系统 | `rcwa3d_anisotropic/solver.py` | Li 的 crossed-grating FMM；Onishi/Crabtree/Chipman 的 bianisotropic RCWT；当前图案层仅实现 `mu=I, chi=xi=0` |
+| 界面连续条件、propagation S-matrix、Redheffer 星积级联 | `smatrix.py`, `solver.py` | Moharam 等人的 stable RCWA；Rumpf 的 scattering matrix 形式；S4 的分层周期结构求解器 |
+| 反射/透射功率、Poynting flux 归一化 | `phase.py`, `solver.py` | 标准 time-averaged Poynting flux；S4/grcwa/torcwa 的功率流计算路径 |
+| 非互易热辐射中的吸收率/发射率关系 | anisotropic examples | Miller/Zhu/Fan 的 modal radiation laws；Guo/Zhao/Fan 的 adjoint Kirchhoff law；具体 Fang 系列示例以原论文定义为准 |
+
+推荐引用清单：
+
+- M. G. Moharam and T. K. Gaylord, "Rigorous coupled-wave analysis of planar-grating diffraction", JOSA 71, 811-818 (1981). <https://doi.org/10.1364/JOSA.71.000811>
+- M. G. Moharam, E. B. Grann, D. A. Pommet, and T. K. Gaylord, "Stable implementation of the rigorous coupled-wave analysis for surface-relief gratings: enhanced transmittance matrix approach", JOSA A 12, 1068-1076 (1995). <https://doi.org/10.1364/JOSAA.12.001068>
+- L. Li, "Use of Fourier series in the analysis of discontinuous periodic structures", JOSA A 13, 1870-1876 (1996). <https://doi.org/10.1364/JOSAA.13.001870>
+- L. Li, "New formulation of the Fourier modal method for crossed surface-relief gratings", JOSA A 14, 2758-2767 (1997). <https://doi.org/10.1364/JOSAA.14.002758>
+- L. Li, "Reformulation of the Fourier modal method for surface-relief gratings made with anisotropic materials", Journal of Modern Optics 45, 1313-1334 (1998). <https://doi.org/10.1080/09500349808230632>
+- L. Li, "Fourier modal method for crossed anisotropic gratings with arbitrary permittivity and permeability tensors", Journal of Optics A 5, 345-355 (2003). <https://doi.org/10.1088/1464-4258/5/4/307>
+- D. W. Berreman, "Optics in stratified and anisotropic media: 4 x 4-matrix formulation", JOSA 62, 502-510 (1972). <https://doi.org/10.1364/JOSA.62.000502>
+- K. Watanabe, R. Petit, and M. Nevière, "Differential theory of gratings made of anisotropic materials", JOSA A 19, 325-334 (2002). <https://doi.org/10.1364/JOSAA.19.000325>
+- M. Onishi, K. Crabtree, and R. A. Chipman, "Formulation of rigorous coupled-wave theory for gratings in bianisotropic media", JOSA A 28, 1747-1758 (2011). <https://doi.org/10.1364/JOSAA.28.001747>
+- I. Smagin, S. Dyakov, and N. Gippius, "The Fourier modal method for gratings with bi-anisotropic materials", arXiv:2510.05973 (2025). <https://arxiv.org/abs/2510.05973>
+- R. C. Rumpf, "Improved formulation of scattering matrices for semi-analytical methods that is consistent with convention", Progress In Electromagnetics Research B 35, 241-261 (2011). <https://doi.org/10.2528/PIERB11083107>
+- V. Liu and S. Fan, "S4: A free electromagnetic solver for layered periodic structures", Computer Physics Communications 183, 2233-2244 (2012). <https://doi.org/10.1016/j.cpc.2012.04.026>
+- P. Götz, T. Schuster, K. Frenner, S. Rafler, and W. Osten, "Normal vector method for the RCWA with automated vector field generation", Optics Express 16, 17295-17301 (2008). <https://doi.org/10.1364/OE.16.017295>
+- D. A. B. Miller, L. Zhu, and S. Fan, "Universal modal radiation laws for all thermal emitters", PNAS 114, 4336-4341 (2017). <https://doi.org/10.1073/pnas.1701606114>
+- C. Guo, B. Zhao, and S. Fan, "Adjoint Kirchhoff's Law and General Symmetry Implications for All Thermal Emitters", Physical Review X 12, 021023 (2022). <https://doi.org/10.1103/PhysRevX.12.021023>
+- J. Fang et al., "Dual-polarization strong nonreciprocal thermal radiation under near-normal incidence", International Communications in Heat and Mass Transfer 148, 107031 (2023). <https://doi.org/10.1016/j.icheatmasstransfer.2023.107031>
+- grcwa, differentiable RCWA implementation. <https://github.com/weiliangjinca/grcwa>
+- torcwa, PyTorch RCWA implementation. <https://github.com/kch3782/torcwa>
+- S4, Stanford Stratified Structure Solver. <https://github.com/victorliu/S4>
 
 ## 场分布重建
 

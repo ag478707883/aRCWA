@@ -88,7 +88,10 @@ def tensorConvolutionData(
 
     factorizationMode = normalizeFactorization(factorization)
     constantTensorValue = constantTensor(epsilon)
-    if isScalarGrid(epsilon):
+    if useAnalyticNormalVector(epsilon, factorizationMode):
+        components = analyticNormalVectorScalarTensorMatrices(epsilon, harmonics)
+        factorization = "analytic-normal-vector-li"
+    elif isScalarGrid(epsilon):
         if normalField is None and shouldAutoGenerateNormalField(epsilon, factorizationMode):
             normalField = estimateNormalField(epsilon, harmonics.orders, harmonics.truncation)
         if normalField is not None:
@@ -101,6 +104,8 @@ def tensorConvolutionData(
             factorization = "z-li"
     elif normalField is not None:
         raise ValueError("normal-vector factorization requires a scalar 2D epsilon grid")
+    elif factorizationMode == "normal-vector" and hasattr(epsilon, "convolutionMatrix"):
+        raise ValueError("normal-vector factorization requires a normalField or an analytic shape with normal vectors")
     else:
         components = tensorComponentMatrices(epsilon, harmonics)
         factorization = "z-li"
@@ -122,6 +127,15 @@ def tensorComponentMatrices(
 ) -> tuple[tuple[ComplexArray, ComplexArray, ComplexArray], ...]:
     if isinstance(epsilon, Mapping):
         return mappingTensorMatrices(epsilon, harmonics)
+
+    if hasattr(epsilon, "convolutionMatrix"):
+        scalar = convolution(epsilon, harmonics)
+        zeroMatrix = zero(harmonics.count)
+        return (
+            (scalar, zeroMatrix, zeroMatrix),
+            (zeroMatrix, scalar.copy(), zeroMatrix.copy()),
+            (zeroMatrix.copy(), zeroMatrix.copy(), scalar.copy()),
+        )
 
     if np.isscalar(epsilon):
         scalar = convolution(epsilon, harmonics)
@@ -214,6 +228,23 @@ def normalVectorScalarTensorMatrices(
     return ((cxx, cxy, zeroMatrix.copy()), (cyx, cyy, zeroMatrix.copy()), (zeroMatrix.copy(), zeroMatrix.copy(), direct))
 
 
+def analyticNormalVectorScalarTensorMatrices(
+    epsilon: TensorLike,
+    harmonics: Harmonics,
+) -> tuple[tuple[ComplexArray, ComplexArray, ComplexArray], ...]:
+    direct = convolution(epsilon, harmonics)
+    reciprocal = np.asarray(epsilon.reciprocalConvolutionMatrix(harmonics), dtype=complex)
+    inverseRule = solveIdentity(reciprocal)
+    nx, ny, tx, ty = tuple(np.asarray(matrix, dtype=complex) for matrix in epsilon.normalVectorMatrices(harmonics))
+    zeroMatrix = zero(harmonics.count)
+
+    cxx = nx @ inverseRule @ nx + tx @ direct @ tx
+    cxy = nx @ inverseRule @ ny + tx @ direct @ ty
+    cyx = ny @ inverseRule @ nx + ty @ direct @ tx
+    cyy = ny @ inverseRule @ ny + ty @ direct @ ty
+    return ((cxx, cxy, zeroMatrix.copy()), (cyx, cyy, zeroMatrix.copy()), (zeroMatrix.copy(), zeroMatrix.copy(), direct))
+
+
 def mappingTensorMatrices(
     epsilon: Mapping[object, ArrayLike | complex],
     harmonics: Harmonics,
@@ -256,6 +287,9 @@ def componentIndex(key: object) -> tuple[int, int]:
 
 
 def constantTensor(epsilon: TensorLike) -> ComplexArray | None:
+    if hasattr(epsilon, "convolutionMatrix"):
+        return None
+
     if isinstance(epsilon, Mapping):
         tensor = np.zeros((3, 3), dtype=complex)
         present = np.zeros((3, 3), dtype=bool)
@@ -282,7 +316,7 @@ def constantTensor(epsilon: TensorLike) -> ComplexArray | None:
 
 
 def isScalarGrid(epsilon: TensorLike) -> bool:
-    if isinstance(epsilon, Mapping) or np.isscalar(epsilon):
+    if isinstance(epsilon, Mapping) or hasattr(epsilon, "convolutionMatrix") or np.isscalar(epsilon):
         return False
     array = np.asarray(epsilon)
     return bool(array.ndim == 2 and array.shape != (3, 3))
@@ -302,6 +336,17 @@ def normalizeFactorization(value: str) -> str:
     if normalized not in aliases:
         raise ValueError("factorization must be 'auto', 'standard', or 'normal-vector'")
     return aliases[normalized]
+
+
+def useAnalyticNormalVector(epsilon: TensorLike, factorizationMode: str) -> bool:
+    return bool(
+        hasattr(epsilon, "normalVectorMatrices")
+        and hasattr(epsilon, "reciprocalConvolutionMatrix")
+        and (
+            factorizationMode == "normal-vector"
+            or (factorizationMode == "auto" and getattr(epsilon, "factorization", "analytic") == "normal-vector")
+        )
+    )
 
 
 def shouldAutoGenerateNormalField(epsilon: TensorLike, factorizationMode: str) -> bool:

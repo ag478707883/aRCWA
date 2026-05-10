@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike
 
+from .constitutive import splitConstitutiveInput
 from .factorization import TensorConvolutionData
 from .fourier import Harmonics as Harmonics
 
@@ -51,6 +52,16 @@ class Layer:
     factorization: str = "auto"
     name: str = ""
     sampleShape: tuple[int, int] | None = None
+    mu: TensorLike | None = None
+    chi: TensorLike | None = None
+    xi: TensorLike | None = None
+
+    def __post_init__(self) -> None:
+        epsilon, mu, chi, xi = splitConstitutiveInput(self.epsilon, self.mu, self.chi, self.xi)
+        object.__setattr__(self, "epsilon", epsilon)
+        object.__setattr__(self, "mu", mu)
+        object.__setattr__(self, "chi", chi)
+        object.__setattr__(self, "xi", xi)
 
 
 @dataclass(frozen=True)
@@ -65,6 +76,7 @@ class CompiledLayer:
     factorization: str = "auto"
     name: str = ""
     sampleShape: tuple[int, int] | None = None
+    mu: ComplexArray | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,7 @@ class BatchedHomogeneousLayer:
     thickness: float
     tensors: ComplexArray
     name: str = ""
+    mus: ComplexArray | None = None
 
 
 @dataclass(frozen=True)
